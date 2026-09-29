@@ -1,6 +1,7 @@
 package com.mikumc.mikutp.common.sync;
 
 import java.util.List;
+import java.util.Map;
 import java.util.UUID;
 import java.util.function.Consumer;
 
@@ -37,6 +38,11 @@ public interface SyncBus extends AutoCloseable {
     String presenceGet(UUID player);
 
     void presencePut(UUID player, String serverId, int ttlSeconds);
+
+    /** Refreshes presence for many players at once; implementations should batch. */
+    default void presencePutAll(Map<UUID, String> players, int ttlSeconds) {
+        players.forEach((player, serverId) -> presencePut(player, serverId, ttlSeconds));
+    }
 
     void presenceForget(UUID player);
 

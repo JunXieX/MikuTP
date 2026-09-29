@@ -36,6 +36,9 @@ public final class RedisSyncBus implements SyncBus {
     private static final String GROUP = "mikutp";
     private static final String PENDING_KEY = "mikutp:pending:";
     private static final String PRESENCE_KEY = "mikutp:player:";
+    /** Poll intervals of the outbox publisher: fast when busy, backing off when idle. */
+    private static final long ACTIVE_SLEEP_MS = 100;
+    private static final long IDLE_SLEEP_MS = 1000;
 
     private final JedisPool pool;
     private final String consumer;
@@ -94,6 +97,9 @@ public final class RedisSyncBus implements SyncBus {
     }
 
     private void publishLoop() {
+        // Back off while idle so the outbox poll stays cheap; snap back to fast
+        // polling as soon as traffic appears.
+        long idleSleep = ACTIVE_SLEEP_MS;
         while (running) {
             List<SyncBus.OutboxRow> rows = List.of();
             try {
@@ -102,17 +108,21 @@ public final class RedisSyncBus implements SyncBus {
                 sleep(3000);
             }
             if (rows.isEmpty()) {
-                sleep(300);
+                sleep(idleSleep);
+                idleSleep = Math.min(IDLE_SLEEP_MS, idleSleep * 2);
                 continue;
             }
+            idleSleep = ACTIVE_SLEEP_MS;
             List<Long> sent = new ArrayList<>();
             try (Jedis jedis = pool.getResource()) {
+                var pipe = jedis.pipelined();
                 for (SyncBus.OutboxRow row : rows) {
-                    jedis.xadd(STREAM,
+                    pipe.xadd(STREAM,
                             XAddParams.xAddParams().maxLen(streamMaxLength).approximateTrimming(),
                             Map.of("data", row.payload()));
                     sent.add(row.seq());
                 }
+                pipe.sync();
             } catch (Exception e) {
                 sleep(3000);
                 continue;
@@ -139,6 +149,7 @@ public final class RedisSyncBus implements SyncBus {
                 sleep(3000);
                 continue;
             }
+            List<StreamEntryID> acks = new ArrayList<>();
             for (StreamEntry entry : entries) {
                 try {
                     String payload = entry.getFields().get("data");
@@ -148,17 +159,22 @@ public final class RedisSyncBus implements SyncBus {
                             applier.accept(event);
                         }
                     }
-                    ack(entry.getID().toString());
+                    acks.add(entry.getID());
                 } catch (Exception ignored) {
-                    // Never let one bad event kill the consumer loop.
+                    // Never let one bad event kill the consumer loop; the entry is
+                    // still acked so it is not redelivered forever.
                 }
             }
+            ack(acks);
         }
     }
 
-    private void ack(String entryId) {
+    private void ack(List<StreamEntryID> entryIds) {
+        if (entryIds.isEmpty()) {
+            return;
+        }
         try (Jedis jedis = pool.getResource()) {
-            jedis.xack(STREAM, GROUP, new StreamEntryID(entryId));
+            jedis.xack(STREAM, GROUP, entryIds.toArray(StreamEntryID[]::new));
         } catch (Exception ignored) {
             // Unacked entries are redelivered; appliers are idempotent.
         }
@@ -179,6 +195,19 @@ public final class RedisSyncBus implements SyncBus {
     public void presencePut(UUID player, String serverId, int ttlSeconds) {
         try (Jedis jedis = pool.getResource()) {
             jedis.setex(PRESENCE_KEY + player, ttlSeconds, serverId);
+        } catch (Exception ignored) {
+        }
+    }
+
+    @Override
+    public void presencePutAll(Map<UUID, String> players, int ttlSeconds) {
+        if (players.isEmpty()) {
+            return;
+        }
+        try (Jedis jedis = pool.getResource()) {
+            for (Map.Entry<UUID, String> entry : players.entrySet()) {
+                jedis.setex(PRESENCE_KEY + entry.getKey(), ttlSeconds, entry.getValue());
+            }
         } catch (Exception ignored) {
         }
     }

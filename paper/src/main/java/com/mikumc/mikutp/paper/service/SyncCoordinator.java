@@ -8,6 +8,9 @@ import org.bukkit.Bukkit;
 import org.bukkit.entity.Player;
 import org.bukkit.plugin.java.JavaPlugin;
 
+import java.util.HashMap;
+import java.util.Map;
+import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 
 /**
@@ -68,9 +71,14 @@ public final class SyncCoordinator {
     }
 
     private void heartbeat() {
-        for (Player player : Bukkit.getOnlinePlayers()) {
-            syncBus.presencePut(player.getUniqueId(), serverId, 15);
+        if (Bukkit.getOnlinePlayers().isEmpty()) {
+            return;
         }
+        Map<UUID, String> presence = new HashMap<>();
+        for (Player player : Bukkit.getOnlinePlayers()) {
+            presence.put(player.getUniqueId(), serverId);
+        }
+        syncBus.presencePutAll(presence, 15);
     }
 
     private void onEvent(SyncEvent event) {
