@@ -61,8 +61,24 @@ public final class Database implements AutoCloseable {
                   back_y DOUBLE,
                   back_z DOUBLE,
                   back_yaw DOUBLE,
-                  back_pitch DOUBLE
+                  back_pitch DOUBLE,
+                  death_server VARCHAR(64),
+                  death_world VARCHAR(64),
+                  death_x DOUBLE,
+                  death_y DOUBLE,
+                  death_z DOUBLE,
+                  death_yaw DOUBLE,
+                  death_pitch DOUBLE
                 )""".formatted(prefix));
+        // Tables created before death columns existed: add them one by one, ignoring
+        // "duplicate column" failures (MySQL 1060 / SQLite duplicate column message).
+        column("ALTER TABLE %splayers ADD COLUMN death_server VARCHAR(64)".formatted(prefix));
+        column("ALTER TABLE %splayers ADD COLUMN death_world VARCHAR(64)".formatted(prefix));
+        column("ALTER TABLE %splayers ADD COLUMN death_x DOUBLE".formatted(prefix));
+        column("ALTER TABLE %splayers ADD COLUMN death_y DOUBLE".formatted(prefix));
+        column("ALTER TABLE %splayers ADD COLUMN death_z DOUBLE".formatted(prefix));
+        column("ALTER TABLE %splayers ADD COLUMN death_yaw DOUBLE".formatted(prefix));
+        column("ALTER TABLE %splayers ADD COLUMN death_pitch DOUBLE".formatted(prefix));
         exec("""
                 CREATE TABLE IF NOT EXISTS %shomes (
                   owner_uuid VARCHAR(36) NOT NULL,
@@ -140,6 +156,18 @@ public final class Database implements AutoCloseable {
         }
     }
 
+    /** Adds a column for pre-existing tables; re-running is a harmless no-op. */
+    private void column(String sql) throws SQLException {
+        try {
+            exec(sql);
+        } catch (SQLException e) {
+            String message = String.valueOf(e.getMessage()).toLowerCase();
+            if (e.getErrorCode() != 1060 && !message.contains("duplicate column") && !message.contains("already exists")) {
+                throw e;
+            }
+        }
+    }
+
     private void exec(String sql) throws SQLException {
         try (Connection c = provider.acquire(); Statement st = c.createStatement()) {
             st.execute(sql);
@@ -191,8 +219,15 @@ public final class Database implements AutoCloseable {
                 });
     }
 
-    public void setBack(String uuid, Position pos) throws SQLException {
-        execUpdate("UPDATE %splayers SET back_server = ?, back_world = ?, back_x = ?, back_y = ?, back_z = ?, back_yaw = ?, back_pitch = ? WHERE uuid = ?".formatted(prefix),
+    /**
+     * Stores a return position under the given column prefix; {@code null} clears it.
+     * Prefixes are internal constants: {@code back_} for the last teleport origin,
+     * {@code death_} for the last death location.
+     */
+    public void setBack(String uuid, Position pos, String colPrefix) throws SQLException {
+        execUpdate(("UPDATE %splayers SET " + colPrefix + "server = ?, " + colPrefix + "world = ?, "
+                + colPrefix + "x = ?, " + colPrefix + "y = ?, " + colPrefix + "z = ?, "
+                + colPrefix + "yaw = ?, " + colPrefix + "pitch = ? WHERE uuid = ?").formatted(prefix),
                 ps -> {
                     if (pos == null) {
                         ps.setString(1, null);
@@ -215,16 +250,19 @@ public final class Database implements AutoCloseable {
                 });
     }
 
-    public Optional<Position> getBack(String uuid) throws SQLException {
-        return queryOne("SELECT back_server, back_world, back_x, back_y, back_z, back_yaw, back_pitch FROM %splayers WHERE uuid = ?".formatted(prefix),
+    public Optional<Position> getBack(String uuid, String colPrefix) throws SQLException {
+        return queryOne(("SELECT " + colPrefix + "server, " + colPrefix + "world, " + colPrefix + "x, "
+                + colPrefix + "y, " + colPrefix + "z, " + colPrefix + "yaw, " + colPrefix + "pitch"
+                + " FROM %splayers WHERE uuid = ?").formatted(prefix),
                 ps -> ps.setString(1, uuid), rs -> {
-                    String server = rs.getString("back_server");
-                    String world = rs.getString("back_world");
+                    String server = rs.getString(colPrefix + "server");
+                    String world = rs.getString(colPrefix + "world");
                     if (server == null || world == null) {
                         return null;
                     }
-                    return new Position(server, world, rs.getDouble("back_x"), rs.getDouble("back_y"),
-                            rs.getDouble("back_z"), (float) rs.getDouble("back_yaw"), (float) rs.getDouble("back_pitch"));
+                    return new Position(server, world, rs.getDouble(colPrefix + "x"), rs.getDouble(colPrefix + "y"),
+                            rs.getDouble(colPrefix + "z"), (float) rs.getDouble(colPrefix + "yaw"),
+                            (float) rs.getDouble(colPrefix + "pitch"));
                 });
     }
 

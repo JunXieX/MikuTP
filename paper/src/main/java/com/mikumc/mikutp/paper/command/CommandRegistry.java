@@ -97,9 +97,10 @@ public final class CommandRegistry {
             reg.accept(new Registration("tpblock", tpblock(), "屏蔽玩家的传送请求", List.of("tpignore")));
             reg.accept(new Registration("tpunblock", tpunblock(), "解除屏蔽", List.of()));
             reg.accept(new Registration("wild", wild(), "随机传送", List.of("rtp")));
-            reg.accept(new Registration("back", back(), "返回上一个位置", List.of()));
+            reg.accept(new Registration("back", back(), "返回上次传送位置", List.of()));
+            reg.accept(new Registration("dback", dback(), "返回死亡地点", List.of()));
             reg.accept(new Registration("ui", ui(), "传送请求快捷响应", List.of()));
-            reg.accept(new Registration("mikutp", admin(), "MikuTP 管理命令", List.of()));
+            reg.accept(new Registration("mtp", admin(), "MikuTP 管理命令", List.of("mikutp")));
         });
     }
 
@@ -121,7 +122,8 @@ public final class CommandRegistry {
             case "tpunblock" -> commands.tpunblock;
             case "wild" -> commands.wild;
             case "back" -> commands.back;
-            case "mikutp" -> commands.mikutp;
+            case "dback" -> commands.dback;
+            case "mtp" -> commands.mtp;
             case "ui" -> commands.ui;
             default -> null;
         };
@@ -315,17 +317,27 @@ public final class CommandRegistry {
     }
 
     private LiteralCommandNode<CommandSourceStack> back() {
-        return Commands.literal("back")
-                .requires(requiresPlayer("mikutp.back"))
+        return historyCommand("back", "mikutp.back", CooldownManager.Kind.BACK, teleports::goBack);
+    }
+
+    private LiteralCommandNode<CommandSourceStack> dback() {
+        return historyCommand("dback", "mikutp.dback", CooldownManager.Kind.DBACK, teleports::goDeathBack);
+    }
+
+    private LiteralCommandNode<CommandSourceStack> historyCommand(String name, String permission,
+                                                                  CooldownManager.Kind kind,
+                                                                  java.util.function.Consumer<Player> handler) {
+        return Commands.literal(name)
+                .requires(requiresPlayer(permission))
                 .executes(ctx -> {
                     Player player = asPlayer(ctx.getSource());
-                    long remaining = cooldowns.remaining(player.getUniqueId(), CooldownManager.Kind.BACK);
+                    long remaining = cooldowns.remaining(player.getUniqueId(), kind);
                     if (remaining > 0) {
                         messages.send(player, "common.cooldown", "seconds", String.valueOf(remaining));
                         return 1;
                     }
-                    cooldowns.apply(player.getUniqueId(), CooldownManager.Kind.BACK);
-                    teleports.goBack(player);
+                    cooldowns.apply(player.getUniqueId(), kind);
+                    handler.accept(player);
                     return 1;
                 })
                 .build();
@@ -357,7 +369,7 @@ public final class CommandRegistry {
     }
 
     private LiteralCommandNode<CommandSourceStack> admin() {
-        LiteralArgumentBuilder<CommandSourceStack> root = Commands.literal("mikutp")
+        LiteralArgumentBuilder<CommandSourceStack> root = Commands.literal("mtp")
                 .requires(src -> src.getSender().hasPermission("mikutp.admin"))
                 .executes(ctx -> {
                     ctx.getSource().getSender().sendMessage(messages.render(ctx.getSource().getSender(),

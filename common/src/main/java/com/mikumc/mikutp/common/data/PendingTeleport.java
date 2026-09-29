@@ -7,7 +7,7 @@ package com.mikumc.mikutp.common.data;
 public final class PendingTeleport {
 
     public enum Source {
-        HOME, WARP, TPA, TPA_HERE, BACK, WILD, ADMIN
+        HOME, WARP, TPA, TPA_HERE, BACK, DEATH, WILD, ADMIN
     }
 
     public String playerUuid;

@@ -162,6 +162,7 @@ public final class MikuTPPlugin extends JavaPlugin {
             case TPA -> config.teleport.cooldowns.tpa;
             case WILD -> config.teleport.cooldowns.wild;
             case BACK -> config.teleport.cooldowns.back;
+            case DBACK -> config.teleport.cooldowns.dback;
         };
     }
 

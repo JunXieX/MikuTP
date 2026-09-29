@@ -110,32 +110,42 @@ public final class TeleportService {
 
     /** /back entry point; the cooldown is enforced by the caller. */
     public void goBack(Player player) {
+        goHistory(player, "back_", "back.none", "back.going", PendingTeleport.Source.BACK);
+    }
+
+    /** /dback entry point; the cooldown is enforced by the caller. */
+    public void goDeathBack(Player player) {
+        goHistory(player, "death_", "dback.none", "dback.going", PendingTeleport.Source.DEATH);
+    }
+
+    private void goHistory(Player player, String colPrefix, String emptyKey, String goingKey,
+                           PendingTeleport.Source source) {
         tasks.async(() -> {
             Position back;
             try {
-                back = database.getBack(player.getUniqueId().toString()).orElse(null);
+                back = database.getBack(player.getUniqueId().toString(), colPrefix).orElse(null);
             } catch (Exception e) {
                 plugin.getSLF4JLogger().warn("Failed to read back position", e);
                 return;
             }
             if (back == null) {
-                messages.send(player, "back.none");
+                messages.send(player, emptyKey);
                 return;
             }
-            messages.send(player, "back.going");
-            send(player, back, PendingTeleport.Source.BACK, back.world, null);
+            messages.send(player, goingKey);
+            send(player, back, source, back.world, null);
         });
     }
 
-    /** Records the /back position from a death event (runs on the region thread). */
+    /** Records the /dback position from a death event (runs on the region thread). */
     public void recordDeathBack(Player player) {
-        if (!config.back.enabled || !config.back.saveOnDeath) {
+        if (!config.back.enabled || !config.back.deathEnabled || !config.back.deathSave) {
             return;
         }
         Position pos = positionOf(player.getLocation());
         tasks.async(() -> {
             try {
-                database.setBack(player.getUniqueId().toString(), pos);
+                database.setBack(player.getUniqueId().toString(), pos, "death_");
             } catch (Exception e) {
                 plugin.getSLF4JLogger().warn("Failed to save death back position", e);
             }
@@ -229,7 +239,7 @@ public final class TeleportService {
         Position pos = positionOf(player.getLocation());
         tasks.async(() -> {
             try {
-                database.setBack(player.getUniqueId().toString(), pos);
+                database.setBack(player.getUniqueId().toString(), pos, "back_");
             } catch (Exception e) {
                 plugin.getSLF4JLogger().warn("Failed to save back position", e);
             }

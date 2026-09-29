@@ -10,7 +10,7 @@ import java.util.function.IntFunction;
 public final class CooldownManager {
 
     public enum Kind {
-        HOME, WARP, TPA, WILD, BACK
+        HOME, WARP, TPA, WILD, BACK, DBACK
     }
 
     private final Map<UUID, Map<Kind, Long>> until = new ConcurrentHashMap<>();

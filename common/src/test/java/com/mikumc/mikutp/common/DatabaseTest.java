@@ -88,10 +88,28 @@ class DatabaseTest {
         assertFalse(database.getPlayer("uuid-a").orElseThrow().tpaEnabled);
 
         Position back = new Position("s1", "world_nether", 5, 40, 5, 0f, 0f);
-        database.setBack("uuid-a", back);
-        assertEquals("world_nether", database.getBack("uuid-a").orElseThrow().world);
-        database.setBack("uuid-a", null);
-        assertTrue(database.getBack("uuid-a").isEmpty());
+        database.setBack("uuid-a", back, "back_");
+        assertEquals("world_nether", database.getBack("uuid-a", "back_").orElseThrow().world);
+        database.setBack("uuid-a", null, "back_");
+        assertTrue(database.getBack("uuid-a", "back_").isEmpty());
+    }
+
+    @Test
+    void deathBackIsIndependentOfTeleportBack() throws Exception {
+        database.upsertPlayer("uuid-a", "Alice", 1L);
+        Position teleportBack = new Position("s1", "world", 1, 64, 2, 0f, 0f);
+        Position deathBack = new Position("s2", "world", 3, 32, 4, 90f, 0f);
+        database.setBack("uuid-a", teleportBack, "back_");
+        database.setBack("uuid-a", deathBack, "death_");
+
+        assertEquals(1.0, database.getBack("uuid-a", "back_").orElseThrow().x);
+        assertEquals(3.0, database.getBack("uuid-a", "death_").orElseThrow().x);
+        assertEquals("s2", database.getBack("uuid-a", "death_").orElseThrow().server);
+
+        // Clearing one record must not touch the other.
+        database.setBack("uuid-a", null, "death_");
+        assertTrue(database.getBack("uuid-a", "death_").isEmpty());
+        assertEquals("world", database.getBack("uuid-a", "back_").orElseThrow().world);
     }
 
     @Test

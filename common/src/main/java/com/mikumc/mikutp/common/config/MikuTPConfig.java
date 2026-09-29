@@ -62,7 +62,8 @@ public final class MikuTPConfig {
         public CommandEntry tpunblock = new CommandEntry(List.of());
         public CommandEntry wild = new CommandEntry(List.of("rtp"));
         public CommandEntry back = new CommandEntry(List.of());
-        public CommandEntry mikutp = new CommandEntry(List.of());
+        public CommandEntry dback = new CommandEntry(List.of());
+        public CommandEntry mtp = new CommandEntry(List.of("mikutp"));
         public CommandEntry ui = new CommandEntry(List.of());
     }
 
@@ -147,6 +148,7 @@ public final class MikuTPConfig {
         public int tpa = 10;
         public int wild = 60;
         public int back = 10;
+        public int dback = 30;
     }
 
     public static final class Home {
@@ -169,10 +171,12 @@ public final class MikuTPConfig {
 
     public static final class Back {
         public boolean enabled = true;
-        /** Update the /back position when a player dies. */
-        public boolean saveOnDeath = true;
         /** Update the /back position when the plugin teleports a player. */
         public boolean saveOnTeleport = true;
+        /** Enable /dback (return to the last death location). */
+        public boolean deathEnabled = true;
+        /** Update the /dback position when a player dies. */
+        public boolean deathSave = true;
     }
 
     public static final class Wild {

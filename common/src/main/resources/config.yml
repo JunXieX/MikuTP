@@ -62,8 +62,10 @@ teleport:
     tpa: 10
     # /wild 冷却秒数
     wild: 60
-    # /back 冷却秒数
+    # /back（返回上次传送位置）冷却秒数
     back: 10
+    # /dback（返回死亡地点）冷却秒数
+    dback: 30
 
 # ---------------- 家 ----------------
 home:
@@ -86,14 +88,16 @@ tpa:
   # 对话框中"屏蔽"按钮的屏蔽时长（分钟），到期自动解除
   block_duration_minutes: 10
 
-# ---------------- /back ----------------
+# ---------------- /back 与 /dback ----------------
 back:
-  # 是否启用 /back 返回上一位置
+  # 是否启用 /back（返回上次传送出发的位置）
   enabled: true
-  # 玩家死亡时是否更新 /back 位置
-  save_on_death: true
-  # 本插件执行传送时是否更新 /back 位置
+  # 本插件执行传送时是否记录 /back 位置
   save_on_teleport: true
+  # 是否启用 /dback（返回最近一次死亡的地点）
+  death_enabled: true
+  # 玩家死亡时是否记录 /dback 位置
+  death_save: true
 
 # ---------------- 随机传送 ----------------
 wild:
@@ -187,14 +191,18 @@ commands:
   wild:
     enabled: true
     aliases: [rtp]
-  # 返回上一个位置（/back）
+  # 返回上次传送位置（/back）
   back:
     enabled: true
     aliases: []
-  # 管理命令（/mikutp reload|info）
-  mikutp:
+  # 返回死亡地点（/dback）
+  dback:
     enabled: true
     aliases: []
+  # 管理命令（/mtp reload|info，默认别名 /mikutp）
+  mtp:
+    enabled: true
+    aliases: [mikutp]
   # 内部命令：聊天菜单快捷按钮依赖它，关闭后点击聊天按钮将失效
   ui:
     enabled: true

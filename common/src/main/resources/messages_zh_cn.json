@@ -63,8 +63,10 @@
   "wild.success": "<prefix><green>欢迎来到未知之地：<white><location></white>。</green>",
   "wild.failed": "<prefix><red>尝试多次仍未找到安全地点，请稍后再试。</red>",
 
-  "back.none": "<prefix><red>没有可以返回的位置。</red>",
-  "back.going": "<prefix><gray>正在返回上一个位置……</gray>",
+  "back.none": "<prefix><red>没有记录到可以返回的位置。</red>",
+  "back.going": "<prefix><gray>正在返回上次传送的位置……</gray>",
+  "dback.none": "<prefix><red>没有记录到死亡地点。</red>",
+  "dback.going": "<prefix><gray>正在返回死亡地点……</gray>",
 
   "admin.info": "<prefix><gray>模式：<white><mode></white> | 服务器：<white><server></white> | 存储：<white><storage></white></gray>",
   "admin.unknown-sub": "<prefix><red>未知子命令，可用：reload、info。</red>",
