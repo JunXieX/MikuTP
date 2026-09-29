@@ -94,65 +94,21 @@ public final class DialogFactory {
     // ------------------------------------------------------------------ homes
 
     public void showHomeList(Player viewer, List<Home> homes, int page, Consumer<String> onPick) {
-        List<ActionButton> buttons = new ArrayList<>();
-        int pages = Math.max(1, (homes.size() + pageSize - 1) / pageSize);
-        int current = Math.min(Math.max(1, page), pages);
-        int from = (current - 1) * pageSize;
-        int to = Math.min(homes.size(), from + pageSize);
-        for (int i = from; i < to; i++) {
-            Home home = homes.get(i);
-            buttons.add(actionButton(Component.text(home.name), 250,
-                    () -> tasks.entity(viewer, () -> onPick.accept(home.name))));
-        }
-        addPageButtons(buttons, viewer, pages, current, p -> showHomeList(viewer, homes, p, onPick));
-        showList(viewer, "dialog.list.title-homes", buttons, current);
+        showHomePage(viewer, homes, page, onPick, false);
     }
 
     public void showHomeDelete(Player viewer, List<Home> homes, int page, Consumer<String> onPick) {
-        List<ActionButton> buttons = new ArrayList<>();
-        int pages = Math.max(1, (homes.size() + pageSize - 1) / pageSize);
-        int current = Math.min(Math.max(1, page), pages);
-        int from = (current - 1) * pageSize;
-        int to = Math.min(homes.size(), from + pageSize);
-        for (int i = from; i < to; i++) {
-            Home home = homes.get(i);
-            buttons.add(actionButton(Component.text(home.name), 250,
-                    () -> tasks.entity(viewer, () -> onPick.accept(home.name))));
-        }
-        addPageButtons(buttons, viewer, pages, current, p -> showHomeDelete(viewer, homes, p, onPick));
-        showList(viewer, "dialog.list.title-delhome", buttons, current);
+        showHomePage(viewer, homes, page, onPick, true);
     }
 
     // ------------------------------------------------------------------ warps
 
     public void showWarpList(Player viewer, List<Warp> warps, int page, Consumer<String> onPick) {
-        List<ActionButton> buttons = new ArrayList<>();
-        int pages = Math.max(1, (warps.size() + pageSize - 1) / pageSize);
-        int current = Math.min(Math.max(1, page), pages);
-        int from = (current - 1) * pageSize;
-        int to = Math.min(warps.size(), from + pageSize);
-        for (int i = from; i < to; i++) {
-            Warp warp = warps.get(i);
-            buttons.add(actionButton(Component.text(warp.name), 250,
-                    () -> tasks.entity(viewer, () -> onPick.accept(warp.name))));
-        }
-        addPageButtons(buttons, viewer, pages, current, p -> showWarpList(viewer, warps, p, onPick));
-        showList(viewer, "dialog.list.title-warps", buttons, current);
+        showWarpPage(viewer, warps, page, onPick, false);
     }
 
     public void showWarpDelete(Player viewer, List<Warp> warps, int page, Consumer<String> onPick) {
-        List<ActionButton> buttons = new ArrayList<>();
-        int pages = Math.max(1, (warps.size() + pageSize - 1) / pageSize);
-        int current = Math.min(Math.max(1, page), pages);
-        int from = (current - 1) * pageSize;
-        int to = Math.min(warps.size(), from + pageSize);
-        for (int i = from; i < to; i++) {
-            Warp warp = warps.get(i);
-            buttons.add(actionButton(Component.text(warp.name), 250,
-                    () -> tasks.entity(viewer, () -> onPick.accept(warp.name))));
-        }
-        addPageButtons(buttons, viewer, pages, current, p -> showWarpDelete(viewer, warps, p, onPick));
-        showList(viewer, "dialog.list.title-delwarp", buttons, current);
+        showWarpPage(viewer, warps, page, onPick, true);
     }
 
     /** Generic name input dialog (used by /sethome and /setwarp without arguments). */
@@ -181,6 +137,32 @@ public final class DialogFactory {
 
     // ------------------------------------------------------------------ internals
 
+    private void showHomePage(Player viewer, List<Home> homes, int page, Consumer<String> onPick, boolean delete) {
+        int[] w = window(homes.size(), page);
+        List<ActionButton> buttons = new ArrayList<>();
+        for (int i = w[2]; i < w[3]; i++) {
+            Home home = homes.get(i);
+            buttons.add(actionButton(Component.text(home.name), 250,
+                    () -> tasks.entity(viewer, () -> onPick.accept(home.name))));
+        }
+        Consumer<Integer> reopen = p -> showHomePage(viewer, homes, p, onPick, delete);
+        addPageButtons(buttons, viewer, w[0], w[1], reopen);
+        showList(viewer, delete ? "dialog.list.title-delhome" : "dialog.list.title-homes", buttons, w[1]);
+    }
+
+    private void showWarpPage(Player viewer, List<Warp> warps, int page, Consumer<String> onPick, boolean delete) {
+        int[] w = window(warps.size(), page);
+        List<ActionButton> buttons = new ArrayList<>();
+        for (int i = w[2]; i < w[3]; i++) {
+            Warp warp = warps.get(i);
+            buttons.add(actionButton(Component.text(warp.name), 250,
+                    () -> tasks.entity(viewer, () -> onPick.accept(warp.name))));
+        }
+        Consumer<Integer> reopen = p -> showWarpPage(viewer, warps, p, onPick, delete);
+        addPageButtons(buttons, viewer, w[0], w[1], reopen);
+        showList(viewer, delete ? "dialog.list.title-delwarp" : "dialog.list.title-warps", buttons, w[1]);
+    }
+
     private void showList(Player viewer, String titleKey, List<ActionButton> buttons, int page) {
         Dialog dialog = Dialog.create(b -> b.empty()
                 .base(DialogBase.builder(messages.render(viewer, titleKey, "page", String.valueOf(page)))
@@ -188,6 +170,15 @@ public final class DialogFactory {
                         .build())
                 .type(DialogType.multiAction(buttons, closeButton(viewer), 2)));
         viewer.showDialog(dialog);
+    }
+
+    /** Clamps the page and computes {pages, current, from, to} for a slice of {@code total} entries. */
+    private int[] window(int total, int page) {
+        int pages = Math.max(1, (total + pageSize - 1) / pageSize);
+        int current = Math.min(Math.max(1, page), pages);
+        int from = (current - 1) * pageSize;
+        int to = Math.min(total, from + pageSize);
+        return new int[]{pages, current, from, to};
     }
 
     private ActionButton actionButton(Component label, int width, Runnable onClick) {

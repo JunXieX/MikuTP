@@ -180,7 +180,7 @@ public final class CommandRegistry {
                 dialogs.showHomeList(player, homes, 1, name -> homeService.go(player, name));
             }
         } else {
-            chats.homeList(player, homes, delete, null);
+            chats.homeList(player, homes, delete);
         }
     }
 

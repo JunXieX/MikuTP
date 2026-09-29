@@ -15,7 +15,6 @@
   "common.cross-connect-failed": "<prefix><red>跨服传送失败，无法连接目标服务器。</red>",
   "common.cross-disabled": "<prefix><red>本服务器未启用跨服功能，无法执行该操作。</red>",
   "common.invalid-name": "<prefix><red>名称仅允许字母、数字、下划线与连字符，长度 1-32。</red>",
-  "common.nothing-found": "<prefix><red>没有匹配的结果。</red>",
   "common.reload-done": "<prefix><green>配置与语言文件已重载。</green>",
 
   "home.limit-reached": "<prefix><red>家的数量已达上限（<white><limit></white>），可删除后重试。</red>",

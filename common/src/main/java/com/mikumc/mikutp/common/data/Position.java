@@ -33,10 +33,6 @@ public final class Position {
         return new Position(null, world, x, y, z, yaw, pitch);
     }
 
-    public boolean hasServer() {
-        return server != null && !server.isBlank();
-    }
-
     public String shortText() {
         String w = world == null ? "?" : world;
         return w + " " + Math.round(x) + ", " + Math.round(y) + ", " + Math.round(z);

@@ -7,9 +7,7 @@ import net.kyori.adventure.text.minimessage.tag.resolver.Placeholder;
 import net.kyori.adventure.text.minimessage.tag.resolver.TagResolver;
 import org.bukkit.command.CommandSender;
 import org.bukkit.entity.Player;
-import org.bukkit.plugin.java.JavaPlugin;
 
-import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 
@@ -21,14 +19,12 @@ public final class MessageService {
 
     private static final MiniMessage MM = MiniMessage.miniMessage();
 
-    private final JavaPlugin plugin;
     private final boolean papiAvailable;
     private volatile boolean parsePapi;
     private volatile MessageBundle bundle;
     private volatile Component prefix;
 
-    public MessageService(JavaPlugin plugin, MessageBundle bundle, boolean parsePapi, boolean papiAvailable) {
-        this.plugin = plugin;
+    public MessageService(MessageBundle bundle, boolean parsePapi, boolean papiAvailable) {
         this.bundle = bundle;
         this.parsePapi = parsePapi;
         this.papiAvailable = papiAvailable;
@@ -74,9 +70,5 @@ public final class MessageService {
             resolvers.add(Placeholder.unparsed(pairs[i], pairs[i + 1] == null ? "" : pairs[i + 1]));
         }
         return TagResolver.resolver(resolvers);
-    }
-
-    public Path languageFile() {
-        return plugin.getDataFolder().toPath().resolve(bundle.raw("language_file"));
     }
 }

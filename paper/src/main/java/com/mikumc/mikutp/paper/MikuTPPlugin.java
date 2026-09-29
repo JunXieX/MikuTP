@@ -253,7 +253,7 @@ public final class MikuTPPlugin extends JavaPlugin {
         MessageBundle bundle = new MessageBundle(readResource("messages_zh_cn.json"));
         bundle.loadOverrides(getDataFolder().toPath().resolve(config.languageFile));
         if (messages == null) {
-            messages = new MessageService(this, bundle, config.parsePlaceholderApi, papiAvailable);
+            messages = new MessageService(bundle, config.parsePlaceholderApi, papiAvailable);
         } else {
             messages.reload(bundle, config.parsePlaceholderApi);
         }

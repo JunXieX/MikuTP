@@ -18,16 +18,4 @@ public final class Validate {
             return false;
         }
     }
-
-    public static boolean validUuid(String value) {
-        if (value == null) {
-            return false;
-        }
-        try {
-            java.util.UUID.fromString(value);
-            return true;
-        } catch (IllegalArgumentException e) {
-            return false;
-        }
-    }
 }

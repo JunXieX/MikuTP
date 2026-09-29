@@ -8,7 +8,6 @@ import net.kyori.adventure.text.event.ClickEvent;
 import org.bukkit.entity.Player;
 
 import java.util.List;
-import java.util.function.Consumer;
 
 /**
  * Clickable chat fallback for every dialog menu, used when dialogs are
@@ -22,7 +21,7 @@ public final class ChatMenus {
         this.messages = messages;
     }
 
-    public void homeList(Player viewer, List<Home> homes, boolean delete, Consumer<String> unused) {
+    public void homeList(Player viewer, List<Home> homes, boolean delete) {
         if (homes.isEmpty()) {
             messages.send(viewer, "home.empty");
             return;

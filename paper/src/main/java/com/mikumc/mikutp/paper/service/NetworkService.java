@@ -20,7 +20,6 @@ public final class NetworkService {
     private final JavaPlugin plugin;
     private final Tasks tasks;
     private final MessageService messages;
-    private volatile boolean enabled;
     private final Map<String, CompletableFuture<java.util.List<String>>>
             playerListFutures = new ConcurrentHashMap<>();
 
@@ -38,10 +37,6 @@ public final class NetworkService {
         var messenger = plugin.getServer().getMessenger();
         messenger.unregisterIncomingPluginChannel(plugin, ProxyMessages.CHANNEL);
         messenger.unregisterOutgoingPluginChannel(plugin, ProxyMessages.CHANNEL);
-    }
-
-    public void setEnabled(boolean enabled) {
-        this.enabled = enabled;
     }
 
     private void onIncoming(Player carrier, byte[] bytes) {

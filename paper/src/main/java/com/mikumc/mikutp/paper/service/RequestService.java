@@ -13,7 +13,6 @@ import org.bukkit.entity.Player;
 import org.bukkit.plugin.java.JavaPlugin;
 
 import java.util.ArrayList;
-import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
@@ -46,9 +45,11 @@ public final class RequestService {
     /** Renders an incoming request to its target (dialog or clickable chat). */
     private Consumer<TpRequest> showRequestHandler;
 
-    /** Target player uuid -> request id -> request. */
+    /** Target player uuid -> request id -> request. Inner maps are concurrent:
+     * consumer, sweep and command threads all touch them. */
     private final Map<UUID, Map<String, TpRequest>> incoming = new ConcurrentHashMap<>();
     private final Map<UUID, String> outgoing = new ConcurrentHashMap<>();
+    private final Map<UUID, String> lastIncoming = new ConcurrentHashMap<>();
     private final java.util.Set<String> deliveredEvents = ConcurrentHashMap.newKeySet();
     private final java.util.Set<String> handledEvents = ConcurrentHashMap.newKeySet();
     private volatile long lastDump = 0;
@@ -86,6 +87,7 @@ public final class RequestService {
 
     public void onQuit(UUID player) {
         String pid = player.toString();
+        lastIncoming.remove(player);
         Map<String, TpRequest> mine = incoming.remove(player);
         if (mine != null) {
             for (TpRequest request : mine.values()) {
@@ -237,6 +239,26 @@ public final class RequestService {
             storeIgnore(UUID.fromString(request.targetUuid), UUID.fromString(request.requesterUuid),
                     config.tpa.blockDurationMinutes);
         }
+        Player requester = Bukkit.getPlayer(UUID.fromString(request.requesterUuid));
+        if (requester != null) {
+            // Both parties are on this server: teleport locally, no bus event needed.
+            switch (response) {
+                case ACCEPT -> {
+                    Player mover = request.type == TpRequest.Type.GO ? requester : target;
+                    Player anchor = request.type == TpRequest.Type.GO ? target : requester;
+                    messages.send(requester, "tpa.accepted-requester", "player", request.targetName);
+                    if (mover.isOnline()) {
+                        teleports.sendLocalTo(mover, anchor, anchor.getName(), true);
+                    }
+                }
+                case DENY -> messages.send(requester, "tpa.denied-requester", "player", request.targetName);
+                case BLOCK -> messages.send(requester, "tpa.blocked-requester", "player", request.targetName);
+            }
+            return;
+        }
+        if (!syncBus.crossServer()) {
+            return; // requester is gone and there is no cross-server path left
+        }
         if (response == Response.ACCEPT && request.type == TpRequest.Type.GO) {
             // The requester travels here; stash our position for their arrival before
             // announcing the acceptance.
@@ -248,8 +270,6 @@ public final class RequestService {
         event.response = response.name();
         syncBus.publish(event);
     }
-
-    private final Map<UUID, String> lastIncoming = new ConcurrentHashMap<>();
 
     private void storeIgnore(UUID blocker, UUID blocked, int minutes) {
         long expiresAt = minutes <= 0 ? IgnoreEntry.PERMANENT
@@ -265,8 +285,9 @@ public final class RequestService {
     }
 
     public void toggle(Player player) {
-        profiles.setTpaEnabled(player.getUniqueId(), !profiles.isTpaEnabled(player.getUniqueId()));
-        messages.send(player, profiles.isTpaEnabled(player.getUniqueId()) ? "tpa.toggled-on" : "tpa.toggled-off");
+        boolean next = !profiles.isTpaEnabled(player.getUniqueId());
+        profiles.setTpaEnabled(player.getUniqueId(), next);
+        messages.send(player, next ? "tpa.toggled-on" : "tpa.toggled-off");
     }
 
     public void block(Player blocker, String targetName, boolean permanent) {
@@ -376,7 +397,7 @@ public final class RequestService {
         if (target == null) {
             return;
         }
-        incoming.computeIfAbsent(target.getUniqueId(), k -> new HashMap<>()).put(request.id, request);
+        incoming.computeIfAbsent(target.getUniqueId(), k -> new ConcurrentHashMap<>()).put(request.id, request);
         lastIncoming.put(target.getUniqueId(), request.id);
         tasks.entity(target, () -> {
             Consumer<TpRequest> handler = showRequestHandler;
@@ -410,13 +431,19 @@ public final class RequestService {
             }
             switch (response) {
                 case ACCEPT -> {
+                    messages.send(requester, "tpa.accepted-requester", "player", request.targetName);
                     if (request.type == TpRequest.Type.GO) {
-                        // The acceptor already stashed our destination.
-                        messages.send(requester, "tpa.accepted-requester", "player", request.targetName);
-                        teleports.dispatchToAnchor(requester, request.targetUuid, null);
+                        // Prefer a direct teleport when the acceptor is on this server
+                        // (covers players who switched servers while the event was in flight).
+                        Player anchor = Bukkit.getPlayer(UUID.fromString(request.targetUuid));
+                        if (anchor != null) {
+                            teleports.sendLocalTo(requester, anchor, anchor.getName(), true);
+                        } else {
+                            teleports.dispatchToAnchor(requester, request.targetUuid, null);
+                        }
                     } else {
-                        messages.send(requester, "tpa.accepted-requester", "player", request.targetName);
-                        // Stash our live position for the arriving target, then give the go-ahead.
+                        // Come-here: the target travels. Stash our live position, then
+                        // give the target's backend the go-ahead.
                         teleports.stashPendingTeleport(UUID.fromString(request.targetUuid),
                                 requester.getUniqueId(), PendingTeleport.Source.TPA_HERE);
                         SyncEvent ready = SyncEvent.create(SyncEvent.Type.TP_READY, serverId);
@@ -444,8 +471,13 @@ public final class RequestService {
             return;
         }
         outgoing.remove(mover.getUniqueId(), request.id);
-        tasks.entity(mover, () -> messages.send(mover, "tpa.accepted-requester", "player", request.requesterName));
-        teleports.dispatchToAnchor(mover, request.requesterUuid, null);
+        messages.send(mover, "tpa.accepted-requester", "player", request.requesterName);
+        Player anchor = Bukkit.getPlayer(UUID.fromString(request.requesterUuid));
+        if (anchor != null) {
+            teleports.sendLocalTo(mover, anchor, anchor.getName(), true);
+        } else {
+            teleports.dispatchToAnchor(mover, request.requesterUuid, null);
+        }
     }
 
     private void applyIgnoreSync(SyncEvent event) {

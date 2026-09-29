@@ -32,6 +32,8 @@ public final class HomeService {
     private final SyncBus syncBus;
     private final String serverId;
     private final Map<UUID, List<Home>> cache = new ConcurrentHashMap<>();
+    /** Home limits captured on the join thread; PlaceholderAPI reads these off-thread. */
+    private final Map<UUID, Integer> limitCache = new ConcurrentHashMap<>();
 
     public HomeService(JavaPlugin plugin, Tasks tasks, MikuTPConfig config, Database database,
                        MessageService messages, CooldownManager cooldowns, TeleportService teleports,
@@ -48,6 +50,7 @@ public final class HomeService {
     }
 
     public void onJoin(Player player) {
+        tasks.entity(player, () -> limitCache.put(player.getUniqueId(), computeLimit(player)));
         tasks.async(() -> {
             try {
                 cache.put(player.getUniqueId(), database.listHomes(player.getUniqueId().toString()));
@@ -59,6 +62,12 @@ public final class HomeService {
 
     public void onQuit(UUID player) {
         cache.remove(player);
+        limitCache.remove(player);
+    }
+
+    /** Cached limit for off-thread consumers (PlaceholderAPI). */
+    public int cachedLimit(UUID player) {
+        return limitCache.getOrDefault(player, Math.max(0, config.home.defaultLimit));
     }
 
     public List<Home> homes(UUID player) {
@@ -68,6 +77,10 @@ public final class HomeService {
 
     /** Home limit from mikutp.homes.&lt;n&gt; permissions; must run on the player's thread. */
     public int limit(Player player) {
+        return computeLimit(player);
+    }
+
+    private int computeLimit(Player player) {
         if (player.hasPermission("mikutp.homes.unlimited")) {
             return Integer.MAX_VALUE;
         }
@@ -201,6 +214,7 @@ public final class HomeService {
                 messages.send(player, "home.not-found", "name", name);
                 return;
             }
+            // Only burn the cooldown on a real, reachable home.
             cooldowns.apply(id, CooldownManager.Kind.HOME);
             messages.send(player, "home.going", "name", home.name);
             teleports.send(player, home.position, PendingTeleport.Source.HOME, home.name, null);

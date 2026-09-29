@@ -59,9 +59,9 @@ public final class MikuTPExpansion extends PlaceholderExpansion {
         UUID id = player == null ? null : player.getUniqueId();
         return switch (key) {
             case "homes_used" -> id == null ? "" : String.valueOf(homeService.homes(id).size());
-            case "homes_max" -> player instanceof Player online ? String.valueOf(homeService.limit(online)) : "";
+            case "homes_max" -> player instanceof Player online ? String.valueOf(homeService.cachedLimit(online.getUniqueId())) : "";
             case "homes_left" -> player instanceof Player online
-                    ? String.valueOf(Math.max(0, homeService.limit(online) - homeService.homes(id).size()))
+                    ? String.valueOf(Math.max(0, homeService.cachedLimit(online.getUniqueId()) - homeService.homes(id).size()))
                     : "";
             case "warps" -> String.valueOf(warpService.warps().size());
             case "tpa_enabled" -> id == null ? "" : String.valueOf(profiles.isTpaEnabled(id));
