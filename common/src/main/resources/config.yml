@@ -199,6 +199,14 @@ commands:
   dback:
     enabled: true
     aliases: []
+  # 管理员传送到玩家身边（/otp，跳过预热与冷却）
+  otp:
+    enabled: true
+    aliases: []
+  # 管理员将玩家拉到身边（/otph 玩家 或 /otph all [子服名]）
+  otph:
+    enabled: true
+    aliases: []
   # 管理命令（/mtp reload|info，默认别名 /mikutp）
   mtp:
     enabled: true

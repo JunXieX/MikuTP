@@ -39,6 +39,9 @@ permissions:
   mikutp.dback:
     description: 使用 /dback 返回死亡地点
     default: true
+  mikutp.otp:
+    description: 使用 /otp 与 /otph 强制传送（管理员）
+    default: op
   mikutp.admin:
     description: 使用 /mtp 管理命令（reload/info）
     default: op

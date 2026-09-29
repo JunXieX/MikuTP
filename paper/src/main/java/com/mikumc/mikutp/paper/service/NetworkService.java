@@ -21,6 +21,8 @@ public final class NetworkService {
     private volatile Consumer<TpRequest> requestHandler;
     private volatile Consumer<TpRequest> tpGoHandler;
     private volatile boolean enabled;
+    private final java.util.Map<String, java.util.concurrent.CompletableFuture<java.util.List<String>>>
+            playerListFutures = new java.util.concurrent.ConcurrentHashMap<>();
 
     public NetworkService(JavaPlugin plugin, Tasks tasks, MessageService messages) {
         this.plugin = plugin;
@@ -79,6 +81,22 @@ public final class NetworkService {
             }
             return;
         }
+        if (ProxyMessages.TYPE_PLAYER_LIST.equals(type)) {
+            String id = o.has("id") && o.get("id").isJsonPrimitive() ? o.get("id").getAsString() : null;
+            java.util.List<String> players = new java.util.ArrayList<>();
+            if (o.has("players") && o.get("players").isJsonArray()) {
+                for (var element : o.getAsJsonArray("players")) {
+                    players.add(element.getAsString());
+                }
+            }
+            if (id != null) {
+                var future = playerListFutures.remove(id);
+                if (future != null) {
+                    future.complete(players);
+                }
+            }
+            return;
+        }
         if (ProxyMessages.TYPE_CONNECT_RESULT.equals(type)) {
             boolean ok = o.has("ok") && o.get("ok").isJsonPrimitive() && o.get("ok").getAsBoolean();
             if (!ok) {
@@ -107,6 +125,25 @@ public final class NetworkService {
 
     private void route(String to, String bodyJson, Player carrier) {
         send(carrier, ProxyMessages.encodeRoute(to, bodyJson));
+    }
+
+    /**
+     * Asks the proxy for the online players of one server, or of the whole
+     * network when {@code serverName} is null. Completes with an empty list on
+     * timeout (roughly 5 seconds).
+     */
+    public java.util.concurrent.CompletableFuture<java.util.List<String>> requestPlayerList(Player carrier, String serverName) {
+        String id = java.util.UUID.randomUUID().toString();
+        var future = new java.util.concurrent.CompletableFuture<java.util.List<String>>();
+        playerListFutures.put(id, future);
+        tasks.asyncDelayed(() -> {
+            var pending = playerListFutures.remove(id);
+            if (pending != null && !pending.isDone()) {
+                pending.complete(java.util.List.of());
+            }
+        }, 5000);
+        send(carrier, ProxyMessages.encodeListPlayers(id, serverName));
+        return future;
     }
 
     private void send(Player carrier, String json) {

@@ -99,6 +99,8 @@ public final class CommandRegistry {
             reg.accept(new Registration("wild", wild(), "随机传送", List.of("rtp")));
             reg.accept(new Registration("back", back(), "返回上次传送位置", List.of()));
             reg.accept(new Registration("dback", dback(), "返回死亡地点", List.of()));
+            reg.accept(new Registration("otp", otp(), "强制传送到玩家身边", List.of()));
+            reg.accept(new Registration("otph", otph(), "强制将玩家传送过来", List.of()));
             reg.accept(new Registration("ui", ui(), "传送请求快捷响应", List.of()));
             reg.accept(new Registration("mtp", admin(), "MikuTP 管理命令", List.of("mikutp")));
         });
@@ -123,6 +125,8 @@ public final class CommandRegistry {
             case "wild" -> commands.wild;
             case "back" -> commands.back;
             case "dback" -> commands.dback;
+            case "otp" -> commands.otp;
+            case "otph" -> commands.otph;
             case "mtp" -> commands.mtp;
             case "ui" -> commands.ui;
             default -> null;
@@ -322,6 +326,58 @@ public final class CommandRegistry {
 
     private LiteralCommandNode<CommandSourceStack> dback() {
         return historyCommand("dback", "mikutp.dback", CooldownManager.Kind.DBACK, teleports::goDeathBack);
+    }
+
+    private LiteralCommandNode<CommandSourceStack> otp() {
+        LiteralArgumentBuilder<CommandSourceStack> root = Commands.literal("otp")
+                .requires(requiresPlayer("mikutp.otp"))
+                .executes(ctx -> {
+                    messages.send(asPlayer(ctx.getSource()), "otp.usage");
+                    return 1;
+                });
+        root.then(Commands.argument("player", StringArgumentType.word())
+                .suggests(onlinePlayerSuggestions())
+                .executes(ctx -> {
+                    teleports.adminGoto(asPlayer(ctx.getSource()), StringArgumentType.getString(ctx, "player"));
+                    return 1;
+                }));
+        return root.build();
+    }
+
+    private LiteralCommandNode<CommandSourceStack> otph() {
+        LiteralArgumentBuilder<CommandSourceStack> root = Commands.literal("otph")
+                .requires(requiresPlayer("mikutp.otp"))
+                .executes(ctx -> {
+                    messages.send(asPlayer(ctx.getSource()), "otph.usage");
+                    return 1;
+                });
+        root.then(Commands.literal("all")
+                .executes(ctx -> {
+                    teleports.adminBringAll(asPlayer(ctx.getSource()), null);
+                    return 1;
+                })
+                .then(Commands.argument("server", StringArgumentType.word())
+                        .executes(ctx -> {
+                            teleports.adminBringAll(asPlayer(ctx.getSource()),
+                                    StringArgumentType.getString(ctx, "server"));
+                            return 1;
+                        })));
+        root.then(Commands.argument("player", StringArgumentType.word())
+                .suggests(onlinePlayerSuggestions())
+                .executes(ctx -> {
+                    teleports.adminBring(asPlayer(ctx.getSource()), StringArgumentType.getString(ctx, "player"));
+                    return 1;
+                }));
+        return root.build();
+    }
+
+    private com.mojang.brigadier.suggestion.SuggestionProvider<CommandSourceStack> onlinePlayerSuggestions() {
+        return (ctx, builder) -> {
+            for (Player online : Bukkit.getOnlinePlayers()) {
+                builder.suggest(online.getName());
+            }
+            return builder.buildFuture();
+        };
     }
 
     private LiteralCommandNode<CommandSourceStack> historyCommand(String name, String permission,

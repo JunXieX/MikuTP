@@ -129,8 +129,10 @@ public final class Database implements AutoCloseable {
                   yaw DOUBLE NOT NULL DEFAULT 0,
                   pitch DOUBLE NOT NULL DEFAULT 0,
                   source VARCHAR(16) NOT NULL,
+                  anchor VARCHAR(36),
                   created_at BIGINT NOT NULL
                 )""".formatted(prefix));
+        column("ALTER TABLE %steleports ADD COLUMN anchor VARCHAR(36)".formatted(prefix));
         exec("""
                 CREATE TABLE IF NOT EXISTS %signores (
                   blocker_uuid VARCHAR(36) NOT NULL,
@@ -456,12 +458,12 @@ public final class Database implements AutoCloseable {
 
     public void putPendingTeleport(PendingTeleport t) throws SQLException {
         String base = """
-                INSERT INTO %steleports (uuid, server, world, x, y, z, yaw, pitch, source, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO %steleports (uuid, server, world, x, y, z, yaw, pitch, source, anchor, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """.formatted(prefix);
         String sql = dialect == Dialect.SQLITE
-                ? base + " ON CONFLICT(uuid) DO UPDATE SET server = excluded.server, world = excluded.world, x = excluded.x, y = excluded.y, z = excluded.z, yaw = excluded.yaw, pitch = excluded.pitch, source = excluded.source, created_at = excluded.created_at"
-                : base + " ON DUPLICATE KEY UPDATE server = VALUES(server), world = VALUES(world), x = VALUES(x), y = VALUES(y), z = VALUES(z), yaw = VALUES(yaw), pitch = VALUES(pitch), source = VALUES(source), created_at = VALUES(created_at)";
+                ? base + " ON CONFLICT(uuid) DO UPDATE SET server = excluded.server, world = excluded.world, x = excluded.x, y = excluded.y, z = excluded.z, yaw = excluded.yaw, pitch = excluded.pitch, source = excluded.source, anchor = excluded.anchor, created_at = excluded.created_at"
+                : base + " ON DUPLICATE KEY UPDATE server = VALUES(server), world = VALUES(world), x = VALUES(x), y = VALUES(y), z = VALUES(z), yaw = VALUES(yaw), pitch = VALUES(pitch), source = VALUES(source), anchor = VALUES(anchor), created_at = VALUES(created_at)";
         execUpdate(sql, ps -> {
             ps.setString(1, t.playerUuid);
             ps.setString(2, t.position.server == null ? "" : t.position.server);
@@ -472,15 +474,21 @@ public final class Database implements AutoCloseable {
             ps.setDouble(7, t.position.yaw);
             ps.setDouble(8, t.position.pitch);
             ps.setString(9, t.source.name());
-            ps.setLong(10, t.createdAt);
+            ps.setString(10, t.anchorUuid == null ? "" : t.anchorUuid);
+            ps.setLong(11, t.createdAt);
         });
     }
 
     public Optional<PendingTeleport> takePendingTeleport(String playerUuid) throws SQLException {
         Optional<PendingTeleport> found = queryOne("SELECT * FROM %steleports WHERE uuid = ?".formatted(prefix),
-                ps -> ps.setString(1, playerUuid), rs -> new PendingTeleport(rs.getString("uuid"),
-                        readPosition(rs, "", "server"), PendingTeleport.Source.valueOf(rs.getString("source")),
-                        rs.getLong("created_at")));
+                ps -> ps.setString(1, playerUuid), rs -> {
+                    PendingTeleport pending = new PendingTeleport(rs.getString("uuid"),
+                            readPosition(rs, "", "server"), PendingTeleport.Source.valueOf(rs.getString("source")),
+                            rs.getLong("created_at"));
+                    String anchor = rs.getString("anchor");
+                    pending.anchorUuid = anchor == null || anchor.isBlank() ? null : anchor;
+                    return pending;
+                });
         if (found.isPresent()) {
             execUpdate("DELETE FROM %steleports WHERE uuid = ?".formatted(prefix),
                     ps -> ps.setString(1, playerUuid));

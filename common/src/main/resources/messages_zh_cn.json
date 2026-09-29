@@ -68,6 +68,14 @@
   "dback.none": "<prefix><red>没有记录到死亡地点。</red>",
   "dback.going": "<prefix><gray>正在返回死亡地点……</gray>",
 
+  "otp.usage": "<prefix><yellow>用法：<white>/otp <玩家名></white>（强制传送到 TA 身边）。</yellow>",
+  "otph.usage": "<prefix><yellow>用法：<white>/otph <玩家名></white> 或 <white>/otph all [子服名]</white>（不填子服名则拉取全部玩家）。</yellow>",
+  "admin.self": "<prefix><red>不能对自己使用该命令。</red>",
+  "admin.target-left": "<prefix><red>目标玩家已离开，传送未完成。</red>",
+  "admin.pulled-you": "<prefix><yellow>你已被管理员传送到 <white><player></white> 身边。</yellow>",
+  "admin.bring-started": "<prefix><gray>正在将 <white><player></white> 传送过来……</gray>",
+  "admin.bring-all-done": "<prefix><green>已传送 <white><count></white> 名玩家到你身边。</green>",
+
   "admin.info": "<prefix><gray>模式：<white><mode></white> | 服务器：<white><server></white> | 存储：<white><storage></white></gray>",
   "admin.unknown-sub": "<prefix><red>未知子命令，可用：reload、info。</red>",
 

@@ -147,6 +147,18 @@ class DatabaseTest {
         PendingTeleport taken = database.takePendingTeleport("uuid-a").orElseThrow();
         assertEquals(9.0, taken.position.x);
         assertEquals("s2", taken.position.server);
+        assertTrue(taken.anchorUuid == null);
+        assertTrue(database.takePendingTeleport("uuid-a").isEmpty());
+    }
+
+    @Test
+    void pendingTeleportAnchorRoundTrip() throws Exception {
+        Position stub = new Position(null, "", 0, 0, 0, 0f, 0f);
+        database.putPendingTeleport(new PendingTeleport("uuid-a", stub, PendingTeleport.Source.ADMIN, 1L, "uuid-anchor"));
+
+        PendingTeleport taken = database.takePendingTeleport("uuid-a").orElseThrow();
+        assertEquals("uuid-anchor", taken.anchorUuid);
+        assertEquals(PendingTeleport.Source.ADMIN, taken.source);
         assertTrue(database.takePendingTeleport("uuid-a").isEmpty());
     }
 

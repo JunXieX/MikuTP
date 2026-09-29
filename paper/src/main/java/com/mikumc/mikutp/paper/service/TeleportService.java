@@ -11,7 +11,6 @@ import org.bukkit.entity.Player;
 import org.bukkit.plugin.java.JavaPlugin;
 
 import java.util.UUID;
-import java.util.function.Supplier;
 
 /**
  * Central teleport execution: warmup, local transfers, cross-server dispatch
@@ -27,10 +26,12 @@ public final class TeleportService {
     private final Effects effects;
     private final WarmupManager warmups;
     private final NetworkService network;
+    private final ProfileService profiles;
     private final String serverId;
 
     public TeleportService(JavaPlugin plugin, Tasks tasks, MikuTPConfig config, Database database,
-                           MessageService messages, Effects effects, WarmupManager warmups, NetworkService network) {
+                           MessageService messages, Effects effects, WarmupManager warmups, NetworkService network,
+                           ProfileService profiles) {
         this.plugin = plugin;
         this.tasks = tasks;
         this.config = config;
@@ -39,6 +40,7 @@ public final class TeleportService {
         this.effects = effects;
         this.warmups = warmups;
         this.network = network;
+        this.profiles = profiles;
         this.serverId = config.crossServer.serverId;
     }
 
@@ -55,11 +57,28 @@ public final class TeleportService {
         tasks.entity(player, () -> begin(player, dest, source, label, afterDispatch));
     }
 
-    /** Teleports to a live location after warmup; the position is read at warmup end. */
-    public void sendLocal(Player player, Supplier<Location> target, String label) {
-        tasks.entity(player, () -> {
-            recordBack(player);
-            startWarmup(player, () -> teleportNow(player, target.get(), label));
+    /**
+     * Teleports {@code mover} to {@code anchor}'s live location after warmup;
+     * the position is read on the anchor's own region thread (Folia-safe).
+     */
+    public void sendLocalTo(Player mover, Player anchor, String label, boolean warmup) {
+        tasks.entity(anchor, () -> {
+            Player stable = Bukkit.getPlayer(anchor.getUniqueId());
+            if (stable == null) {
+                return;
+            }
+            Location location = stable.getLocation().clone();
+            tasks.entity(mover, () -> {
+                if (!mover.isOnline()) {
+                    return;
+                }
+                recordBack(mover);
+                if (warmup) {
+                    startWarmup(mover, () -> teleportNow(mover, location, label));
+                } else {
+                    teleportNow(mover, location, label);
+                }
+            });
         });
     }
 
@@ -80,6 +99,31 @@ public final class TeleportService {
             if (destServer != null && !destServer.isBlank() && !destServer.equals(serverId)) {
                 return;
             }
+            if (pending.anchorUuid != null && !pending.anchorUuid.isBlank()) {
+                UUID anchorId = parseUuid(pending.anchorUuid);
+                Player anchor = anchorId == null ? null : Bukkit.getPlayer(anchorId);
+                if (anchor != null) {
+                    // Teleport to the anchor's live position, read on their region thread.
+                    tasks.entity(anchor, () -> {
+                        Player stable = Bukkit.getPlayer(anchorId);
+                        if (stable == null) {
+                            fallbackPendingArrival(playerUuid, pending);
+                            return;
+                        }
+                        Location live = stable.getLocation().clone();
+                        playerTeleportAsync(playerUuid, live, pending.source.name().toLowerCase());
+                    });
+                    return;
+                }
+                if (pending.position.world == null || pending.position.world.isBlank()) {
+                    // Anchor gone and no stored position to fall back on.
+                    Player arriving = Bukkit.getPlayer(playerUuid);
+                    if (arriving != null) {
+                        messages.send(arriving, "admin.target-left");
+                    }
+                    return;
+                }
+            }
             World world = Bukkit.getWorld(pending.position.world);
             if (world == null) {
                 plugin.getSLF4JLogger().warn("Pending teleport targets unknown world {}", pending.position.world);
@@ -88,6 +132,144 @@ public final class TeleportService {
             Location target = new Location(world, pending.position.x, pending.position.y,
                     pending.position.z, pending.position.yaw, pending.position.pitch);
             playerTeleportAsync(playerUuid, target, pending.source.name().toLowerCase());
+        });
+    }
+
+    /** /otp: forcibly travels to a player's side, locally or across the network. */
+    public void adminGoto(Player admin, String targetName) {
+        profiles.resolve(targetName).thenAccept(opt -> {
+            if (opt.isEmpty()) {
+                messages.send(admin, "common.player-not-found", "player", targetName);
+                return;
+            }
+            ProfileService.PlayerRecord record = opt.get();
+            if (record.uuid().equals(admin.getUniqueId())) {
+                messages.send(admin, "admin.self");
+                return;
+            }
+            if (record.local()) {
+                Player target = Bukkit.getPlayer(record.uuid());
+                if (target == null) {
+                    messages.send(admin, "common.player-not-found", "player", targetName);
+                    return;
+                }
+                messages.send(admin, "common.teleporting", "target", target.getName());
+                sendLocalTo(admin, target, target.getName(), false);
+                return;
+            }
+            if (!network.enabled()) {
+                messages.send(admin, "common.cross-disabled");
+                return;
+            }
+            tasks.async(() -> {
+                try {
+                    // The arrival server resolves the target's live position via the anchor.
+                    PendingTeleport pending = new PendingTeleport(admin.getUniqueId().toString(),
+                            new Position(null, "", 0, 0, 0, 0f, 0f), PendingTeleport.Source.ADMIN,
+                            System.currentTimeMillis(), record.uuid().toString());
+                    database.putPendingTeleport(pending);
+                    tasks.entity(admin, () -> network.connectAnchor(admin, record.uuid().toString()));
+                } catch (Exception e) {
+                    plugin.getSLF4JLogger().warn("Admin goto dispatch failed", e);
+                    messages.send(admin, "common.teleport-failed");
+                }
+            });
+        });
+    }
+
+    /** /otph: forcibly brings a player to the admin's side, locally or across the network. */
+    public void adminBring(Player admin, String targetName) {
+        profiles.resolve(targetName).thenAccept(opt -> {
+            if (opt.isEmpty()) {
+                messages.send(admin, "common.player-not-found", "player", targetName);
+                return;
+            }
+            ProfileService.PlayerRecord record = opt.get();
+            if (record.uuid().equals(admin.getUniqueId())) {
+                messages.send(admin, "admin.self");
+                return;
+            }
+            if (record.local()) {
+                Player target = Bukkit.getPlayer(record.uuid());
+                if (target == null) {
+                    messages.send(admin, "common.player-not-found", "player", targetName);
+                    return;
+                }
+                messages.send(target, "admin.pulled-you", "player", admin.getName());
+                sendLocalTo(target, admin, admin.getName(), false);
+                return;
+            }
+            if (!network.enabled()) {
+                messages.send(admin, "common.cross-disabled");
+                return;
+            }
+            adminBringRemote(admin, record.uuid());
+            messages.send(admin, "admin.bring-started", "player", record.name());
+        });
+    }
+
+    /** /otph all [server]: pulls every matching online player to the admin's side. */
+    public void adminBringAll(Player admin, String serverName) {
+        if (!network.enabled()) {
+            if (serverName != null) {
+                messages.send(admin, "common.cross-disabled");
+                return;
+            }
+            int count = 0;
+            for (Player victim : Bukkit.getOnlinePlayers()) {
+                if (victim.getUniqueId().equals(admin.getUniqueId())) {
+                    continue;
+                }
+                messages.send(victim, "admin.pulled-you", "player", admin.getName());
+                sendLocalTo(victim, admin, admin.getName(), false);
+                count++;
+            }
+            messages.send(admin, "admin.bring-all-done", "count", String.valueOf(count));
+            return;
+        }
+        network.requestPlayerList(admin, serverName).thenAccept(uuids -> {
+            int count = 0;
+            for (String uuid : uuids) {
+                UUID victim;
+                try {
+                    victim = UUID.fromString(uuid);
+                } catch (IllegalArgumentException e) {
+                    continue;
+                }
+                if (victim.equals(admin.getUniqueId())) {
+                    continue;
+                }
+                Player local = Bukkit.getPlayer(victim);
+                if (local != null) {
+                    messages.send(local, "admin.pulled-you", "player", admin.getName());
+                    sendLocalTo(local, admin, admin.getName(), false);
+                } else {
+                    adminBringRemote(admin, victim);
+                }
+                count++;
+            }
+            messages.send(admin, "admin.bring-all-done", "count", String.valueOf(count));
+        });
+    }
+
+    private void adminBringRemote(Player admin, UUID victim) {
+        tasks.entity(admin, () -> {
+            Player stable = Bukkit.getPlayer(admin.getUniqueId());
+            if (stable == null) {
+                return;
+            }
+            Position here = positionOf(stable.getLocation());
+            tasks.async(() -> {
+                try {
+                    PendingTeleport pending = new PendingTeleport(victim.toString(), here,
+                            PendingTeleport.Source.ADMIN, System.currentTimeMillis(),
+                            admin.getUniqueId().toString());
+                    database.putPendingTeleport(pending);
+                    tasks.entity(stable, () -> network.connectAnchor(stable, victim.toString()));
+                } catch (Exception e) {
+                    plugin.getSLF4JLogger().warn("Admin bring dispatch failed", e);
+                }
+            });
         });
     }
 
@@ -211,6 +393,29 @@ public final class TeleportService {
                 effects.teleport(player);
             }
         }));
+    }
+
+    private static UUID parseUuid(String value) {
+        try {
+            return UUID.fromString(value);
+        } catch (IllegalArgumentException e) {
+            return null;
+        }
+    }
+
+    /** Anchor-based arrival fallback: use the stored position, else tell the player it failed. */
+    private void fallbackPendingArrival(UUID playerUuid, PendingTeleport pending) {
+        World world = Bukkit.getWorld(pending.position.world);
+        Player arriving = Bukkit.getPlayer(playerUuid);
+        if (world == null || arriving == null) {
+            if (arriving != null) {
+                messages.send(arriving, "admin.target-left");
+            }
+            return;
+        }
+        Location target = new Location(world, pending.position.x, pending.position.y,
+                pending.position.z, pending.position.yaw, pending.position.pitch);
+        playerTeleportAsync(playerUuid, target, pending.source.name().toLowerCase());
     }
 
     private void dispatchCross(Player player, Position dest, PendingTeleport.Source source, Runnable afterDispatch) {

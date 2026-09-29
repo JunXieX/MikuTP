@@ -82,7 +82,7 @@ public final class MikuTPPlugin extends JavaPlugin {
         profiles = new ProfileService(this, tasks, database);
         teleports = new TeleportService(this, tasks, config, database, messages, effects,
                 new com.mikumc.mikutp.paper.service.WarmupManager(tasks, messages, effects, config.teleport.warmupSeconds),
-                network);
+                network, profiles);
         homeService = new HomeService(this, tasks, config, database, messages, cooldowns, teleports);
         warpService = new WarpService(this, tasks, config, database, messages, cooldowns, teleports);
         requestService = new RequestService(this, tasks, config, database, messages, effects, cooldowns,

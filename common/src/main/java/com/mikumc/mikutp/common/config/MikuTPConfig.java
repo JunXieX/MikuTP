@@ -63,6 +63,8 @@ public final class MikuTPConfig {
         public CommandEntry wild = new CommandEntry(List.of("rtp"));
         public CommandEntry back = new CommandEntry(List.of());
         public CommandEntry dback = new CommandEntry(List.of());
+        public CommandEntry otp = new CommandEntry(List.of());
+        public CommandEntry otph = new CommandEntry(List.of());
         public CommandEntry mtp = new CommandEntry(List.of("mikutp"));
         public CommandEntry ui = new CommandEntry(List.of());
     }

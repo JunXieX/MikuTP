@@ -315,7 +315,7 @@ public final class RequestService {
                     return;
                 }
                 messages.send(requester, "tpa.accepted-requester", "player", request.targetName);
-                teleports.sendLocal(mover, anchor::getLocation, anchor.getName());
+                teleports.sendLocalTo(mover, anchor, anchor.getName(), true);
             }
             case DENY -> {
                 messages.send(target, "tpa.denied-target", "player", request.requesterName);

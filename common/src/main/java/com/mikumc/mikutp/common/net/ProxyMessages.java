@@ -25,6 +25,8 @@ public final class ProxyMessages {
     public static final String TYPE_TP_REQUEST = "tp_request";
     public static final String TYPE_TP_GO = "tp_go";
     public static final String TYPE_CONNECT_RESULT = "connect_result";
+    public static final String TYPE_LIST_PLAYERS = "list_players";
+    public static final String TYPE_PLAYER_LIST = "player_list";
 
     private ProxyMessages() {
     }
@@ -79,6 +81,29 @@ public final class ProxyMessages {
         if (error != null) {
             o.addProperty("error", error);
         }
+        return o.toString();
+    }
+
+    /** Asks the proxy for the online players of one server, or the whole network when null. */
+    public static String encodeListPlayers(String id, String serverName) {
+        JsonObject o = new JsonObject();
+        o.addProperty("t", TYPE_LIST_PLAYERS);
+        o.addProperty("id", id);
+        if (serverName != null) {
+            o.addProperty("server", serverName);
+        }
+        return o.toString();
+    }
+
+    public static String encodePlayerList(String id, java.util.List<String> playerUuids) {
+        JsonObject o = new JsonObject();
+        o.addProperty("t", TYPE_PLAYER_LIST);
+        o.addProperty("id", id);
+        com.google.gson.JsonArray array = new com.google.gson.JsonArray();
+        for (String uuid : playerUuids) {
+            array.add(uuid);
+        }
+        o.add("players", array);
         return o.toString();
     }
 

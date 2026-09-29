@@ -14,6 +14,11 @@ public final class PendingTeleport {
     public Position position;
     public Source source;
     public long createdAt;
+    /**
+     * When set, the arrival server teleports the player to this player's live
+     * position instead of the stored coordinates (admin goto / pulls).
+     */
+    public String anchorUuid;
 
     public PendingTeleport() {
     }
@@ -23,5 +28,10 @@ public final class PendingTeleport {
         this.position = position;
         this.source = source;
         this.createdAt = createdAt;
+    }
+
+    public PendingTeleport(String playerUuid, Position position, Source source, long createdAt, String anchorUuid) {
+        this(playerUuid, position, source, createdAt);
+        this.anchorUuid = anchorUuid;
     }
 }

@@ -66,8 +66,28 @@ public final class MikuTPVelocity {
             case ProxyMessages.TYPE_CONNECT -> connect(message, source);
             case ProxyMessages.TYPE_CONNECT_ANCHOR -> connectAnchor(message, source);
             case ProxyMessages.TYPE_ROUTE -> route(message);
+            case ProxyMessages.TYPE_LIST_PLAYERS -> listPlayers(message, source);
             default -> logger.debug("Unknown MikuTP message type {}", type);
         }
+    }
+
+    /** Answers a backend's request for the online players of one server or the whole network. */
+    private void listPlayers(JsonObject message, ServerConnection source) {
+        String id = string(message, "id");
+        if (id == null) {
+            return;
+        }
+        String serverName = string(message, "server");
+        java.util.List<String> uuids = new java.util.ArrayList<>();
+        if (serverName == null) {
+            for (Player player : server.getAllPlayers()) {
+                uuids.add(player.getUniqueId().toString());
+            }
+        } else {
+            server.getServer(serverName).ifPresent(target ->
+                    target.getPlayersConnected().forEach(player -> uuids.add(player.getUniqueId().toString())));
+        }
+        send(source, ProxyMessages.encodePlayerList(id, uuids));
     }
 
     private void connect(JsonObject message, ServerConnection source) {
