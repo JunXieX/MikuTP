@@ -22,7 +22,7 @@ import java.util.Optional;
  * backends. State lives in the shared database; this plugin stays stateless.
  */
 @Plugin(id = "mikutp", name = "MikuTP", version = "1.0.0",
-        description = "Cross-server teleport bridge for MikuTP backends.",
+        description = "Cross-server teleport bridge for MikuTP backends. MikuMC original plugin by JunXieX, group 1105054380.",
         authors = {"JunXieX"})
 public final class MikuTPVelocity {
 

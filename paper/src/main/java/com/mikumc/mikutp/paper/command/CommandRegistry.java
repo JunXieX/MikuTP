@@ -463,6 +463,18 @@ public final class CommandRegistry {
             ctx.getSource().getSender().sendMessage(messages.render(ctx.getSource().getSender(), "admin.resync-done"));
             return 1;
         }));
+        root.then(Commands.literal("permissions").executes(ctx -> {
+            CommandSender sender = ctx.getSource().getSender();
+            var permissions = plugin.getPluginMeta().getPermissions();
+            sender.sendMessage(messages.render(sender, "admin.permissions", "count", String.valueOf(permissions.size())));
+            for (var permission : permissions) {
+                sender.sendMessage(messages.render(sender, "admin.permissions-line",
+                        "node", permission.getName(),
+                        "default", permission.getDefault().toString().toLowerCase(),
+                        "description", permission.getDescription() == null ? "" : permission.getDescription()));
+            }
+            return 1;
+        }));
         root.then(Commands.literal("info").executes(ctx -> {
             ctx.getSource().getSender().sendMessage(messages.render(ctx.getSource().getSender(),
                     "admin.info", "info", infoSupplier.get()));

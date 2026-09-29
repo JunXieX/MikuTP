@@ -63,7 +63,9 @@ public final class MikuTPPlugin extends JavaPlugin {
 
     @Override
     public void onEnable() {
-        papiAvailable = getServer().getPluginManager().getPlugin("PlaceholderAPI") != null;
+        // softdepend loads PlaceholderAPI before us when present; isPluginEnabled also
+        // covers the case where it exists but failed to enable.
+        papiAvailable = getServer().getPluginManager().isPluginEnabled("PlaceholderAPI");
         try {
             loadConfiguration(true);
         } catch (IOException e) {

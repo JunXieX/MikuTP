@@ -79,7 +79,10 @@
   "admin.bring-all-done": "<prefix><green>已传送 <white><count></white> 名玩家到你身边。</green>",
 
   "admin.info": "<prefix><gray>模式：<white><mode></white> | 服务器：<white><server></white> | 存储：<white><storage></white></gray>",
-  "admin.unknown-sub": "<prefix><red>未知子命令，可用：reload、info。</red>",
+  "admin.resync-done": "<prefix><green>已请求全部服务器重新发布本地数据。</green>",
+  "admin.permissions": "<prefix><gray>MikuTP 权限节点（<white><count></white> 个），可直接在 LuckPerms 中配置：</gray>",
+  "admin.permissions-line": "  <white><node></white> <dark_gray>[默认 <default>]</dark_gray><gray> — <description></gray>",
+  "admin.unknown-sub": "<prefix><red>未知子命令，可用：reload、resync、permissions、info。</red>",
 
   "dialog.tpa.title": "<bold>发起传送请求</bold>",
   "dialog.tpa.hint": "输入对方的游戏 ID，向 TA 发送请求",
