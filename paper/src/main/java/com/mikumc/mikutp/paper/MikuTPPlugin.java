@@ -99,7 +99,7 @@ public final class MikuTPPlugin extends JavaPlugin {
 
         new CommandRegistry(this, messages, cooldowns, homeService, warpService, requestService,
                 wildService, teleports, dialogs, chats, this::reloadAll, this::infoLine,
-                () -> config.dialogs.enabled).register();
+                () -> config.dialogs.enabled, config).register();
 
         getServer().getPluginManager().registerEvents(
                 new PlayerLifecycle(profiles, homeService, requestService, teleports, cooldowns), this);
@@ -184,10 +184,10 @@ public final class MikuTPPlugin extends JavaPlugin {
         }
     }
 
-    /** Reads or creates config.json and the language file. */
+    /** Reads or creates config.yml and the language file. */
     private void loadConfiguration(boolean initial) throws IOException {
-        Path configFile = getDataFolder().toPath().resolve("config.json");
-        MikuTPConfig loaded = ConfigIO.loadOrCreate(configFile, readResource("config.json"), MikuTPConfig.class);
+        Path configFile = getDataFolder().toPath().resolve("config.yml");
+        MikuTPConfig loaded = ConfigIO.loadOrCreate(configFile, readResource("config.yml"), MikuTPConfig.class);
         if (config == null) {
             config = loaded;
         } else {

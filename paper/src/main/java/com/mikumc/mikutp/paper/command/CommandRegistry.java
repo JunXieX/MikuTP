@@ -1,5 +1,6 @@
 package com.mikumc.mikutp.paper.command;
 
+import com.mikumc.mikutp.common.config.MikuTPConfig;
 import com.mikumc.mikutp.paper.dialog.ChatMenus;
 import com.mikumc.mikutp.paper.dialog.DialogFactory;
 import com.mikumc.mikutp.paper.service.CooldownManager;
@@ -45,12 +46,14 @@ public final class CommandRegistry {
     private final Runnable reloadAction;
     private final java.util.function.Supplier<String> infoSupplier;
     private final java.util.function.BooleanSupplier dialogsEnabledSupplier;
+    private final com.mikumc.mikutp.common.config.MikuTPConfig config;
 
     public CommandRegistry(JavaPlugin plugin, MessageService messages, CooldownManager cooldowns,
                            HomeService homeService, WarpService warpService, RequestService requestService,
                            WildService wildService, TeleportService teleports, DialogFactory dialogs,
                            ChatMenus chats, Runnable reloadAction, java.util.function.Supplier<String> infoSupplier,
-                           java.util.function.BooleanSupplier dialogsEnabledSupplier) {
+                           java.util.function.BooleanSupplier dialogsEnabledSupplier,
+                           com.mikumc.mikutp.common.config.MikuTPConfig config) {
         this.plugin = plugin;
         this.messages = messages;
         this.cooldowns = cooldowns;
@@ -64,29 +67,68 @@ public final class CommandRegistry {
         this.reloadAction = reloadAction;
         this.infoSupplier = infoSupplier;
         this.dialogsEnabledSupplier = dialogsEnabledSupplier;
+        this.config = config;
     }
 
     public void register() {
         plugin.getLifecycleManager().registerEventHandler(LifecycleEvents.COMMANDS, event -> {
             var registrar = event.registrar();
-            registrar.register(home(), "传送到你的家", List.of("homes"));
-            registrar.register(sethome(), "设置一个家", List.of());
-            registrar.register(delhome(), "删除一个家", List.of());
-            registrar.register(warp(), "传送到服务器地标", List.of("warps"));
-            registrar.register(setwarp(), "创建服务器地标", List.of());
-            registrar.register(delwarp(), "删除服务器地标", List.of());
-            registrar.register(tpa(), "请求传送到玩家身边", List.of());
-            registrar.register(tpahere(), "邀请玩家传送到你身边", List.of());
-            registrar.register(tpaccept(), "接受传送请求", List.of("tpyes"));
-            registrar.register(tpdeny(), "拒绝传送请求", List.of("tpno"));
-            registrar.register(tpatoggle(), "开关传送请求接收", List.of());
-            registrar.register(tpblock(), "屏蔽玩家的传送请求", List.of("tpignore"));
-            registrar.register(tpunblock(), "解除屏蔽", List.of());
-            registrar.register(wild(), "随机传送", List.of("rtp"));
-            registrar.register(back(), "返回上一个位置", List.of());
-            registrar.register(ui(), "传送请求快捷响应", List.of());
-            registrar.register(admin(), "MikuTP 管理命令", List.of("mikutp:admin"));
+            // 命令可按 config.yml 的 commands 段单独关闭或改别名；绝不覆盖原版指令。
+            java.util.function.Consumer<Registration> reg = r -> {
+                var entry = entry(r.key());
+                if (entry != null && !entry.enabled) {
+                    plugin.getSLF4JLogger().info("Command /{} disabled in config.yml", r.key());
+                    return;
+                }
+                List<String> aliases = entry != null && entry.aliases != null ? entry.aliases : r.defaultAliases();
+                registrar.register(r.node(), r.description(), aliases);
+            };
+            reg.accept(new Registration("home", home(), "传送到你的家", List.of("homes")));
+            reg.accept(new Registration("sethome", sethome(), "设置一个家", List.of()));
+            reg.accept(new Registration("delhome", delhome(), "删除一个家", List.of()));
+            reg.accept(new Registration("warp", warp(), "传送到服务器地标", List.of("warps")));
+            reg.accept(new Registration("setwarp", setwarp(), "创建服务器地标", List.of()));
+            reg.accept(new Registration("delwarp", delwarp(), "删除服务器地标", List.of()));
+            reg.accept(new Registration("tpa", tpa(), "请求传送到玩家身边", List.of()));
+            reg.accept(new Registration("tpahere", tpahere(), "邀请玩家传送到你身边", List.of()));
+            reg.accept(new Registration("tpaccept", tpaccept(), "接受传送请求", List.of("tpyes")));
+            reg.accept(new Registration("tpdeny", tpdeny(), "拒绝传送请求", List.of("tpno")));
+            reg.accept(new Registration("tpatoggle", tpatoggle(), "开关传送请求接收", List.of()));
+            reg.accept(new Registration("tpblock", tpblock(), "屏蔽玩家的传送请求", List.of("tpignore")));
+            reg.accept(new Registration("tpunblock", tpunblock(), "解除屏蔽", List.of()));
+            reg.accept(new Registration("wild", wild(), "随机传送", List.of("rtp")));
+            reg.accept(new Registration("back", back(), "返回上一个位置", List.of()));
+            reg.accept(new Registration("ui", ui(), "传送请求快捷响应", List.of()));
+            reg.accept(new Registration("mikutp", admin(), "MikuTP 管理命令", List.of()));
         });
+    }
+
+    private MikuTPConfig.CommandEntry entry(String key) {
+        MikuTPConfig.Commands commands = config.commands;
+        return switch (key) {
+            case "home" -> commands.home;
+            case "sethome" -> commands.sethome;
+            case "delhome" -> commands.delhome;
+            case "warp" -> commands.warp;
+            case "setwarp" -> commands.setwarp;
+            case "delwarp" -> commands.delwarp;
+            case "tpa" -> commands.tpa;
+            case "tpahere" -> commands.tpahere;
+            case "tpaccept" -> commands.tpaccept;
+            case "tpdeny" -> commands.tpdeny;
+            case "tpatoggle" -> commands.tpatoggle;
+            case "tpblock" -> commands.tpblock;
+            case "tpunblock" -> commands.tpunblock;
+            case "wild" -> commands.wild;
+            case "back" -> commands.back;
+            case "mikutp" -> commands.mikutp;
+            case "ui" -> commands.ui;
+            default -> null;
+        };
+    }
+
+    private record Registration(String key, LiteralCommandNode<CommandSourceStack> node,
+                                String description, List<String> defaultAliases) {
     }
 
     // ------------------------------------------------------------------ home
@@ -182,7 +224,7 @@ public final class CommandRegistry {
                     if (dialogsEnabled()) {
                         dialogs.showTpaTarget(player, false, name -> requestService.send(player, name, false));
                     } else {
-                        messages.send(player, "common.nothing-found");
+                        messages.send(player, "tpa.usage");
                     }
                 },
                 (player, name) -> requestService.send(player, name, false),
@@ -195,7 +237,7 @@ public final class CommandRegistry {
                     if (dialogsEnabled()) {
                         dialogs.showTpaTarget(player, true, name -> requestService.send(player, name, true));
                     } else {
-                        messages.send(player, "common.nothing-found");
+                        messages.send(player, "tpahere.usage");
                     }
                 },
                 (player, name) -> requestService.send(player, name, true),
@@ -250,7 +292,7 @@ public final class CommandRegistry {
 
     private LiteralCommandNode<CommandSourceStack> tpblock() {
         return playerRoot("tpblock", "mikutp.tpa",
-                player -> messages.send(player, "tpa.block-list-empty"),
+                player -> requestService.listBlocks(player),
                 (player, name) -> requestService.block(player, name, true),
                 null);
     }

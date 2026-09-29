@@ -1,0 +1,207 @@
+# ============================================================
+#  MikuTP 配置文件
+#  - 所有键均可保留默认值；删除或缺少的键会自动回落到内置默认。
+#  - 修改后执行 /mikutp reload 即可热重载（server_id 与 storage 除外，需重启）。
+#  - 玩家可见文本在 messages_zh_cn.json 中自定义。
+# ============================================================
+
+# 配置结构版本号，请勿手动修改
+config_version: 1
+
+# ---------------- 存储 ----------------
+storage:
+  # 存储类型：SQLITE（单服务器，零配置）或 MYSQL（跨服网络必选）
+  type: SQLITE
+  # 数据表前缀，多插件共库时可改
+  table_prefix: mikutp_
+  # MySQL 连接信息（仅 type 为 MYSQL 时生效）
+  mysql:
+    # 数据库地址
+    host: localhost
+    # 数据库端口
+    port: 3306
+    # 数据库名
+    database: mikutp
+    # 数据库用户名
+    user: mikutp
+    # 数据库密码
+    password: ""
+    # 是否启用 SSL 连接
+    use_ssl: false
+  # MySQL 连接池大小（每台后端服务器各自一个连接池）
+  pool_size: 8
+
+# ---------------- 跨服 ----------------
+cross_server:
+  # 是否启用跨服模式：开启后 home/tpa/back 支持跨服务器传送，
+  # 需要在 Velocity 代理端安装 MikuTP-Velocity 配套插件
+  enabled: false
+  # 本服务器 ID：跨服模式下必须与 velocity.toml 里的服务器名完全一致
+  server_id: server
+  # 轮询共享数据库的间隔（毫秒），越小请求送达越快，占用略增
+  poll_interval_ms: 1000
+  # 跨服传送请求有效期（秒），超时自动失效
+  request_expiry_seconds: 60
+
+# ---------------- 传送行为 ----------------
+teleport:
+  # 传送预热秒数（站立不动等待的时间），0 表示立即传送
+  warmup_seconds: 3
+  # 预热期间允许移动的方块距离，0 表示一动就取消传送
+  move_threshold_blocks: 0.0
+  # 预热期间受到伤害是否取消传送
+  cancel_on_damage: true
+  # 是否播放传送相关音效（倒计时、取消、到达等）
+  sounds: true
+  cooldowns:
+    # /home 冷却秒数
+    home: 5
+    # /warp 冷却秒数
+    warp: 5
+    # /tpa 与 /tpahere 的发起冷却秒数
+    tpa: 10
+    # /wild 冷却秒数
+    wild: 60
+    # /back 冷却秒数
+    back: 10
+
+# ---------------- 家 ----------------
+home:
+  # 默认每人家的数量上限；权限 mikutp.homes.<数量> 可覆盖，mikutp.homes.unlimited 表示不限
+  default_limit: 5
+  # 家名称的允许格式（正则表达式）
+  name_pattern: "[a-zA-Z0-9_-]{1,32}"
+
+# ---------------- 地标 ----------------
+warp:
+  # 是否启用地标功能（/warp /setwarp /delwarp）
+  enabled: true
+
+# ---------------- 传送请求 ----------------
+tpa:
+  # 是否启用传送请求功能（/tpa /tpahere 及应答命令）
+  enabled: true
+  # 请求有效期（秒），超时自动失效
+  request_expiry_seconds: 60
+  # 对话框中"屏蔽"按钮的屏蔽时长（分钟），到期自动解除
+  block_duration_minutes: 10
+
+# ---------------- /back ----------------
+back:
+  # 是否启用 /back 返回上一位置
+  enabled: true
+  # 玩家死亡时是否更新 /back 位置
+  save_on_death: true
+  # 本插件执行传送时是否更新 /back 位置
+  save_on_teleport: true
+
+# ---------------- 随机传送 ----------------
+wild:
+  # 是否启用 /wild（/rtp）
+  enabled: true
+  # 目标世界选择：CURRENT=玩家当前世界；LIST=从下方 worlds 列表随机挑选
+  world_mode: CURRENT
+  # world_mode 为 LIST 时的候选世界列表
+  worlds: [world]
+  # 距搜索中心的最小距离（方块）
+  min_radius: 500
+  # 距搜索中心的最大距离（方块）
+  max_radius: 5000
+  # 搜索中心：SPAWN=世界出生点；ZERO=坐标 0,0
+  center: SPAWN
+  # 单次搜索最多尝试的落点数量，用尽后提示失败并退回冷却
+  max_attempts: 10
+  # 屏蔽的原版生物群系标签，用于避开海洋、河流、海滩等资源贫瘠或危险地形
+  blocked_biome_tags: [is_ocean, is_deep_ocean, is_river, is_beach]
+  # 额外屏蔽的具体群系（完整命名空间键），例如 minecraft:stony_shore
+  blocked_biomes: []
+  # 是否要求安全落点：实心非危险地面且头顶两格净空
+  require_safe_landing: true
+
+# ---------------- 对话框菜单 ----------------
+dialogs:
+  # 是否启用原生对话框菜单（MC 1.21.6+ 的 Dialog 界面）；
+  # 设为 false 时所有菜单回退为可点击的聊天消息
+  enabled: true
+  # 家/地标列表对话框每页显示的条目数
+  list_page_size: 12
+
+# ---------------- 命令 ----------------
+# 每条命令都可以单独关闭（enabled: false），或在与其他插件冲突时修改别名。
+# 本插件所有命令名与别名均不与原版指令重合；若你自定义的别名撞上原版指令，
+# 服务器通常会以原版指令优先，因此请避免将别名改成 /tp、/gamemode 等原版指令名。
+commands:
+  # 回到你的家（/home）
+  home:
+    enabled: true
+    aliases: [homes]
+  # 设置一个家（/sethome）
+  sethome:
+    enabled: true
+    aliases: []
+  # 删除一个家（/delhome）
+  delhome:
+    enabled: true
+    aliases: []
+  # 前往服务器地标（/warp）
+  warp:
+    enabled: true
+    aliases: [warps]
+  # 创建服务器地标（/setwarp）
+  setwarp:
+    enabled: true
+    aliases: []
+  # 删除服务器地标（/delwarp）
+  delwarp:
+    enabled: true
+    aliases: []
+  # 请求传送到玩家身边（/tpa）
+  tpa:
+    enabled: true
+    aliases: []
+  # 邀请玩家传送到你身边（/tpahere）
+  tpahere:
+    enabled: true
+    aliases: []
+  # 接受传送请求（/tpaccept）
+  tpaccept:
+    enabled: true
+    aliases: [tpyes]
+  # 拒绝传送请求（/tpdeny）
+  tpdeny:
+    enabled: true
+    aliases: [tpno]
+  # 开关接收所有传送请求（/tpatoggle）
+  tpatoggle:
+    enabled: true
+    aliases: []
+  # 永久屏蔽某玩家的传送请求（/tpblock）
+  tpblock:
+    enabled: true
+    aliases: [tpignore]
+  # 解除屏蔽（/tpunblock）
+  tpunblock:
+    enabled: true
+    aliases: []
+  # 随机传送（/wild）
+  wild:
+    enabled: true
+    aliases: [rtp]
+  # 返回上一个位置（/back）
+  back:
+    enabled: true
+    aliases: []
+  # 管理命令（/mikutp reload|info）
+  mikutp:
+    enabled: true
+    aliases: []
+  # 内部命令：聊天菜单快捷按钮依赖它，关闭后点击聊天按钮将失效
+  ui:
+    enabled: true
+    aliases: []
+
+# ---------------- 其他 ----------------
+# 玩家可见消息所用的语言文件名（位于插件数据目录，可复制后自行翻译）
+language_file: messages_zh_cn.json
+# 是否在玩家可见消息中解析 PlaceholderAPI 占位符（需安装 PlaceholderAPI）
+parse_placeholder_api: true

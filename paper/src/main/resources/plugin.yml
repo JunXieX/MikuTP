@@ -3,7 +3,7 @@ version: '${version}'
 main: com.mikumc.mikutp.paper.MikuTPPlugin
 api-version: '26.2'
 authors: [JunXieX]
-description: Teleportation suite with dialog menus, homes, warps, tpa and random teleport for Paper and Folia.
+description: 多功能传送套件：家、地标、传送请求、随机传送与跨服传送（Paper/Folia）。
 folia-supported: true
 softdepend: [PlaceholderAPI]
 libraries:
@@ -13,38 +13,38 @@ libraries:
 
 permissions:
   mikutp.home:
-    description: Use /home and /homes
+    description: 使用 /home 与 /homes 回到自己的家
     default: true
   mikutp.home.set:
-    description: Use /sethome
+    description: 使用 /sethome 设置家
     default: true
   mikutp.home.delete:
-    description: Use /delhome
+    description: 使用 /delhome 删除家
     default: true
   mikutp.warp:
-    description: Use /warp
+    description: 使用 /warp 前往服务器地标
     default: true
   mikutp.warp.manage:
-    description: Create and delete warps
+    description: 使用 /setwarp 与 /delwarp 管理服务器地标
     default: op
   mikutp.tpa:
-    description: Send and answer teleport requests
+    description: 发起与应答传送请求（/tpa /tpahere 等）
     default: true
   mikutp.wild:
-    description: Use /wild random teleport
+    description: 使用 /wild 随机传送
     default: true
   mikutp.back:
-    description: Use /back
+    description: 使用 /back 返回上一个位置
     default: true
   mikutp.admin:
-    description: /mikutp administration
+    description: 使用 /mikutp 管理命令（reload/info）
     default: op
   mikutp.bypass.warmup:
-    description: Skip the teleport warmup
+    description: 免除传送预热等待
     default: false
   mikutp.bypass.cooldown:
-    description: Skip teleport cooldowns
+    description: 免除传送冷却
     default: false
   mikutp.homes.unlimited:
-    description: Unlimited home count
+    description: 不受家的数量上限限制
     default: false

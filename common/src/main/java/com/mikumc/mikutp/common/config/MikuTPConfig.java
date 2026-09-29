@@ -37,11 +37,46 @@ public final class MikuTPConfig {
     /** Dialog menu settings. */
     public Dialogs dialogs = new Dialogs();
 
+    /** Per-command switches and aliases. */
+    public Commands commands = new Commands();
+
     /** Message file loaded from the plugin data folder. */
     public String languageFile = "messages_zh_cn.json";
 
     /** Parse PlaceholderAPI placeholders in player-visible messages. */
     public boolean parsePlaceholderApi = true;
+
+    public static final class Commands {
+        public CommandEntry home = new CommandEntry(List.of("homes"));
+        public CommandEntry sethome = new CommandEntry(List.of());
+        public CommandEntry delhome = new CommandEntry(List.of());
+        public CommandEntry warp = new CommandEntry(List.of("warps"));
+        public CommandEntry setwarp = new CommandEntry(List.of());
+        public CommandEntry delwarp = new CommandEntry(List.of());
+        public CommandEntry tpa = new CommandEntry(List.of());
+        public CommandEntry tpahere = new CommandEntry(List.of());
+        public CommandEntry tpaccept = new CommandEntry(List.of("tpyes"));
+        public CommandEntry tpdeny = new CommandEntry(List.of("tpno"));
+        public CommandEntry tpatoggle = new CommandEntry(List.of());
+        public CommandEntry tpblock = new CommandEntry(List.of("tpignore"));
+        public CommandEntry tpunblock = new CommandEntry(List.of());
+        public CommandEntry wild = new CommandEntry(List.of("rtp"));
+        public CommandEntry back = new CommandEntry(List.of());
+        public CommandEntry mikutp = new CommandEntry(List.of());
+        public CommandEntry ui = new CommandEntry(List.of());
+    }
+
+    public static final class CommandEntry {
+        public boolean enabled = true;
+        public List<String> aliases = List.of();
+
+        public CommandEntry() {
+        }
+
+        public CommandEntry(List<String> aliases) {
+            this.aliases = aliases;
+        }
+    }
 
     /** Copies every top-level section onto this instance so live references see a reload. */
     public void copyFrom(MikuTPConfig other) {

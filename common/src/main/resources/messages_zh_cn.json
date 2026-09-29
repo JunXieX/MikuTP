@@ -32,10 +32,12 @@
   "warp.going": "<prefix><gray>正在前往地标 <white><name></white>……</gray>",
 
   "tpa.sent": "<prefix><green>已向 <white><player></white> 发送传送请求（<white><seconds></white>s 内有效）。</green>",
+  "tpa.usage": "<prefix><yellow>用法：<white>/tpa <玩家名></white>，或直接输入 /tpa 在菜单中选择。</yellow>",
+  "tpahere.usage": "<prefix><yellow>用法：<white>/tpahere <玩家名></white>，或直接输入 /tpahere 在菜单中选择。</yellow>",
   "tpa.sent-here": "<prefix><green>已邀请 <white><player></white> 前来你身边（<white><seconds></white>s 内有效）。</green>",
   "tpa.received-chat": "<prefix><yellow><white><player></white> 请求传送到你身边。</yellow>",
   "tpa.received-here-chat": "<prefix><yellow><white><player></white> 邀请你前往 TA 身边。</yellow>",
-  "tpa.hint-chat": "<prefix><gray>点击接受：</gray><click:run_command:'/mikutp ui accept <id>'><green><bold>[接受]</bold></green></click> <gray>拒绝：</gray><click:run_command:'/mikutp ui deny <id>'><red><bold>[拒绝]</bold></red></click> <gray>屏蔽：</gray><click:run_command:'/mikutp ui block <id>'><dark_red><bold>[屏蔽]</bold></dark_red></click>",
+  "tpa.hint-chat": "<prefix><gray>点击接受：</gray><click:run_command:'/mikutp-ui accept <id>'><green><bold>[接受]</bold></green></click> <gray>拒绝：</gray><click:run_command:'/mikutp-ui deny <id>'><red><bold>[拒绝]</bold></red></click> <gray>屏蔽：</gray><click:run_command:'/mikutp-ui block <id>'><dark_red><bold>[屏蔽]</bold></dark_red></click>",
   "tpa.accepted-target": "<prefix><green>已接受 <white><player></white> 的传送请求。</green>",
   "tpa.denied-target": "<prefix><yellow>已拒绝 <white><player></white> 的传送请求。</yellow>",
   "tpa.accepted-requester": "<prefix><green><white><player></white> 接受了你的请求，正在安排传送……</green>",
