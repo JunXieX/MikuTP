@@ -10,38 +10,36 @@ config_version: 1
 
 # ---------------- 存储 ----------------
 storage:
-  # 存储类型：SQLITE（单服务器，零配置）或 MYSQL（跨服网络必选）
-  type: SQLITE
-  # 数据表前缀，多插件共库时可改
+  # 本地 SQLite 数据表前缀（每个后端服务器各自一份本地库）
   table_prefix: mikutp_
-  # MySQL 连接信息（仅 type 为 MYSQL 时生效）
-  mysql:
-    # 数据库地址
-    host: localhost
-    # 数据库端口
-    port: 3306
-    # 数据库名
-    database: mikutp
-    # 数据库用户名
-    user: mikutp
-    # 数据库密码
-    password: ""
-    # 是否启用 SSL 连接
-    use_ssl: false
-  # MySQL 连接池大小（每台后端服务器各自一个连接池）
-  pool_size: 8
 
-# ---------------- 跨服 ----------------
+# ---------------- 服务器身份 ----------------
 cross_server:
-  # 是否启用跨服模式：开启后 home/tpa/back 支持跨服务器传送，
-  # 需要在 Velocity 代理端安装 MikuTP-Velocity 配套插件
-  enabled: false
-  # 本服务器 ID：跨服模式下必须与 velocity.toml 里的服务器名完全一致
+  # 本服务器 ID：跨服模式下必须与 velocity.toml 里的服务器名完全一致，
+  # 同时也是 Redis 同步中的消费者与事件来源标记
   server_id: server
-  # 轮询共享数据库的间隔（毫秒），越小请求送达越快，占用略增
-  poll_interval_ms: 1000
-  # 跨服传送请求有效期（秒），超时自动失效
-  request_expiry_seconds: 60
+
+# ---------------- 跨服同步 ----------------
+# 模式说明：本地 SQLite 为唯一事实源，Redis 只承担服务器之间的
+# 事件同步与临时协调（请求、待传送记录、在线心跳）。
+sync:
+  # NONE = 单服务器（完全不需要 Redis）；REDIS = 跨服同步模式
+  mode: NONE
+  # Redis 连接信息（mode 为 REDIS 时生效）
+  redis:
+    # Redis 地址
+    host: localhost
+    # Redis 端口
+    port: 6379
+    # Redis 密码（无密码留空）
+    password: ""
+    # Redis 逻辑数据库编号
+    database: 0
+    # 是否使用 SSL 连接
+    use_ssl: false
+  # 同步事件流的近似保留长度（条）。事件很小，建议设大以便
+  # 离线的服务器重新上线后能回放足够久远的历史
+  stream_max_length: 500000
 
 # ---------------- 传送行为 ----------------
 teleport:
@@ -205,6 +203,10 @@ commands:
     aliases: []
   # 管理员将玩家拉到身边（/otph 玩家 或 /otph all [子服名]）
   otph:
+    enabled: true
+    aliases: []
+  # 管理员传送到玩家最后下线的位置（/outtp，仅查询本服数据）
+  outtp:
     enabled: true
     aliases: []
   # 管理命令（/mtp reload|info，默认别名 /mikutp）

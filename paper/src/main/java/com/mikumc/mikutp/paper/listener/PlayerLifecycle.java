@@ -47,6 +47,7 @@ public final class PlayerLifecycle implements Listener {
     @EventHandler(priority = EventPriority.MONITOR)
     public void onQuit(PlayerQuitEvent event) {
         UUID id = event.getPlayer().getUniqueId();
+        teleports.recordLogout(event.getPlayer());
         profiles.onQuit(id);
         homeService.onQuit(id);
         requestService.onQuit(id);

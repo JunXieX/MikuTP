@@ -70,7 +70,10 @@
 
   "otp.usage": "<prefix><yellow>用法：<white>/otp <玩家名></white>（强制传送到 TA 身边）。</yellow>",
   "otph.usage": "<prefix><yellow>用法：<white>/otph <玩家名></white> 或 <white>/otph all [子服名]</white>（不填子服名则拉取全部玩家）。</yellow>",
+  "outtp.usage": "<prefix><yellow>用法：<white>/outtp <玩家名></white>（传送到 TA 最后下线的位置）。</yellow>",
+  "outtp.none": "<prefix><red>本服没有 <white><player></white> 的下线位置记录。</red>",
   "admin.self": "<prefix><red>不能对自己使用该命令。</red>",
+  "admin.resync-done": "<prefix><green>已请求全部服务器重新发布本地数据。</green>",
   "admin.target-left": "<prefix><red>目标玩家已离开，传送未完成。</red>",
   "admin.pulled-you": "<prefix><yellow>你已被管理员传送到 <white><player></white> 身边。</yellow>",
   "admin.bring-started": "<prefix><gray>正在将 <white><player></white> 传送过来……</gray>",

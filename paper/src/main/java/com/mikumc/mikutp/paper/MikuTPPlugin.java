@@ -4,6 +4,9 @@ import com.mikumc.mikutp.common.config.ConfigIO;
 import com.mikumc.mikutp.common.config.MikuTPConfig;
 import com.mikumc.mikutp.common.data.Database;
 import com.mikumc.mikutp.common.message.MessageBundle;
+import com.mikumc.mikutp.common.sync.LoopbackSyncBus;
+import com.mikumc.mikutp.common.sync.RedisSyncBus;
+import com.mikumc.mikutp.common.sync.SyncBus;
 import com.mikumc.mikutp.paper.command.CommandRegistry;
 import com.mikumc.mikutp.paper.dialog.ChatMenus;
 import com.mikumc.mikutp.paper.dialog.DialogFactory;
@@ -18,9 +21,11 @@ import com.mikumc.mikutp.paper.service.NetworkService;
 import com.mikumc.mikutp.paper.service.ProfileService;
 import com.mikumc.mikutp.paper.service.RequestService;
 import com.mikumc.mikutp.paper.service.StorageFactory;
+import com.mikumc.mikutp.paper.service.SyncCoordinator;
 import com.mikumc.mikutp.paper.service.Tasks;
 import com.mikumc.mikutp.paper.service.TeleportService;
 import com.mikumc.mikutp.paper.service.WarpService;
+import com.mikumc.mikutp.paper.service.WarmupManager;
 import com.mikumc.mikutp.paper.service.WildService;
 import org.bukkit.Bukkit;
 import org.bukkit.entity.Player;
@@ -33,7 +38,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.UUID;
 
-/** Plugin entry point; wires storage, services, commands, listeners and hooks. */
+/** Plugin entry point; wires storage, the sync bus, services, commands and hooks. */
 public final class MikuTPPlugin extends JavaPlugin {
 
     private MikuTPConfig config;
@@ -42,8 +47,9 @@ public final class MikuTPPlugin extends JavaPlugin {
     private CooldownManager cooldowns;
     private Database database;
     private Tasks tasks;
-    private ProfileService profiles;
+    private SyncBus syncBus;
     private NetworkService network;
+    private ProfileService profiles;
     private TeleportService teleports;
     private HomeService homeService;
     private WarpService warpService;
@@ -51,6 +57,7 @@ public final class MikuTPPlugin extends JavaPlugin {
     private WildService wildService;
     private DialogFactory dialogs;
     private ChatMenus chats;
+    private SyncCoordinator coordinator;
     private MikuTPExpansion expansion;
     private boolean papiAvailable;
 
@@ -69,7 +76,7 @@ public final class MikuTPPlugin extends JavaPlugin {
             database = StorageFactory.create(getDataFolder().toPath(), config);
             database.init();
         } catch (Exception e) {
-            getSLF4JLogger().error("Failed to open storage, disabling plugin", e);
+            getSLF4JLogger().error("Failed to open local storage, disabling plugin", e);
             getServer().getPluginManager().disablePlugin(this);
             return;
         }
@@ -77,29 +84,30 @@ public final class MikuTPPlugin extends JavaPlugin {
         tasks = new Tasks(this);
         effects = new Effects(config.teleport.sounds);
         cooldowns = new CooldownManager(this::cooldownSeconds);
+        syncBus = buildSyncBus();
         network = new NetworkService(this, tasks, messages);
-        network.setEnabled(config.crossServer.enabled);
-        profiles = new ProfileService(this, tasks, database);
+        profiles = new ProfileService(this, tasks, database, syncBus, config.crossServer.serverId);
         teleports = new TeleportService(this, tasks, config, database, messages, effects,
-                new com.mikumc.mikutp.paper.service.WarmupManager(tasks, messages, effects, config.teleport.warmupSeconds),
-                network, profiles);
-        homeService = new HomeService(this, tasks, config, database, messages, cooldowns, teleports);
+                new WarmupManager(tasks, messages, effects, config.teleport.warmupSeconds),
+                network, profiles, syncBus);
+        homeService = new HomeService(this, tasks, config, database, messages, cooldowns, teleports, syncBus);
         warpService = new WarpService(this, tasks, config, database, messages, cooldowns, teleports);
         requestService = new RequestService(this, tasks, config, database, messages, effects, cooldowns,
-                teleports, profiles, network);
+                teleports, profiles, syncBus);
         wildService = new WildService(this, tasks, config, messages, cooldowns, teleports);
+        coordinator = new SyncCoordinator(this, tasks, config, database, syncBus,
+                homeService, profiles, teleports, requestService);
 
         dialogs = new DialogFactory(tasks, messages, config.dialogs.listPageSize);
         chats = new ChatMenus(messages);
         requestService.setShowRequestHandler(this::showRequest);
-        network.setRequestHandler(requestService::deliverRemote);
-        network.setTpGoHandler(requestService::deliverTpGo);
         warpService.load();
-        requestService.start(config.crossServer.enabled);
+        requestService.start();
+        coordinator.start();
 
         new CommandRegistry(this, messages, cooldowns, homeService, warpService, requestService,
-                wildService, teleports, dialogs, chats, this::reloadAll, this::infoLine,
-                () -> config.dialogs.enabled, config).register();
+                wildService, teleports, dialogs, chats, this::reloadAll, coordinator::resync,
+                this::infoLine, () -> config.dialogs.enabled, config).register();
 
         getServer().getPluginManager().registerEvents(
                 new PlayerLifecycle(profiles, homeService, requestService, teleports, cooldowns), this);
@@ -112,9 +120,9 @@ public final class MikuTPPlugin extends JavaPlugin {
             expansion.register();
         }
 
-        getSLF4JLogger().info("MikuTP ready: mode={}, server-id={}, storage={}",
-                config.crossServer.enabled ? "cross-server" : "local",
-                config.crossServer.serverId, config.storage.type.toUpperCase());
+        getSLF4JLogger().info("MikuTP ready: mode={}, server-id={}, storage=sqlite",
+                config.sync.enabled() ? "cross-server (redis)" : "local",
+                config.crossServer.serverId);
     }
 
     @Override
@@ -125,6 +133,13 @@ public final class MikuTPPlugin extends JavaPlugin {
         if (expansion != null) {
             expansion.unregister();
             expansion = null;
+        }
+        if (syncBus != null) {
+            try {
+                syncBus.close();
+            } catch (Exception e) {
+                getSLF4JLogger().warn("Failed to close sync bus cleanly", e);
+            }
         }
         if (network != null) {
             network.shutdown();
@@ -139,6 +154,48 @@ public final class MikuTPPlugin extends JavaPlugin {
     }
 
     // ------------------------------------------------------------------ internals
+
+    private SyncBus buildSyncBus() {
+        if (!config.sync.enabled()) {
+            return new LoopbackSyncBus();
+        }
+        var redis = config.sync.redis;
+        try {
+            return new RedisSyncBus(redis.host, redis.port, redis.password, redis.database,
+                    redis.useSsl, config.crossServer.serverId, config.sync.streamMaxLength,
+                    new SyncBus.OutboxStore() {
+                        @Override
+                        public long append(String payload) {
+                            try {
+                                return database.addOutboxEvent(payload);
+                            } catch (Exception e) {
+                                throw new IllegalStateException(e);
+                            }
+                        }
+
+                        @Override
+                        public java.util.List<com.mikumc.mikutp.common.sync.SyncBus.OutboxRow> take(int max) {
+                            try {
+                                return database.takeOutboxEvents(max);
+                            } catch (Exception e) {
+                                throw new IllegalStateException(e);
+                            }
+                        }
+
+                        @Override
+                        public void remove(java.util.List<Long> seqs) {
+                            try {
+                                database.deleteOutboxEvents(seqs);
+                            } catch (Exception e) {
+                                throw new IllegalStateException(e);
+                            }
+                        }
+                    });
+        } catch (Exception e) {
+            getSLF4JLogger().error("Failed to connect to Redis, falling back to single-server mode", e);
+            return new LoopbackSyncBus();
+        }
+    }
 
     private void showRequest(com.mikumc.mikutp.common.data.TpRequest request) {
         Player target = request.targetUuid == null ? null
@@ -167,9 +224,9 @@ public final class MikuTPPlugin extends JavaPlugin {
     }
 
     private String infoLine() {
-        return (config.crossServer.enabled ? "cross-server" : "local")
+        return (config.sync.enabled() ? "cross-server (redis)" : "local")
                 + " | server=" + config.crossServer.serverId
-                + " | storage=" + config.storage.type.toUpperCase()
+                + " | storage=sqlite"
                 + " | dialogs=" + (config.dialogs.enabled ? "on" : "off");
     }
 
@@ -177,9 +234,8 @@ public final class MikuTPPlugin extends JavaPlugin {
         try {
             loadConfiguration(false);
             effects.setEnabled(config.teleport.sounds);
-            network.setEnabled(config.crossServer.enabled);
             warpService.load();
-            getSLF4JLogger().info("MikuTP reloaded (server-id and storage changes need a restart)");
+            getSLF4JLogger().info("MikuTP reloaded (sync mode, server-id and storage changes need a restart)");
         } catch (IOException e) {
             getSLF4JLogger().error("Reload failed: {}", e.getMessage());
         }

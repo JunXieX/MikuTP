@@ -65,7 +65,6 @@ public final class MikuTPVelocity {
         switch (type) {
             case ProxyMessages.TYPE_CONNECT -> connect(message, source);
             case ProxyMessages.TYPE_CONNECT_ANCHOR -> connectAnchor(message, source);
-            case ProxyMessages.TYPE_ROUTE -> route(message);
             case ProxyMessages.TYPE_LIST_PLAYERS -> listPlayers(message, source);
             default -> logger.debug("Unknown MikuTP message type {}", type);
         }
@@ -138,21 +137,6 @@ public final class MikuTPVelocity {
                 send(source, ProxyMessages.encodeConnectResult(false, result.getStatus().name()));
             }
         });
-    }
-
-    private void route(JsonObject message) {
-        String to = string(message, "to");
-        String body = string(message, "body");
-        if (to == null || body == null) {
-            return;
-        }
-        Optional<Player> target = server.getPlayer(java.util.UUID.fromString(to));
-        Optional<ServerConnection> targetServer = target.flatMap(Player::getCurrentServer);
-        if (targetServer.isEmpty()) {
-            // Target not online anywhere: backends discover state changes through the database.
-            return;
-        }
-        targetServer.get().sendPluginMessage(CHANNEL, body.getBytes(StandardCharsets.UTF_8));
     }
 
     private void send(ServerConnection connection, String json) {

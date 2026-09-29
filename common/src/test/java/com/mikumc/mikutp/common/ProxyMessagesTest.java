@@ -1,39 +1,17 @@
 package com.mikumc.mikutp.common;
 
 import com.google.gson.JsonObject;
-import com.mikumc.mikutp.common.data.TpRequest;
 import com.mikumc.mikutp.common.net.ProxyMessages;
 import org.junit.jupiter.api.Test;
 
 import java.nio.charset.StandardCharsets;
-import java.util.UUID;
+import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class ProxyMessagesTest {
-
-    @Test
-    void requestRoundTrip() {
-        long now = System.currentTimeMillis();
-        TpRequest request = new TpRequest(UUID.randomUUID().toString(), TpRequest.Type.COME,
-                "req-uuid", "Alice", "s1", "tgt-uuid", "Bob", TpRequest.Status.PENDING, now, now);
-
-        String routed = ProxyMessages.encodeRoute("tgt-uuid", ProxyMessages.encodeTpRequest(request));
-        JsonObject envelope = ProxyMessages.decode(routed.getBytes(StandardCharsets.UTF_8));
-        assertEquals(ProxyMessages.TYPE_ROUTE, ProxyMessages.type(envelope));
-        assertEquals("tgt-uuid", envelope.get("to").getAsString());
-
-        JsonObject body = ProxyMessages.decode(envelope.get("body").getAsString().getBytes(StandardCharsets.UTF_8));
-        assertEquals(ProxyMessages.TYPE_TP_REQUEST, ProxyMessages.type(body));
-        TpRequest parsed = ProxyMessages.requestFromJson(body);
-        assertEquals(request.id, parsed.id);
-        assertEquals(TpRequest.Type.COME, parsed.type);
-        assertEquals("Alice", parsed.requesterName);
-        assertEquals("Bob", parsed.targetName);
-        assertEquals("s1", parsed.requesterServer);
-    }
 
     @Test
     void connectMessages() {
@@ -50,8 +28,21 @@ class ProxyMessagesTest {
         JsonObject result = ProxyMessages.decode(
                 ProxyMessages.encodeConnectResult(false, "anchor_offline").getBytes(StandardCharsets.UTF_8));
         assertEquals(ProxyMessages.TYPE_CONNECT_RESULT, ProxyMessages.type(result));
-        assertTrue(result.get("ok").getAsBoolean() == false);
+        assertTrue(!result.get("ok").getAsBoolean());
         assertEquals("anchor_offline", result.get("error").getAsString());
+    }
+
+    @Test
+    void playerListMessages() {
+        JsonObject request = ProxyMessages.decode(
+                ProxyMessages.encodeListPlayers("req-1", "survival").getBytes(StandardCharsets.UTF_8));
+        assertEquals(ProxyMessages.TYPE_LIST_PLAYERS, ProxyMessages.type(request));
+        assertEquals("survival", request.get("server").getAsString());
+
+        JsonObject answer = ProxyMessages.decode(
+                ProxyMessages.encodePlayerList("req-1", List.of("uuid-1", "uuid-2")).getBytes(StandardCharsets.UTF_8));
+        assertEquals(ProxyMessages.TYPE_PLAYER_LIST, ProxyMessages.type(answer));
+        assertEquals(2, answer.getAsJsonArray("players").size());
     }
 
     @Test

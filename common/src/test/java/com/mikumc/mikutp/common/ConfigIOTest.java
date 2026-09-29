@@ -38,7 +38,7 @@ class ConfigIOTest {
         assertEquals("goto", config.commands.home.aliases.get(0));
         // 未出现的键回落到内置默认值
         assertEquals(5000, config.wild.maxRadius);
-        assertEquals("SQLITE", config.storage.type);
+        assertEquals(5, config.home.defaultLimit);
         assertTrue(config.commands.wild.enabled);
     }
 
@@ -63,6 +63,6 @@ class ConfigIOTest {
         MikuTPConfig config = ConfigIO.loadOrCreate(file, yaml, MikuTPConfig.class);
 
         assertEquals(7, config.teleport.warmupSeconds);
-        assertEquals("SQLITE", config.storage.type);
+        assertEquals("mikutp_", config.storage.tablePrefix);
     }
 }

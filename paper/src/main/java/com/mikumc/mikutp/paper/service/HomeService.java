@@ -5,6 +5,7 @@ import com.mikumc.mikutp.common.data.Database;
 import com.mikumc.mikutp.common.data.Home;
 import com.mikumc.mikutp.common.data.PendingTeleport;
 import com.mikumc.mikutp.common.data.Position;
+import com.mikumc.mikutp.common.sync.SyncBus;
 import com.mikumc.mikutp.common.util.Validate;
 import org.bukkit.Location;
 import org.bukkit.entity.Player;
@@ -28,11 +29,13 @@ public final class HomeService {
     private final MessageService messages;
     private final CooldownManager cooldowns;
     private final TeleportService teleports;
+    private final SyncBus syncBus;
     private final String serverId;
     private final Map<UUID, List<Home>> cache = new ConcurrentHashMap<>();
 
     public HomeService(JavaPlugin plugin, Tasks tasks, MikuTPConfig config, Database database,
-                       MessageService messages, CooldownManager cooldowns, TeleportService teleports) {
+                       MessageService messages, CooldownManager cooldowns, TeleportService teleports,
+                       SyncBus syncBus) {
         this.plugin = plugin;
         this.tasks = tasks;
         this.config = config;
@@ -40,6 +43,7 @@ public final class HomeService {
         this.messages = messages;
         this.cooldowns = cooldowns;
         this.teleports = teleports;
+        this.syncBus = syncBus;
         this.serverId = config.crossServer.serverId;
     }
 
@@ -100,6 +104,7 @@ public final class HomeService {
                 database.saveHome(home);
                 cache.put(id, sort(replace(current, home)));
                 messages.send(player, "home.set", "name", name);
+                publishHomeSet(home);
             } catch (Exception e) {
                 plugin.getSLF4JLogger().warn("Failed to save home", e);
                 messages.send(player, "common.teleport-failed");
@@ -115,6 +120,7 @@ public final class HomeService {
                     cache.computeIfPresent(id, (k, list) -> sort(list.stream()
                             .filter(h -> !h.name.equalsIgnoreCase(name)).toList()));
                     messages.send(player, "home.deleted", "name", name);
+                    publishHomeDelete(id.toString(), name);
                 } else {
                     messages.send(player, "home.not-found", "name", name);
                 }
@@ -122,6 +128,57 @@ public final class HomeService {
                 plugin.getSLF4JLogger().warn("Failed to delete home", e);
             }
         });
+    }
+
+    private void publishHomeSet(Home home) {
+        if (!syncBus.crossServer()) {
+            return;
+        }
+        var event = com.mikumc.mikutp.common.sync.SyncEvent.create(
+                com.mikumc.mikutp.common.sync.SyncEvent.Type.HOME_SET, serverId);
+        event.ownerUuid = home.ownerUuid;
+        event.homeName = home.name;
+        event.homePosition = home.position;
+        event.homeCreatedAt = home.createdAt;
+        syncBus.publish(event);
+    }
+
+    private void publishHomeDelete(String ownerUuid, String name) {
+        if (!syncBus.crossServer()) {
+            return;
+        }
+        var event = com.mikumc.mikutp.common.sync.SyncEvent.create(
+                com.mikumc.mikutp.common.sync.SyncEvent.Type.HOME_DELETE, serverId);
+        event.ownerUuid = ownerUuid;
+        event.homeName = name;
+        syncBus.publish(event);
+    }
+
+    /** Applies a replicated home change from another backend. */
+    public void applyRemoteSet(com.mikumc.mikutp.common.sync.SyncEvent event) {
+        if (event.ownerUuid == null || event.homeName == null || event.homePosition == null) {
+            return;
+        }
+        try {
+            Home home = new Home(event.ownerUuid, event.homeName, event.homePosition, event.homeCreatedAt);
+            database.saveHome(home);
+            cache.computeIfPresent(UUID.fromString(event.ownerUuid), (k, list) -> sort(replace(list, home)));
+        } catch (Exception e) {
+            plugin.getSLF4JLogger().warn("Failed to apply replicated home", e);
+        }
+    }
+
+    public void applyRemoteDelete(com.mikumc.mikutp.common.sync.SyncEvent event) {
+        if (event.ownerUuid == null || event.homeName == null) {
+            return;
+        }
+        try {
+            database.deleteHome(event.ownerUuid, event.homeName);
+            cache.computeIfPresent(UUID.fromString(event.ownerUuid), (k, list) -> sort(list.stream()
+                    .filter(h -> !h.name.equalsIgnoreCase(event.homeName)).toList()));
+        } catch (Exception e) {
+            plugin.getSLF4JLogger().warn("Failed to apply replicated home deletion", e);
+        }
     }
 
     public void go(Player player, String name) {

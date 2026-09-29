@@ -11,6 +11,7 @@ tasks.withType<JavaCompile> {
 dependencies {
     compileOnly("com.google.code.gson:gson:2.11.0")
     compileOnly("org.yaml:snakeyaml:2.2")
+    compileOnly("redis.clients:jedis:5.1.0")
 
     testImplementation("com.google.code.gson:gson:2.11.0")
     testImplementation("org.yaml:snakeyaml:2.2")

@@ -8,13 +8,16 @@ import java.util.List;
  */
 public final class MikuTPConfig {
 
-    public int configVersion = 1;
+    public int configVersion = 2;
 
-    /** Where homes, warps, requests and player data are stored. */
+    /** Local SQLite storage settings. */
     public Storage storage = new Storage();
 
-    /** Cross-server (proxy network) mode settings. */
+    /** Cross-server identity and request settings. */
     public CrossServer crossServer = new CrossServer();
+
+    /** Redis sync bus settings (cross-server mode). */
+    public Sync sync = new Sync();
 
     /** Global teleport behaviour: warmup, cancel rules and cooldowns. */
     public Teleport teleport = new Teleport();
@@ -65,6 +68,7 @@ public final class MikuTPConfig {
         public CommandEntry dback = new CommandEntry(List.of());
         public CommandEntry otp = new CommandEntry(List.of());
         public CommandEntry otph = new CommandEntry(List.of());
+        public CommandEntry outtp = new CommandEntry(List.of());
         public CommandEntry mtp = new CommandEntry(List.of("mikutp"));
         public CommandEntry ui = new CommandEntry(List.of());
     }
@@ -86,6 +90,7 @@ public final class MikuTPConfig {
         this.configVersion = other.configVersion;
         this.storage = other.storage;
         this.crossServer = other.crossServer;
+        this.sync = other.sync;
         this.teleport = other.teleport;
         this.home = other.home;
         this.warp = other.warp;
@@ -93,43 +98,42 @@ public final class MikuTPConfig {
         this.back = other.back;
         this.wild = other.wild;
         this.dialogs = other.dialogs;
+        this.commands = other.commands;
         this.languageFile = other.languageFile;
         this.parsePlaceholderApi = other.parsePlaceholderApi;
     }
 
     public static final class Storage {
-        /** SQLITE for single servers, MYSQL for proxy networks. */
-        public String type = "SQLITE";
         public String tablePrefix = "mikutp_";
-        public MySql mysql = new MySql();
-        /** Only used for MYSQL. SQLite always uses a single connection. */
-        public int poolSize = 8;
-    }
-
-    public static final class MySql {
-        public String host = "localhost";
-        public int port = 3306;
-        public String database = "mikutp";
-        public String user = "mikutp";
-        public String password = "";
-        public boolean useSsl = false;
     }
 
     public static final class CrossServer {
         /**
-         * When true, homes/tpa/back work across the proxy network.
-         * Requires the Velocity-side companion plugin and a shared MYSQL database.
-         */
-        public boolean enabled = false;
-        /**
-         * Identifier of this backend server. Must match the server name used by
-         * the proxy when this backend takes part in a network.
+         * Identifier of this backend server; also the Redis consumer name and the
+         * origin tag on sync events. Must match the proxy server name when this
+         * backend takes part in a network.
          */
         public String serverId = "server";
-        /** How often the backend polls the database for cross-server events, in milliseconds. */
-        public long pollIntervalMs = 1000;
-        /** Seconds after which an unanswered cross-server request expires. */
-        public int requestExpirySeconds = 60;
+    }
+
+    public static final class Sync {
+        /** NONE = single server (no Redis); REDIS = local SQLite plus the Redis sync bus. */
+        public String mode = "NONE";
+        public Redis redis = new Redis();
+        /** Approximate stream retention in entries; events are tiny, keep it generous. */
+        public long streamMaxLength = 500000;
+        /** True when cross-server features are switched on. */
+        public boolean enabled() {
+            return "REDIS".equalsIgnoreCase(mode);
+        }
+    }
+
+    public static final class Redis {
+        public String host = "localhost";
+        public int port = 6379;
+        public String password = "";
+        public int database = 0;
+        public boolean useSsl = false;
     }
 
     public static final class Teleport {

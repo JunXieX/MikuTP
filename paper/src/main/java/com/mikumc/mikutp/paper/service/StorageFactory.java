@@ -9,38 +9,20 @@ import java.nio.file.Path;
 import java.sql.Connection;
 import java.sql.SQLException;
 
-/** Builds the JDBC layer from config: a SQLite file or a MySQL pool. */
+/** Opens the local SQLite database through a single pooled connection. */
 public final class StorageFactory {
 
     private StorageFactory() {
     }
 
     public static Database create(Path dataFolder, MikuTPConfig config) {
-        String type = config.storage.type == null ? "SQLITE" : config.storage.type.trim().toUpperCase();
-        HikariDataSource dataSource;
-        Database.Dialect dialect;
-        if (type.equals("MYSQL")) {
-            var mysql = config.storage.mysql;
-            HikariConfig h = new HikariConfig();
-            h.setPoolName("MikuTP-MySQL");
-            h.setMaximumPoolSize(Math.max(2, config.storage.poolSize));
-            h.setDriverClassName("com.mysql.cj.jdbc.Driver");
-            h.setJdbcUrl("jdbc:mysql://%s:%d/%s?useSSL=%s&characterEncoding=utf8&serverTimezone=UTC"
-                    .formatted(mysql.host, mysql.port, mysql.database, mysql.useSsl));
-            h.setUsername(mysql.user);
-            h.setPassword(mysql.password);
-            dataSource = new HikariDataSource(h);
-            dialect = Database.Dialect.MYSQL;
-        } else {
-            HikariConfig h = new HikariConfig();
-            h.setPoolName("MikuTP-SQLite");
-            h.setMaximumPoolSize(1);
-            h.setDriverClassName("org.sqlite.JDBC");
-            h.setJdbcUrl("jdbc:sqlite:" + dataFolder.resolve("data.db").toAbsolutePath());
-            dataSource = new HikariDataSource(h);
-            dialect = Database.Dialect.SQLITE;
-        }
-        return new Database(new PooledProvider(dataSource), dialect, config.storage.tablePrefix);
+        HikariConfig h = new HikariConfig();
+        h.setPoolName("MikuTP-SQLite");
+        h.setMaximumPoolSize(1);
+        h.setDriverClassName("org.sqlite.JDBC");
+        h.setJdbcUrl("jdbc:sqlite:" + dataFolder.resolve("data.db").toAbsolutePath());
+        HikariDataSource dataSource = new HikariDataSource(h);
+        return new Database(new PooledProvider(dataSource), config.storage.tablePrefix);
     }
 
     private record PooledProvider(HikariDataSource dataSource) implements Database.ConnectionProvider {

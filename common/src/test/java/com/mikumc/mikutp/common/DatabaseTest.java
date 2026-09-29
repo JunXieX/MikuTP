@@ -3,19 +3,16 @@ package com.mikumc.mikutp.common;
 import com.mikumc.mikutp.common.data.Database;
 import com.mikumc.mikutp.common.data.Home;
 import com.mikumc.mikutp.common.data.IgnoreEntry;
-import com.mikumc.mikutp.common.data.PendingTeleport;
 import com.mikumc.mikutp.common.data.PlayerProfile;
 import com.mikumc.mikutp.common.data.Position;
-import com.mikumc.mikutp.common.data.TpRequest;
+import com.mikumc.mikutp.common.data.Warp;
+import com.mikumc.mikutp.common.sync.SyncBus;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
 import java.sql.Connection;
-import java.sql.DriverManager;
-import java.sql.SQLException;
 import java.util.List;
-import java.util.UUID;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -35,7 +32,7 @@ class DatabaseTest {
         }
 
         @Override
-        public Connection acquire() throws SQLException {
+        public Connection acquire() throws java.sql.SQLException {
             return dataSource.getConnection();
         }
 
@@ -49,7 +46,7 @@ class DatabaseTest {
 
     @BeforeEach
     void setUp() throws Exception {
-        database = new Database(new PooledSqlite(), Database.Dialect.SQLITE, "mikutp_");
+        database = new Database(new PooledSqlite(), "mikutp_");
         database.init();
     }
 
@@ -67,6 +64,7 @@ class DatabaseTest {
         assertEquals(1, database.countHomes("uuid-a"));
         assertEquals(1, database.listHomes("uuid-a").size());
         assertEquals(1.0, database.getHome("uuid-a", "base").orElseThrow().position.x);
+        assertEquals(1, database.listAllHomes().size());
 
         assertTrue(database.deleteHome("uuid-a", "base"));
         assertFalse(database.deleteHome("uuid-a", "base"));
@@ -74,7 +72,18 @@ class DatabaseTest {
     }
 
     @Test
-    void playerProfileAndBack() throws Exception {
+    void warpCrudIsServerScoped() throws Exception {
+        database.saveWarp(new Warp("shop", new Position("s1", "world", 1, 64, 1, 0f, 0f), 1L));
+        database.saveWarp(new Warp("market", new Position("s2", "world", 2, 64, 2, 0f, 0f), 2L));
+
+        assertEquals(1, database.listWarps("s1").size());
+        assertEquals("market", database.listWarps("s2").get(0).name);
+        assertTrue(database.deleteWarp("shop"));
+        assertEquals(0, database.listWarps("s1").size());
+    }
+
+    @Test
+    void playerProfileAndNameLookup() throws Exception {
         database.upsertPlayer("uuid-a", "Alice", 100L);
         database.upsertPlayer("uuid-a", "Alice_2", 200L);
         database.upsertPlayer("uuid-B", "bob", 300L);
@@ -86,80 +95,44 @@ class DatabaseTest {
 
         database.setTpaEnabled("uuid-a", false);
         assertFalse(database.getPlayer("uuid-a").orElseThrow().tpaEnabled);
-
-        Position back = new Position("s1", "world_nether", 5, 40, 5, 0f, 0f);
-        database.setBack("uuid-a", back, "back_");
-        assertEquals("world_nether", database.getBack("uuid-a", "back_").orElseThrow().world);
-        database.setBack("uuid-a", null, "back_");
-        assertTrue(database.getBack("uuid-a", "back_").isEmpty());
+        assertEquals(2, database.listAllProfiles().size());
     }
 
     @Test
-    void deathBackIsIndependentOfTeleportBack() throws Exception {
+    void storedPositionsAreIndependent() throws Exception {
         database.upsertPlayer("uuid-a", "Alice", 1L);
-        Position teleportBack = new Position("s1", "world", 1, 64, 2, 0f, 0f);
-        Position deathBack = new Position("s2", "world", 3, 32, 4, 90f, 0f);
-        database.setBack("uuid-a", teleportBack, "back_");
-        database.setBack("uuid-a", deathBack, "death_");
+        Position back = new Position("s1", "world_nether", 5, 40, 5, 0f, 0f);
+        Position death = new Position("s2", "world", 3, 32, 4, 90f, 0f);
+        Position logout = new Position("s1", "world", 7, 65, 8, 180f, 0f);
 
-        assertEquals(1.0, database.getBack("uuid-a", "back_").orElseThrow().x);
-        assertEquals(3.0, database.getBack("uuid-a", "death_").orElseThrow().x);
-        assertEquals("s2", database.getBack("uuid-a", "death_").orElseThrow().server);
+        database.setPosition("uuid-a", back, Database.BACK_PREFIX);
+        database.setPosition("uuid-a", death, Database.DEATH_PREFIX);
+        database.setPosition("uuid-a", logout, Database.LOGOUT_PREFIX);
 
-        // Clearing one record must not touch the other.
-        database.setBack("uuid-a", null, "death_");
-        assertTrue(database.getBack("uuid-a", "death_").isEmpty());
-        assertEquals("world", database.getBack("uuid-a", "back_").orElseThrow().world);
+        assertEquals(5.0, database.getPosition("uuid-a", Database.BACK_PREFIX).orElseThrow().x);
+        assertEquals(3.0, database.getPosition("uuid-a", Database.DEATH_PREFIX).orElseThrow().x);
+        assertEquals(7.0, database.getPosition("uuid-a", Database.LOGOUT_PREFIX).orElseThrow().x);
+        assertEquals("s2", database.getPosition("uuid-a", Database.DEATH_PREFIX).orElseThrow().server);
+
+        // Clearing one record must not touch the others.
+        database.setPosition("uuid-a", null, Database.DEATH_PREFIX);
+        assertTrue(database.getPosition("uuid-a", Database.DEATH_PREFIX).isEmpty());
+        assertEquals("world_nether", database.getPosition("uuid-a", Database.BACK_PREFIX).orElseThrow().world);
+        assertEquals("world", database.getPosition("uuid-a", Database.LOGOUT_PREFIX).orElseThrow().world);
     }
 
     @Test
-    void requestLifecycle() throws Exception {
-        long now = System.currentTimeMillis();
-        TpRequest request = new TpRequest(UUID.randomUUID().toString(), TpRequest.Type.GO,
-                "req-uuid", "Alice", "s1", "tgt-uuid", "Bob", TpRequest.Status.PENDING, now, now);
-        database.insertRequest(request);
+    void resyncDumpSeesEverything() throws Exception {
+        database.upsertPlayer("uuid-a", "Alice", 10L);
+        database.saveHome(new Home("uuid-a", "base", new Position("s1", "world", 1, 1, 1, 0f, 0f), 1L));
+        database.setPosition("uuid-a", new Position("s1", "world", 2, 2, 2, 0f, 0f), Database.DEATH_PREFIX);
+        database.addIgnore(new IgnoreEntry("uuid-a", "uuid-b", IgnoreEntry.PERMANENT, 1L));
 
-        assertTrue(database.hasPendingFromRequester("req-uuid"));
-        assertEquals(1, database.listPendingForTargets(List.of("tgt-uuid"), now - 1000).size());
-        assertEquals(0, database.listPendingForTargets(List.of("tgt-uuid"), now + 1000).size());
-
-        database.setRequestStatus(request.id, TpRequest.Status.ACCEPTED, now + 5);
-        List<TpRequest> updates = database.listUpdatesSince(List.of("req-uuid", "tgt-uuid"), now - 1);
-        assertEquals(1, updates.size());
-        assertEquals(TpRequest.Status.ACCEPTED, updates.get(0).status);
-        assertEquals("Bob", updates.get(0).targetName);
-
-        // Request is 10s old with a 60s expiry: not stale yet. After 120s it is.
-        TpRequest stale = new TpRequest(UUID.randomUUID().toString(), TpRequest.Type.GO,
-                "req-uuid", "Alice", "s1", "tgt-uuid", "Bob", TpRequest.Status.PENDING, now, now);
-        database.insertRequest(stale);
-        assertEquals(0, database.expireStale(now + 10_000, 60_000));
-        assertEquals(1, database.expireStale(now + 120_000, 60_000));
-        assertEquals(0, database.expireStale(now + 120_000, 60_000));
-    }
-
-    @Test
-    void pendingTeleportHandoff() throws Exception {
-        Position position = new Position("s2", "world", 1, 2, 3, 0f, 0f);
-        database.putPendingTeleport(new PendingTeleport("uuid-a", position, PendingTeleport.Source.TPA, 7L));
-        database.putPendingTeleport(new PendingTeleport("uuid-a", new Position("s2", "world", 9, 9, 9, 0f, 0f), PendingTeleport.Source.TPA, 8L));
-
-        PendingTeleport taken = database.takePendingTeleport("uuid-a").orElseThrow();
-        assertEquals(9.0, taken.position.x);
-        assertEquals("s2", taken.position.server);
-        assertTrue(taken.anchorUuid == null);
-        assertTrue(database.takePendingTeleport("uuid-a").isEmpty());
-    }
-
-    @Test
-    void pendingTeleportAnchorRoundTrip() throws Exception {
-        Position stub = new Position(null, "", 0, 0, 0, 0f, 0f);
-        database.putPendingTeleport(new PendingTeleport("uuid-a", stub, PendingTeleport.Source.ADMIN, 1L, "uuid-anchor"));
-
-        PendingTeleport taken = database.takePendingTeleport("uuid-a").orElseThrow();
-        assertEquals("uuid-anchor", taken.anchorUuid);
-        assertEquals(PendingTeleport.Source.ADMIN, taken.source);
-        assertTrue(database.takePendingTeleport("uuid-a").isEmpty());
+        assertEquals(1, database.listAllProfiles().size());
+        assertEquals(1, database.listAllHomes().size());
+        assertEquals(1, database.listAllStoredPositions().size());
+        assertEquals(1, database.listAllIgnores().size());
+        assertEquals("s1", database.listAllStoredPositions().get(0).death().server);
     }
 
     @Test
@@ -176,5 +149,21 @@ class DatabaseTest {
         assertTrue(database.isIgnored("tgt-uuid", "req-uuid", now + 999_999_999));
         assertTrue(database.clearIgnore("tgt-uuid", "req-uuid"));
         assertFalse(database.isIgnored("tgt-uuid", "req-uuid", now));
+    }
+
+    @Test
+    void outboxRoundTrip() throws Exception {
+        assertEquals(0, database.takeOutboxEvents(100).size());
+        database.addOutboxEvent("event-1");
+        database.addOutboxEvent("event-2");
+
+        List<SyncBus.OutboxRow> rows = database.takeOutboxEvents(10);
+        assertEquals(2, rows.size());
+        assertEquals("event-1", rows.get(0).payload());
+
+        database.deleteOutboxEvents(List.of(rows.get(0).seq()));
+        rows = database.takeOutboxEvents(10);
+        assertEquals(1, rows.size());
+        assertEquals("event-2", rows.get(0).payload());
     }
 }

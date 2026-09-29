@@ -4,6 +4,8 @@ import org.yaml.snakeyaml.LoaderOptions;
 import org.yaml.snakeyaml.Yaml;
 import org.yaml.snakeyaml.constructor.SafeConstructor;
 
+import com.google.gson.Gson;
+
 import java.io.IOException;
 import java.lang.reflect.Field;
 import java.lang.reflect.Modifier;
@@ -20,7 +22,14 @@ import java.util.Map;
  */
 public final class ConfigIO {
 
+    private static final Gson GSON = new Gson();
+
     private ConfigIO() {
+    }
+
+    /** Shared Gson instance for internal wire formats (sync events, pending teleports). */
+    public static Gson gson() {
+        return GSON;
     }
 
     /** Reads {@code file}; writes the bundled, commented default first when absent. */

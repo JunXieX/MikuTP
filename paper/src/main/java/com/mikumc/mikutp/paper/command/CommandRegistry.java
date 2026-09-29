@@ -44,16 +44,18 @@ public final class CommandRegistry {
     private final DialogFactory dialogs;
     private final ChatMenus chats;
     private final Runnable reloadAction;
+    private final Runnable resyncAction;
     private final java.util.function.Supplier<String> infoSupplier;
     private final java.util.function.BooleanSupplier dialogsEnabledSupplier;
-    private final com.mikumc.mikutp.common.config.MikuTPConfig config;
+    private final MikuTPConfig config;
 
     public CommandRegistry(JavaPlugin plugin, MessageService messages, CooldownManager cooldowns,
                            HomeService homeService, WarpService warpService, RequestService requestService,
                            WildService wildService, TeleportService teleports, DialogFactory dialogs,
-                           ChatMenus chats, Runnable reloadAction, java.util.function.Supplier<String> infoSupplier,
+                           ChatMenus chats, Runnable reloadAction, Runnable resyncAction,
+                           java.util.function.Supplier<String> infoSupplier,
                            java.util.function.BooleanSupplier dialogsEnabledSupplier,
-                           com.mikumc.mikutp.common.config.MikuTPConfig config) {
+                           MikuTPConfig config) {
         this.plugin = plugin;
         this.messages = messages;
         this.cooldowns = cooldowns;
@@ -65,6 +67,7 @@ public final class CommandRegistry {
         this.dialogs = dialogs;
         this.chats = chats;
         this.reloadAction = reloadAction;
+        this.resyncAction = resyncAction;
         this.infoSupplier = infoSupplier;
         this.dialogsEnabledSupplier = dialogsEnabledSupplier;
         this.config = config;
@@ -101,6 +104,7 @@ public final class CommandRegistry {
             reg.accept(new Registration("dback", dback(), "返回死亡地点", List.of()));
             reg.accept(new Registration("otp", otp(), "强制传送到玩家身边", List.of()));
             reg.accept(new Registration("otph", otph(), "强制将玩家传送过来", List.of()));
+            reg.accept(new Registration("outtp", outtp(), "传送到玩家最后下线的位置", List.of()));
             reg.accept(new Registration("ui", ui(), "传送请求快捷响应", List.of()));
             reg.accept(new Registration("mtp", admin(), "MikuTP 管理命令", List.of("mikutp")));
         });
@@ -127,6 +131,7 @@ public final class CommandRegistry {
             case "dback" -> commands.dback;
             case "otp" -> commands.otp;
             case "otph" -> commands.otph;
+            case "outtp" -> commands.outtp;
             case "mtp" -> commands.mtp;
             case "ui" -> commands.ui;
             default -> null;
@@ -424,6 +429,22 @@ public final class CommandRegistry {
         return root.build();
     }
 
+    private LiteralCommandNode<CommandSourceStack> outtp() {
+        LiteralArgumentBuilder<CommandSourceStack> root = Commands.literal("outtp")
+                .requires(requiresPlayer("mikutp.otp"))
+                .executes(ctx -> {
+                    messages.send(asPlayer(ctx.getSource()), "outtp.usage");
+                    return 1;
+                });
+        root.then(Commands.argument("player", StringArgumentType.word())
+                .executes(ctx -> {
+                    teleports.adminLastLogout(asPlayer(ctx.getSource()),
+                            StringArgumentType.getString(ctx, "player"));
+                    return 1;
+                }));
+        return root.build();
+    }
+
     private LiteralCommandNode<CommandSourceStack> admin() {
         LiteralArgumentBuilder<CommandSourceStack> root = Commands.literal("mtp")
                 .requires(src -> src.getSender().hasPermission("mikutp.admin"))
@@ -435,6 +456,11 @@ public final class CommandRegistry {
         root.then(Commands.literal("reload").executes(ctx -> {
             reloadAction.run();
             ctx.getSource().getSender().sendMessage(messages.render(ctx.getSource().getSender(), "common.reload-done"));
+            return 1;
+        }));
+        root.then(Commands.literal("resync").executes(ctx -> {
+            resyncAction.run();
+            ctx.getSource().getSender().sendMessage(messages.render(ctx.getSource().getSender(), "admin.resync-done"));
             return 1;
         }));
         root.then(Commands.literal("info").executes(ctx -> {
