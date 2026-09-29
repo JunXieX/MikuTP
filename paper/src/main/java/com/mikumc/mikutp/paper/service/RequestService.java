@@ -279,21 +279,13 @@ public final class RequestService {
                 }
                 if (response == Response.ACCEPT && request.type == TpRequest.Type.GO) {
                     // The requester travels here; stash our position for their arrival.
-                    UUID requesterId = UUID.fromString(request.requesterUuid);
-                    tasks.entity(target, () -> {
-                        Position here = new Position(serverId, target.getWorld().getName(),
-                                target.getLocation().getX(), target.getLocation().getY(),
-                                target.getLocation().getZ(), target.getLocation().getYaw(),
-                                target.getLocation().getPitch());
-                        tasks.async(() -> {
-                            try {
-                                database.putPendingTeleport(new PendingTeleport(requesterId.toString(), here,
-                                        PendingTeleport.Source.TPA, System.currentTimeMillis()));
-                            } catch (Exception e) {
-                                plugin.getSLF4JLogger().warn("Failed to stash cross-server destination", e);
-                            }
-                        });
-                    });
+                    stashPositionFor(UUID.fromString(request.requesterUuid), target.getUniqueId(),
+                            PendingTeleport.Source.TPA);
+                }
+                if (response == Response.ACCEPT && request.type == TpRequest.Type.COME) {
+                    // The target travels to the requester: tell their backend to stash
+                    // the requester's position right away (poll is only a fallback).
+                    network.routeTpGo(request, target);
                 }
                 effects.click(target);
                 switch (response) {
@@ -344,7 +336,7 @@ public final class RequestService {
 
     // ------------------------------------------------------------------ remote delivery & polling
 
-    /** Instant delivery path from the proxy. */
+    /** Instant delivery path from the proxy: a new incoming request. */
     public void deliverRemote(TpRequest request) {
         if (request == null || request.targetUuid == null) {
             return;
@@ -368,6 +360,45 @@ public final class RequestService {
                 handler.accept(request);
             }
             effects.requestReceived(target);
+        });
+    }
+
+    /**
+     * Instant go-ahead path from the proxy: the target of a come-here request
+     * accepted, so the requester's position must be stashed for their arrival.
+     */
+    public void deliverTpGo(TpRequest request) {
+        if (request == null || !handledRemote.add(request.id)) {
+            return;
+        }
+        prune(handledRemote);
+        stashPositionFor(UUID.fromString(request.targetUuid), UUID.fromString(request.requesterUuid),
+                PendingTeleport.Source.TPA_HERE);
+    }
+
+    /** Captures {@code positionOwner}'s live position and stores it as the pending teleport of {@code playerToTeleport}. */
+    private void stashPositionFor(UUID playerToTeleport, UUID positionOwner, PendingTeleport.Source source) {
+        Player owner = Bukkit.getPlayer(positionOwner);
+        if (owner == null) {
+            return;
+        }
+        tasks.entity(owner, () -> {
+            Player stable = Bukkit.getPlayer(positionOwner);
+            if (stable == null) {
+                return;
+            }
+            Position here = new Position(serverId, stable.getWorld().getName(),
+                    stable.getLocation().getX(), stable.getLocation().getY(),
+                    stable.getLocation().getZ(), stable.getLocation().getYaw(),
+                    stable.getLocation().getPitch());
+            tasks.async(() -> {
+                try {
+                    database.putPendingTeleport(new PendingTeleport(playerToTeleport.toString(), here,
+                            source, System.currentTimeMillis()));
+                } catch (Exception e) {
+                    plugin.getSLF4JLogger().warn("Failed to stash cross-server destination", e);
+                }
+            });
         });
     }
 
@@ -408,6 +439,13 @@ public final class RequestService {
             return;
         }
         prune(handledRemote);
+        if (requesterOurs && request.status == TpRequest.Status.ACCEPTED && request.type == TpRequest.Type.COME) {
+            // Fallback when the instant go-ahead was lost: stash the requester's
+            // position so the arriving target can be teleported on join.
+            stashPositionFor(UUID.fromString(request.targetUuid), UUID.fromString(request.requesterUuid),
+                    PendingTeleport.Source.TPA_HERE);
+            return;
+        }
         if (requesterOurs && request.status == TpRequest.Status.ACCEPTED && request.type == TpRequest.Type.GO) {
             Player mover = Bukkit.getPlayer(UUID.fromString(request.requesterUuid));
             markCompleted(request.id, now);

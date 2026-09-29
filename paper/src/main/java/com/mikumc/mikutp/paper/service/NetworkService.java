@@ -19,6 +19,7 @@ public final class NetworkService {
     private final Tasks tasks;
     private final MessageService messages;
     private volatile Consumer<TpRequest> requestHandler;
+    private volatile Consumer<TpRequest> tpGoHandler;
     private volatile boolean enabled;
 
     public NetworkService(JavaPlugin plugin, Tasks tasks, MessageService messages) {
@@ -51,6 +52,11 @@ public final class NetworkService {
         this.requestHandler = handler;
     }
 
+    /** Receives "go ahead" notifications for accepted come-here requests. */
+    public void setTpGoHandler(Consumer<TpRequest> handler) {
+        this.tpGoHandler = handler;
+    }
+
     private void onIncoming(Player carrier, byte[] bytes) {
         com.google.gson.JsonObject o = ProxyMessages.decode(bytes);
         if (o == null) {
@@ -60,6 +66,14 @@ public final class NetworkService {
         if (ProxyMessages.TYPE_TP_REQUEST.equals(type)) {
             TpRequest request = ProxyMessages.requestFromJson(o);
             Consumer<TpRequest> handler = requestHandler;
+            if (request != null && handler != null) {
+                handler.accept(request);
+            }
+            return;
+        }
+        if (ProxyMessages.TYPE_TP_GO.equals(type)) {
+            TpRequest request = ProxyMessages.requestFromJson(o);
+            Consumer<TpRequest> handler = tpGoHandler;
             if (request != null && handler != null) {
                 handler.accept(request);
             }
@@ -83,7 +97,16 @@ public final class NetworkService {
 
     /** Asks the proxy to deliver a request to the target player's backend. */
     public void routeTpRequest(TpRequest request, Player carrier) {
-        send(carrier, ProxyMessages.encodeRoute(request.targetUuid, ProxyMessages.encodeTpRequest(request)));
+        route(request.targetUuid, ProxyMessages.encodeTpRequest(request), carrier);
+    }
+
+    /** Asks the proxy to deliver a go-ahead to the requester's backend. */
+    public void routeTpGo(TpRequest request, Player carrier) {
+        route(request.requesterUuid, ProxyMessages.encodeTpGo(request), carrier);
+    }
+
+    private void route(String to, String bodyJson, Player carrier) {
+        send(carrier, ProxyMessages.encodeRoute(to, bodyJson));
     }
 
     private void send(Player carrier, String json) {

@@ -93,6 +93,7 @@ public final class MikuTPPlugin extends JavaPlugin {
         chats = new ChatMenus(messages);
         requestService.setShowRequestHandler(this::showRequest);
         network.setRequestHandler(requestService::deliverRemote);
+        network.setTpGoHandler(requestService::deliverTpGo);
         warpService.load();
         requestService.start(config.crossServer.enabled);
 

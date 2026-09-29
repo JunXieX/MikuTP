@@ -23,6 +23,7 @@ public final class ProxyMessages {
     public static final String TYPE_CONNECT_ANCHOR = "connect_anchor";
     public static final String TYPE_ROUTE = "route";
     public static final String TYPE_TP_REQUEST = "tp_request";
+    public static final String TYPE_TP_GO = "tp_go";
     public static final String TYPE_CONNECT_RESULT = "connect_result";
 
     private ProxyMessages() {
@@ -56,6 +57,17 @@ public final class ProxyMessages {
     public static String encodeTpRequest(TpRequest request) {
         JsonObject o = new JsonObject();
         o.addProperty("t", TYPE_TP_REQUEST);
+        o.add("request", toJson(request));
+        return o.toString();
+    }
+
+    /**
+     * Tells the requester's backend that a "come here" request was accepted, so
+     * it can stash the requester's position before the mover departs.
+     */
+    public static String encodeTpGo(TpRequest request) {
+        JsonObject o = new JsonObject();
+        o.addProperty("t", TYPE_TP_GO);
         o.add("request", toJson(request));
         return o.toString();
     }
