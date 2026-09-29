@@ -1,0 +1,50 @@
+name: MikuTP
+version: '${version}'
+main: com.mikumc.mikutp.paper.MikuTPPlugin
+api-version: '26.2'
+authors: [JunXieX]
+description: Teleportation suite with dialog menus, homes, warps, tpa and random teleport for Paper and Folia.
+folia-supported: true
+softdepend: [PlaceholderAPI]
+libraries:
+  - org.xerial:sqlite-jdbc:3.46.1.3
+  - com.mysql:mysql-connector-j:9.1.0
+  - com.zaxxer:HikariCP:6.2.1
+
+permissions:
+  mikutp.home:
+    description: Use /home and /homes
+    default: true
+  mikutp.home.set:
+    description: Use /sethome
+    default: true
+  mikutp.home.delete:
+    description: Use /delhome
+    default: true
+  mikutp.warp:
+    description: Use /warp
+    default: true
+  mikutp.warp.manage:
+    description: Create and delete warps
+    default: op
+  mikutp.tpa:
+    description: Send and answer teleport requests
+    default: true
+  mikutp.wild:
+    description: Use /wild random teleport
+    default: true
+  mikutp.back:
+    description: Use /back
+    default: true
+  mikutp.admin:
+    description: /mikutp administration
+    default: op
+  mikutp.bypass.warmup:
+    description: Skip the teleport warmup
+    default: false
+  mikutp.bypass.cooldown:
+    description: Skip teleport cooldowns
+    default: false
+  mikutp.homes.unlimited:
+    description: Unlimited home count
+    default: false
