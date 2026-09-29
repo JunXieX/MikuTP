@@ -9,3 +9,4 @@ logs/
 *.iml
 .vscode/
 .DS_Store
+.zcodeignore
