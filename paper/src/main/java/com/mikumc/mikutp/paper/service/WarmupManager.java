@@ -1,7 +1,6 @@
 package com.mikumc.mikutp.paper.service;
 
 import io.papermc.paper.threadedregions.scheduler.ScheduledTask;
-import org.bukkit.Location;
 import org.bukkit.entity.Player;
 
 import java.util.Map;
@@ -23,11 +22,6 @@ public final class WarmupManager {
 
     private static final class Active {
         volatile ScheduledTask task;
-        final Location origin;
-
-        Active(Location origin) {
-            this.origin = origin;
-        }
     }
 
     public WarmupManager(Tasks tasks, MessageService messages, Effects effects, int warmupSeconds) {
@@ -37,26 +31,19 @@ public final class WarmupManager {
         this.warmupSeconds = Math.max(0, warmupSeconds);
     }
 
-    /** Location the player stood at when the warmup began (for /back). */
-    public Location origin(UUID player) {
-        Active a = active.get(player);
-        return a == null ? null : a.origin.clone();
-    }
-
     public boolean isWarming(UUID player) {
         return active.containsKey(player);
     }
 
-    /** Starts the countdown; {@code onComplete} runs on the player's entity thread. */
+    /** Starts the countdown; {@code onComplete} runs on the player's entity thread.
+     * A second start for the same player replaces the pending one (latest wins). */
     public void start(Player player, Runnable onComplete) {
         if (warmupSeconds <= 0) {
             onComplete.run();
             return;
         }
-        if (active.containsKey(player.getUniqueId())) {
-            return;
-        }
-        Active a = new Active(player.getLocation().clone());
+        drop(player.getUniqueId());
+        Active a = new Active();
         active.put(player.getUniqueId(), a);
         long finishAt = System.currentTimeMillis() + warmupSeconds * 1000L;
         a.task = tasks.entityRepeat(player, task -> {

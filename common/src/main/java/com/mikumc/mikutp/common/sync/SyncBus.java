@@ -8,7 +8,7 @@ import java.util.function.Consumer;
 /**
  * The cross-server synchronization bus. Local SQLite stays the source of
  * truth; the bus only carries change events and short-lived coordination
- * state (pending teleports, presence).
+ * state (pending teleports, presence, request mailboxes).
  */
 public interface SyncBus extends AutoCloseable {
 
@@ -54,6 +54,10 @@ public interface SyncBus extends AutoCloseable {
 
     /** Queues a request for a player who may be offline right now; expires with ttl. */
     default void mailboxAdd(String playerUuid, String payloadJson, int ttlSeconds) {
+    }
+
+    /** Removes one previously queued payload (e.g. after the request was answered). */
+    default void mailboxRemove(String playerUuid, String payloadJson) {
     }
 
     /** Reads and clears everything queued for the player. */

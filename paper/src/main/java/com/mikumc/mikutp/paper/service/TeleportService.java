@@ -513,6 +513,12 @@ public final class TeleportService {
     /** Captures {@code positionOwner}'s live position and stores it as the
      * pending teleport of {@code playerToTeleport} (used by the request flow). */
     public void stashPendingTeleport(UUID playerToTeleport, UUID positionOwner, PendingTeleport.Source source) {
+        stashPendingTeleport(playerToTeleport, positionOwner, source, null);
+    }
+
+    /** Same as above; {@code onSuccess} runs once the payload is durably stored. */
+    public void stashPendingTeleport(UUID playerToTeleport, UUID positionOwner,
+                                     PendingTeleport.Source source, Runnable onSuccess) {
         Player owner = Bukkit.getPlayer(positionOwner);
         if (owner == null) {
             return;
@@ -523,13 +529,18 @@ public final class TeleportService {
                 return;
             }
             Position here = positionOf(stable.getLocation());
-            try {
-                PendingTeleport pending = new PendingTeleport(playerToTeleport.toString(), here,
-                        source, System.currentTimeMillis(), positionOwner.toString());
-                syncBus.pendingPut(playerToTeleport.toString(), ConfigIO.gson().toJson(pending), PENDING_TTL_SECONDS);
-            } catch (Exception e) {
-                plugin.getSLF4JLogger().warn("Failed to stash cross-server destination", e);
-            }
+            tasks.async(() -> {
+                try {
+                    PendingTeleport pending = new PendingTeleport(playerToTeleport.toString(), here,
+                            source, System.currentTimeMillis(), positionOwner.toString());
+                    syncBus.pendingPut(playerToTeleport.toString(), ConfigIO.gson().toJson(pending), PENDING_TTL_SECONDS);
+                    if (onSuccess != null) {
+                        onSuccess.run();
+                    }
+                } catch (Exception e) {
+                    plugin.getSLF4JLogger().warn("Failed to stash cross-server destination", e);
+                }
+            });
         });
     }
 

@@ -72,10 +72,20 @@ public final class RedisSyncBus implements SyncBus {
         ensureGroup();
         publisherThread.start();
         consumerThread.start();
+        try (Jedis jedis = pool.getResource()) {
+            jedis.ping();
+        } catch (Exception e) {
+            // Data is safe: events queue in the local outbox and sync once Redis
+            // is reachable; the loops below keep retrying forever.
+            org.slf4j.LoggerFactory.getLogger(RedisSyncBus.class)
+                    .warn("Redis unreachable at startup ({}); cross-server sync will start automatically once it is reachable.",
+                            e.getMessage());
+        }
     }
 
     private volatile Consumer<SyncEvent> applier = event -> {
     };
+    private volatile boolean groupReady;
 
     @Override
     public void publish(SyncEvent event) {
@@ -92,8 +102,14 @@ public final class RedisSyncBus implements SyncBus {
     private void ensureGroup() {
         try (Jedis jedis = pool.getResource()) {
             jedis.xgroupCreate(STREAM, GROUP, new StreamEntryID("0-0"), true);
+            groupReady = true;
         } catch (JedisDataException e) {
             // BUSYGROUP: the group already exists, which is fine.
+            if (String.valueOf(e.getMessage()).contains("BUSYGROUP")) {
+                groupReady = true;
+            }
+        } catch (Exception ignored) {
+            // Redis unreachable: retried from the consumer loop.
         }
     }
 
@@ -138,6 +154,13 @@ public final class RedisSyncBus implements SyncBus {
 
     private void consumeLoop() {
         while (running) {
+            if (!groupReady) {
+                ensureGroup();
+                if (!groupReady) {
+                    sleep(3000);
+                    continue;
+                }
+            }
             List<StreamEntry> entries;
             try (Jedis jedis = pool.getResource()) {
                 var read = jedis.xreadGroup(GROUP, consumer,
@@ -147,6 +170,10 @@ public final class RedisSyncBus implements SyncBus {
                         ? List.of()
                         : read.get(0).getValue();
             } catch (Exception e) {
+                // A deleted/recreated group surfaces as NOGROUP here; recreate it.
+                if (String.valueOf(e.getMessage()).contains("NOGROUP")) {
+                    groupReady = false;
+                }
                 sleep(3000);
                 continue;
             }
@@ -244,6 +271,14 @@ public final class RedisSyncBus implements SyncBus {
             String key = MAILBOX_KEY + playerUuid;
             jedis.rpush(key, payloadJson);
             jedis.expire(key, ttlSeconds);
+        } catch (Exception ignored) {
+        }
+    }
+
+    @Override
+    public void mailboxRemove(String playerUuid, String payloadJson) {
+        try (Jedis jedis = pool.getResource()) {
+            jedis.lrem(MAILBOX_KEY + playerUuid, 1, payloadJson);
         } catch (Exception ignored) {
         }
     }

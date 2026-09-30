@@ -87,7 +87,6 @@ public final class RequestService {
     }
 
     public void onQuit(UUID player) {
-        String pid = player.toString();
         lastIncoming.remove(player);
         Map<String, TpRequest> mine = incoming.remove(player);
         if (mine != null) {
@@ -236,6 +235,9 @@ public final class RequestService {
 
     private void respondCommon(Player target, TpRequest request, Response response) {
         effects.click(target);
+        // The request is answered: drop its rejoin-mailbox copy so quitting and
+        // rejoining cannot replay an already-handled dialog.
+        syncBus.mailboxRemove(request.targetUuid, ConfigIO.gson().toJson(request));
         switch (response) {
             case ACCEPT -> messages.send(target, "tpa.accepted-target", "player", request.requesterName);
             case DENY -> messages.send(target, "tpa.denied-target", "player", request.requesterName);
@@ -267,11 +269,17 @@ public final class RequestService {
             return; // requester is gone and there is no cross-server path left
         }
         if (response == Response.ACCEPT && request.type == TpRequest.Type.GO) {
-            // The requester travels here; stash our position for their arrival before
-            // announcing the acceptance.
+            // The requester travels here; stash our position for their arrival and
+            // only announce the acceptance once the payload is durably stored.
             teleports.stashPendingTeleport(UUID.fromString(request.requesterUuid),
-                    target.getUniqueId(), PendingTeleport.Source.TPA);
+                    target.getUniqueId(), PendingTeleport.Source.TPA,
+                    () -> publishResponded(request, response));
+            return;
         }
+        publishResponded(request, response);
+    }
+
+    private void publishResponded(TpRequest request, Response response) {
         SyncEvent event = SyncEvent.create(SyncEvent.Type.TP_RESPONDED, serverId);
         event.request = request;
         event.response = response.name();
@@ -492,13 +500,15 @@ public final class RequestService {
                             teleports.dispatchToAnchor(requester, request.targetUuid, null);
                         }
                     } else {
-                        // Come-here: the target travels. Stash our live position, then
-                        // give the target's backend the go-ahead.
+                        // Come-here: the target travels. Stash our live position for the
+                        // arriving target and only give the go-ahead once it is stored.
                         teleports.stashPendingTeleport(UUID.fromString(request.targetUuid),
-                                requester.getUniqueId(), PendingTeleport.Source.TPA_HERE);
-                        SyncEvent ready = SyncEvent.create(SyncEvent.Type.TP_READY, serverId);
-                        ready.request = request;
-                        syncBus.publish(ready);
+                                requester.getUniqueId(), PendingTeleport.Source.TPA_HERE,
+                                () -> {
+                                    SyncEvent ready = SyncEvent.create(SyncEvent.Type.TP_READY, serverId);
+                                    ready.request = request;
+                                    syncBus.publish(ready);
+                                });
                     }
                 }
                 case DENY -> messages.send(requester, "tpa.denied-requester", "player", request.targetName);
