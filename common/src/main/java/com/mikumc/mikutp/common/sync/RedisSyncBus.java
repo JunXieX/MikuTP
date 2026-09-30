@@ -36,6 +36,7 @@ public final class RedisSyncBus implements SyncBus {
     private static final String GROUP = "mikutp";
     private static final String PENDING_KEY = "mikutp:pending:";
     private static final String PRESENCE_KEY = "mikutp:player:";
+    private static final String MAILBOX_KEY = "mikutp:mailbox:";
     /** Poll intervals of the outbox publisher: fast when busy, backing off when idle. */
     private static final long ACTIVE_SLEEP_MS = 100;
     private static final long IDLE_SLEEP_MS = 1000;
@@ -234,6 +235,28 @@ public final class RedisSyncBus implements SyncBus {
             return jedis.getDel(PENDING_KEY + playerUuid);
         } catch (Exception e) {
             return null;
+        }
+    }
+
+    @Override
+    public void mailboxAdd(String playerUuid, String payloadJson, int ttlSeconds) {
+        try (Jedis jedis = pool.getResource()) {
+            String key = MAILBOX_KEY + playerUuid;
+            jedis.rpush(key, payloadJson);
+            jedis.expire(key, ttlSeconds);
+        } catch (Exception ignored) {
+        }
+    }
+
+    @Override
+    public List<String> mailboxTake(String playerUuid) {
+        try (Jedis jedis = pool.getResource()) {
+            String key = MAILBOX_KEY + playerUuid;
+            List<String> payloads = jedis.lrange(key, 0, -1);
+            jedis.del(key);
+            return payloads;
+        } catch (Exception e) {
+            return List.of();
         }
     }
 

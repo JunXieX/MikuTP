@@ -41,6 +41,7 @@ public final class PlayerLifecycle implements Listener {
         cooldowns.setBypass(id, player.hasPermission("mikutp.bypass.cooldown"));
         profiles.onJoin(player);
         homeService.onJoin(player);
+        requestService.deliverMailbox(id);
         teleports.applyPending(id);
     }
 

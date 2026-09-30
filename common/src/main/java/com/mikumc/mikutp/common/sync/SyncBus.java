@@ -52,6 +52,15 @@ public interface SyncBus extends AutoCloseable {
     /** Atomically reads and removes the payload; null when absent. */
     String pendingTake(String playerUuid);
 
+    /** Queues a request for a player who may be offline right now; expires with ttl. */
+    default void mailboxAdd(String playerUuid, String payloadJson, int ttlSeconds) {
+    }
+
+    /** Reads and clears everything queued for the player. */
+    default List<String> mailboxTake(String playerUuid) {
+        return List.of();
+    }
+
     @Override
     void close();
 }

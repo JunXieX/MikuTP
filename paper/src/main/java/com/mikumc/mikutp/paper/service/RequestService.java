@@ -1,5 +1,6 @@
 package com.mikumc.mikutp.paper.service;
 
+import com.mikumc.mikutp.common.config.ConfigIO;
 import com.mikumc.mikutp.common.config.MikuTPConfig;
 import com.mikumc.mikutp.common.data.Database;
 import com.mikumc.mikutp.common.data.IgnoreEntry;
@@ -176,6 +177,12 @@ public final class RequestService {
         SyncEvent event = SyncEvent.create(SyncEvent.Type.TP_NEW, serverId);
         event.request = request;
         syncBus.publish(event);
+        if (syncBus.crossServer()) {
+            // If the target happens to be offline while the event flies, the request
+            // waits in their mailbox and is delivered the moment they rejoin.
+            syncBus.mailboxAdd(request.targetUuid,
+                    ConfigIO.gson().toJson(request), config.tpa.requestExpirySeconds);
+        }
     }
 
     private TpRequest newRequest(Player requester, UUID targetId, String targetName, boolean here) {
@@ -393,12 +400,55 @@ public final class RequestService {
                 || request.createdAt + config.tpa.requestExpirySeconds * 1000L < now) {
             return;
         }
+        if (trackIncoming(request)) {
+            showToTarget(request);
+        }
+    }
+
+    /** Delivers requests that were queued while the target was offline, on rejoin. */
+    public void deliverMailbox(UUID targetId) {
+        if (!syncBus.crossServer()) {
+            return;
+        }
+        tasks.async(() -> {
+            long now = System.currentTimeMillis();
+            for (String payload : syncBus.mailboxTake(targetId.toString())) {
+                TpRequest request;
+                try {
+                    request = ConfigIO.gson().fromJson(payload, TpRequest.class);
+                } catch (Exception e) {
+                    continue;
+                }
+                if (request == null || request.targetUuid == null
+                        || !request.targetUuid.equals(targetId.toString())
+                        || request.status != TpRequest.Status.PENDING
+                        || request.createdAt + config.tpa.requestExpirySeconds * 1000L < now) {
+                    continue;
+                }
+                if (trackIncoming(request)) {
+                    showToTarget(request);
+                }
+            }
+        });
+    }
+
+    /** Registers a request for its target; false when it is already tracked. */
+    private boolean trackIncoming(TpRequest request) {
+        UUID targetId = UUID.fromString(request.targetUuid);
+        Map<String, TpRequest> mine = incoming.computeIfAbsent(targetId, k -> new ConcurrentHashMap<>());
+        if (mine.containsKey(request.id)) {
+            return false;
+        }
+        mine.put(request.id, request);
+        lastIncoming.put(targetId, request.id);
+        return true;
+    }
+
+    private void showToTarget(TpRequest request) {
         Player target = Bukkit.getPlayer(UUID.fromString(request.targetUuid));
         if (target == null) {
             return;
         }
-        incoming.computeIfAbsent(target.getUniqueId(), k -> new ConcurrentHashMap<>()).put(request.id, request);
-        lastIncoming.put(target.getUniqueId(), request.id);
         tasks.entity(target, () -> {
             Consumer<TpRequest> handler = showRequestHandler;
             if (handler != null) {
