@@ -40,7 +40,7 @@ public final class WildService {
     private final MessageService messages;
     private final CooldownManager cooldowns;
     private final TeleportService teleports;
-    private final Map<String, Tag<Biome>> tagCache = new ConcurrentHashMap<>();
+    private final Map<String, java.util.Optional<Tag<Biome>>> tagCache = new ConcurrentHashMap<>();
 
     public WildService(JavaPlugin plugin, Tasks tasks, MikuTPConfig config, MessageService messages,
                        CooldownManager cooldowns, TeleportService teleports) {
@@ -178,7 +178,8 @@ public final class WildService {
 
     private boolean blockedBiome(Biome biome) {
         for (String tagName : config.wild.blockedBiomeTags) {
-            Tag<Biome> tag = tagCache.computeIfAbsent(tagName.toLowerCase(), this::loadTag);
+            Tag<Biome> tag = tagCache.computeIfAbsent(tagName.toLowerCase(),
+                    name -> java.util.Optional.ofNullable(loadTag(name))).orElse(null);
             if (tag != null && tag.isTagged(biome)) {
                 return true;
             }

@@ -128,6 +128,7 @@ public final class Database implements AutoCloseable {
                   payload TEXT NOT NULL
                 )""".formatted(prefix));
         index("CREATE INDEX IF NOT EXISTS %sidx_homes_owner ON %shomes (owner_uuid)".formatted(prefix, prefix));
+        index("CREATE INDEX IF NOT EXISTS %sidx_players_name ON %splayers (name COLLATE NOCASE)".formatted(prefix, prefix));
     }
 
     private void index(String sql) throws SQLException {

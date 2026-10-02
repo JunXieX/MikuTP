@@ -90,8 +90,8 @@ public final class MikuTPPlugin extends JavaPlugin {
         network = new NetworkService(this, tasks, messages);
         profiles = new ProfileService(this, tasks, database, syncBus, config.crossServer.serverId);
         teleports = new TeleportService(this, tasks, config, database, messages, effects,
-                new WarmupManager(tasks, messages, effects, config.teleport.warmupSeconds),
-                network, profiles, syncBus);
+                new WarmupManager(tasks, messages, effects, () -> config.teleport.warmupSeconds),
+                network, profiles, cooldowns, syncBus);
         homeService = new HomeService(this, tasks, config, database, messages, cooldowns, teleports, syncBus);
         warpService = new WarpService(this, tasks, config, database, messages, cooldowns, teleports);
         requestService = new RequestService(this, tasks, config, database, messages, effects, cooldowns,
@@ -100,7 +100,7 @@ public final class MikuTPPlugin extends JavaPlugin {
         coordinator = new SyncCoordinator(this, tasks, config, database, syncBus,
                 homeService, profiles, teleports, requestService);
 
-        dialogs = new DialogFactory(tasks, messages, config.dialogs.listPageSize);
+        dialogs = new DialogFactory(tasks, messages, () -> config.dialogs.listPageSize);
         chats = new ChatMenus(messages);
         requestService.setShowRequestHandler(this::showRequest);
         warpService.load();
@@ -114,7 +114,7 @@ public final class MikuTPPlugin extends JavaPlugin {
         getServer().getPluginManager().registerEvents(
                 new PlayerLifecycle(profiles, homeService, requestService, teleports, cooldowns), this);
         getServer().getPluginManager().registerEvents(
-                new WarmupGuard(teleports.warmups(), config.teleport.moveThresholdBlocks, config.teleport.cancelOnDamage), this);
+                new WarmupGuard(teleports.warmups(), config), this);
 
         if (papiAvailable) {
             expansion = new MikuTPExpansion(this, homeService, warpService, profiles, cooldowns,

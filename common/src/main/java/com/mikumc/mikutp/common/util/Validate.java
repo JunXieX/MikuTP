@@ -5,6 +5,9 @@ import java.util.regex.Pattern;
 /** Input validation helpers. */
 public final class Validate {
 
+    private static final java.util.Map<String, java.util.regex.Pattern> PATTERNS =
+            new java.util.concurrent.ConcurrentHashMap<>();
+
     private Validate() {
     }
 
@@ -13,7 +16,8 @@ public final class Validate {
             return false;
         }
         try {
-            return Pattern.matches(pattern, name);
+            return PATTERNS.computeIfAbsent(pattern, java.util.regex.Pattern::compile)
+                    .matcher(name).matches();
         } catch (Exception e) {
             return false;
         }

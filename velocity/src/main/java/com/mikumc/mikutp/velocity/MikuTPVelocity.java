@@ -21,7 +21,7 @@ import java.util.Optional;
  * message channel, executes server connects and routes deliveries between
  * backends. State lives in the shared database; this plugin stays stateless.
  */
-@Plugin(id = "mikutp", name = "MikuTP", version = "1.0.0",
+@Plugin(id = "mikutp", name = "MikuTP", version = "1.0.1",
         description = "Cross-server teleport bridge for MikuTP backends. MikuMC original plugin by JunXieX, group 1105054380.",
         authors = {"JunXieX"})
 public final class MikuTPVelocity {
@@ -58,6 +58,14 @@ public final class MikuTPVelocity {
         if (message == null) {
             return;
         }
+        try {
+            handle(message, source);
+        } catch (Exception e) {
+            logger.warn("Dropped malformed MikuTP message: {}", e.toString());
+        }
+    }
+
+    private void handle(JsonObject message, ServerConnection source) {
         String type = ProxyMessages.type(message);
         if (type == null) {
             return;

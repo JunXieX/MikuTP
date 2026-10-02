@@ -61,15 +61,22 @@ public final class WarpService {
             messages.send(player, "common.invalid-name");
             return;
         }
+        // Lowercase, like homes: identifiers must never diverge on case.
+        String wanted = name.toLowerCase(java.util.Locale.ROOT);
         Location loc = player.getLocation().clone();
         tasks.async(() -> {
             try {
+                for (Warp existing : warps) {
+                    if (!existing.name.equals(wanted) && existing.name.equalsIgnoreCase(wanted)) {
+                        database.deleteWarp(existing.name);
+                    }
+                }
                 Position position = new Position(serverId, loc.getWorld() == null ? "world" : loc.getWorld().getName(),
                         loc.getX(), loc.getY(), loc.getZ(), loc.getYaw(), loc.getPitch());
-                Warp warp = new Warp(name, position, System.currentTimeMillis());
+                Warp warp = new Warp(wanted, position, System.currentTimeMillis());
                 database.saveWarp(warp);
                 warps = sorted(replace(warps, warp));
-                messages.send(player, "warp.set", "name", name);
+                messages.send(player, "warp.set", "name", wanted);
             } catch (Exception e) {
                 plugin.getSLF4JLogger().warn("Failed to save warp", e);
             }
@@ -77,13 +84,23 @@ public final class WarpService {
     }
 
     public void delete(Player player, String name) {
+        String wanted = name.toLowerCase(java.util.Locale.ROOT);
         tasks.async(() -> {
             try {
-                if (database.deleteWarp(name)) {
-                    warps = sorted(warps.stream().filter(w -> !w.name.equalsIgnoreCase(name)).toList());
-                    messages.send(player, "warp.deleted", "name", name);
+                boolean removed = database.deleteWarp(wanted);
+                if (!removed) {
+                    for (Warp warp : database.listWarps(serverId)) {
+                        if (warp.name.equalsIgnoreCase(wanted)) {
+                            removed = database.deleteWarp(warp.name);
+                            break;
+                        }
+                    }
+                }
+                if (removed) {
+                    warps = sorted(warps.stream().filter(w -> !w.name.equalsIgnoreCase(wanted)).toList());
+                    messages.send(player, "warp.deleted", "name", wanted);
                 } else {
-                    messages.send(player, "warp.not-found", "name", name);
+                    messages.send(player, "warp.not-found", "name", wanted);
                 }
             } catch (Exception e) {
                 plugin.getSLF4JLogger().warn("Failed to delete warp", e);

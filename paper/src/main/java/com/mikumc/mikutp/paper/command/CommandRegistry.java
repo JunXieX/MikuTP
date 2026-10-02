@@ -397,7 +397,8 @@ public final class CommandRegistry {
                         messages.send(player, "common.cooldown", "seconds", String.valueOf(remaining));
                         return 1;
                     }
-                    cooldowns.apply(player.getUniqueId(), kind);
+                    // The cooldown itself is applied by the service only after a
+                    // return position is actually found.
                     handler.accept(player);
                     return 1;
                 })

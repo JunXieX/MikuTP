@@ -73,8 +73,13 @@ public final class NetworkService {
         send(carrier, ProxyMessages.encodeConnect(carrier.getUniqueId().toString(), serverName));
     }
 
-    public void connectAnchor(Player carrier, String anchorUuid) {
-        send(carrier, ProxyMessages.encodeConnectAnchor(carrier.getUniqueId().toString(), anchorUuid));
+    /**
+     * Asks the proxy to move {@code playerToMove} to the server of {@code anchor}.
+     * {@code carrier} is only the connection the request rides on and is usually
+     * (but not necessarily) the player being moved.
+     */
+    public void connectAnchor(Player carrier, String playerToMove, String anchorUuid) {
+        send(carrier, ProxyMessages.encodeConnectAnchor(playerToMove, anchorUuid));
     }
 
     /**

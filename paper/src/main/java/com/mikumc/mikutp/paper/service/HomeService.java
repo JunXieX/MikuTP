@@ -102,21 +102,30 @@ public final class HomeService {
             messages.send(player, "common.invalid-name");
             return;
         }
+        // Names are identifiers: store and match them lowercase so `Base` and
+        // `base` can never diverge between cache and database.
+        String wanted = name.toLowerCase(java.util.Locale.ROOT);
         int maxHomes = limit(player);
         Location loc = player.getLocation().clone();
         UUID id = player.getUniqueId();
         tasks.async(() -> {
             try {
                 List<Home> current = new ArrayList<>(homes(id));
-                boolean exists = current.stream().anyMatch(h -> h.name.equalsIgnoreCase(name));
+                boolean exists = current.stream().anyMatch(h -> h.name.equalsIgnoreCase(wanted));
                 if (!exists && current.size() >= maxHomes) {
                     messages.send(player, "home.limit-reached", "limit", String.valueOf(maxHomes));
                     return;
                 }
-                Home home = new Home(id.toString(), name, positionOf(loc), System.currentTimeMillis());
+                // Pre-lowercase rows from older versions: remove case variants first.
+                for (Home existing : current) {
+                    if (!existing.name.equals(wanted) && existing.name.equalsIgnoreCase(wanted)) {
+                        database.deleteHome(id.toString(), existing.name);
+                    }
+                }
+                Home home = new Home(id.toString(), wanted, positionOf(loc), System.currentTimeMillis());
                 database.saveHome(home);
                 cache.put(id, sort(replace(current, home)));
-                messages.send(player, "home.set", "name", name);
+                messages.send(player, "home.set", "name", wanted);
                 publishHomeSet(home);
             } catch (Exception e) {
                 plugin.getSLF4JLogger().warn("Failed to save home", e);
@@ -127,15 +136,26 @@ public final class HomeService {
 
     public void delete(Player player, String name) {
         UUID id = player.getUniqueId();
+        String wanted = name.toLowerCase(java.util.Locale.ROOT);
         tasks.async(() -> {
             try {
-                if (database.deleteHome(id.toString(), name)) {
+                boolean removed = database.deleteHome(id.toString(), wanted);
+                if (!removed) {
+                    // Case variant stored by an older version: delete by its stored name.
+                    for (Home home : database.listHomes(id.toString())) {
+                        if (home.name.equalsIgnoreCase(wanted)) {
+                            removed = database.deleteHome(id.toString(), home.name);
+                            break;
+                        }
+                    }
+                }
+                if (removed) {
                     cache.computeIfPresent(id, (k, list) -> sort(list.stream()
-                            .filter(h -> !h.name.equalsIgnoreCase(name)).toList()));
-                    messages.send(player, "home.deleted", "name", name);
-                    publishHomeDelete(id.toString(), name);
+                            .filter(h -> !h.name.equalsIgnoreCase(wanted)).toList()));
+                    messages.send(player, "home.deleted", "name", wanted);
+                    publishHomeDelete(id.toString(), wanted);
                 } else {
-                    messages.send(player, "home.not-found", "name", name);
+                    messages.send(player, "home.not-found", "name", wanted);
                 }
             } catch (Exception e) {
                 plugin.getSLF4JLogger().warn("Failed to delete home", e);

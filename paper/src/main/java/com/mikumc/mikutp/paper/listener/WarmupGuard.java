@@ -1,5 +1,6 @@
 package com.mikumc.mikutp.paper.listener;
 
+import com.mikumc.mikutp.common.config.MikuTPConfig;
 import com.mikumc.mikutp.paper.service.WarmupManager;
 import org.bukkit.Location;
 import org.bukkit.entity.Player;
@@ -8,17 +9,16 @@ import org.bukkit.event.Listener;
 import org.bukkit.event.entity.EntityDamageEvent;
 import org.bukkit.event.player.PlayerMoveEvent;
 
-/** Cancels pending teleports on movement or damage. */
+/** Cancels pending teleports on movement or damage. Reads the config live so
+ * /mtp reload takes effect without a restart. */
 public final class WarmupGuard implements Listener {
 
     private final WarmupManager warmups;
-    private final double moveThresholdBlocks;
-    private final boolean cancelOnDamage;
+    private final MikuTPConfig config;
 
-    public WarmupGuard(WarmupManager warmups, double moveThresholdBlocks, boolean cancelOnDamage) {
+    public WarmupGuard(WarmupManager warmups, MikuTPConfig config) {
         this.warmups = warmups;
-        this.moveThresholdBlocks = Math.max(0, moveThresholdBlocks);
-        this.cancelOnDamage = cancelOnDamage;
+        this.config = config;
     }
 
     @EventHandler(ignoreCancelled = true)
@@ -31,20 +31,21 @@ public final class WarmupGuard implements Listener {
         if (to == null) {
             return;
         }
-        if (moveThresholdBlocks <= 0) {
+        double threshold = Math.max(0, config.teleport.moveThresholdBlocks);
+        if (threshold <= 0) {
             if (to.getX() != from.getX() || to.getY() != from.getY() || to.getZ() != from.getZ()) {
                 warmups.cancel(event.getPlayer(), "common.warmup.cancelled-move");
             }
             return;
         }
-        if (from.distanceSquared(to) >= moveThresholdBlocks * moveThresholdBlocks) {
+        if (from.distanceSquared(to) >= threshold * threshold) {
             warmups.cancel(event.getPlayer(), "common.warmup.cancelled-move");
         }
     }
 
     @EventHandler(ignoreCancelled = true)
     public void onDamage(EntityDamageEvent event) {
-        if (!cancelOnDamage || warmups.isEmpty()) {
+        if (!config.teleport.cancelOnDamage || warmups.isEmpty()) {
             return;
         }
         if (event.getEntity() instanceof Player player && warmups.isWarming(player.getUniqueId())) {

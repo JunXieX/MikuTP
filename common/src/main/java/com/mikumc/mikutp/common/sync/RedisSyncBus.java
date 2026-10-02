@@ -23,8 +23,10 @@ import java.util.function.Consumer;
  *
  * <ul>
  *   <li>events: appended to a Redis Stream through the local outbox, consumed
- *       by every backend via a consumer group (XREADGROUP + XACK), so a backend
- *       that was down replays everything it missed on reconnect;</li>
+ *       by every backend via its own consumer group (XREADGROUP + XACK) — one
+ *       group per server makes delivery a broadcast, and each group keeps its
+ *       own read position so a backend that was down replays everything it
+ *       missed on reconnect;</li>
  *   <li>presence: per-player keys with short TTL, refreshed by heartbeats;</li>
  *   <li>pending teleports: per-player keys consumed with GETDEL.</li>
  * </ul>
@@ -33,7 +35,6 @@ public final class RedisSyncBus implements SyncBus {
 
     private static final Gson GSON = new Gson();
     private static final String STREAM = "mikutp:sync";
-    private static final String GROUP = "mikutp";
     private static final String PENDING_KEY = "mikutp:pending:";
     private static final String PRESENCE_KEY = "mikutp:player:";
     private static final String MAILBOX_KEY = "mikutp:mailbox:";
@@ -42,6 +43,14 @@ public final class RedisSyncBus implements SyncBus {
     private static final long IDLE_SLEEP_MS = 1000;
 
     private final JedisPool pool;
+    /**
+     * One consumer group PER SERVER (mikutp-g:&lt;serverId&gt;): groups are the
+     * broadcast unit of Redis Streams — every group receives every entry, and
+     * each group keeps its own read position so a server that was offline
+     * replays everything it missed. Within the group this server is a single
+     * consumer named after itself.
+     */
+    private final String group;
     private final String consumer;
     private final long streamMaxLength;
     private final OutboxStore outbox;
@@ -56,6 +65,7 @@ public final class RedisSyncBus implements SyncBus {
         config.setMaxWait(Duration.ofSeconds(3));
         String pwd = password == null || password.isBlank() ? null : password;
         this.pool = new JedisPool(config, host, port, 5000, pwd, database, useSsl);
+        this.group = "mikutp-g:" + serverId;
         this.consumer = serverId;
         this.streamMaxLength = streamMaxLength;
         this.outbox = outbox;
@@ -101,7 +111,7 @@ public final class RedisSyncBus implements SyncBus {
 
     private void ensureGroup() {
         try (Jedis jedis = pool.getResource()) {
-            jedis.xgroupCreate(STREAM, GROUP, new StreamEntryID("0-0"), true);
+            jedis.xgroupCreate(STREAM, group, new StreamEntryID("0-0"), true);
             groupReady = true;
         } catch (JedisDataException e) {
             // BUSYGROUP: the group already exists, which is fine.
@@ -163,7 +173,7 @@ public final class RedisSyncBus implements SyncBus {
             }
             List<StreamEntry> entries;
             try (Jedis jedis = pool.getResource()) {
-                var read = jedis.xreadGroup(GROUP, consumer,
+                var read = jedis.xreadGroup(group, consumer,
                         XReadGroupParams.xReadGroupParams().block(2000).count(64),
                         Map.of(STREAM, new StreamEntryID(">")));
                 entries = read == null || read.isEmpty()
@@ -202,7 +212,7 @@ public final class RedisSyncBus implements SyncBus {
             return;
         }
         try (Jedis jedis = pool.getResource()) {
-            jedis.xack(STREAM, GROUP, entryIds.toArray(StreamEntryID[]::new));
+            jedis.xack(STREAM, group, entryIds.toArray(StreamEntryID[]::new));
         } catch (Exception ignored) {
             // Unacked entries are redelivered; appliers are idempotent.
         }
@@ -233,9 +243,11 @@ public final class RedisSyncBus implements SyncBus {
             return;
         }
         try (Jedis jedis = pool.getResource()) {
+            var pipe = jedis.pipelined();
             for (Map.Entry<UUID, String> entry : players.entrySet()) {
-                jedis.setex(PRESENCE_KEY + entry.getKey(), ttlSeconds, entry.getValue());
+                pipe.setex(PRESENCE_KEY + entry.getKey(), ttlSeconds, entry.getValue());
             }
+            pipe.sync();
         } catch (Exception ignored) {
         }
     }
@@ -285,10 +297,18 @@ public final class RedisSyncBus implements SyncBus {
 
     @Override
     public List<String> mailboxTake(String playerUuid) {
+        // RENAME first: reading the original key directly could race with a
+        // concurrent mailboxAdd (a request arriving exactly as the player joins).
+        String key = MAILBOX_KEY + playerUuid;
+        String taking = key + ":taking";
         try (Jedis jedis = pool.getResource()) {
-            String key = MAILBOX_KEY + playerUuid;
-            List<String> payloads = jedis.lrange(key, 0, -1);
-            jedis.del(key);
+            try {
+                jedis.rename(key, taking);
+            } catch (JedisDataException e) {
+                return List.of(); // no mailbox for this player
+            }
+            List<String> payloads = jedis.lrange(taking, 0, -1);
+            jedis.del(taking);
             return payloads;
         } catch (Exception e) {
             return List.of();

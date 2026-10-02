@@ -35,12 +35,12 @@ public final class DialogFactory {
 
     private final Tasks tasks;
     private final MessageService messages;
-    private final int pageSize;
+    private final java.util.function.IntSupplier pageSize;
 
-    public DialogFactory(Tasks tasks, MessageService messages, int pageSize) {
+    public DialogFactory(Tasks tasks, MessageService messages, java.util.function.IntSupplier pageSize) {
         this.tasks = tasks;
         this.messages = messages;
-        this.pageSize = Math.max(4, pageSize);
+        this.pageSize = () -> Math.max(4, pageSize.getAsInt());
     }
 
     // ------------------------------------------------------------------ tpa
@@ -174,10 +174,11 @@ public final class DialogFactory {
 
     /** Clamps the page and computes {pages, current, from, to} for a slice of {@code total} entries. */
     private int[] window(int total, int page) {
-        int pages = Math.max(1, (total + pageSize - 1) / pageSize);
+        int size = pageSize.getAsInt();
+        int pages = Math.max(1, (total + size - 1) / size);
         int current = Math.min(Math.max(1, page), pages);
-        int from = (current - 1) * pageSize;
-        int to = Math.min(total, from + pageSize);
+        int from = (current - 1) * size;
+        int to = Math.min(total, from + size);
         return new int[]{pages, current, from, to};
     }
 

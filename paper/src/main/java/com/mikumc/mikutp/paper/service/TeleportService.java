@@ -33,12 +33,13 @@ public final class TeleportService {
     private final WarmupManager warmups;
     private final NetworkService network;
     private final ProfileService profiles;
+    private final CooldownManager cooldowns;
     private final SyncBus syncBus;
     private final String serverId;
 
     public TeleportService(JavaPlugin plugin, Tasks tasks, MikuTPConfig config, Database database,
                            MessageService messages, Effects effects, WarmupManager warmups, NetworkService network,
-                           ProfileService profiles, SyncBus syncBus) {
+                           ProfileService profiles, CooldownManager cooldowns, SyncBus syncBus) {
         this.plugin = plugin;
         this.tasks = tasks;
         this.config = config;
@@ -48,6 +49,7 @@ public final class TeleportService {
         this.warmups = warmups;
         this.network = network;
         this.profiles = profiles;
+        this.cooldowns = cooldowns;
         this.syncBus = syncBus;
         this.serverId = config.crossServer.serverId;
     }
@@ -80,11 +82,14 @@ public final class TeleportService {
                 if (!mover.isOnline()) {
                     return;
                 }
-                recordBack(mover);
-                if (warmup) {
-                    startWarmup(mover, () -> teleportNow(mover, location, label));
-                } else {
+                Runnable doTeleport = () -> {
+                    recordBack(mover);
                     teleportNow(mover, location, label);
+                };
+                if (warmup) {
+                    startWarmup(mover, doTeleport);
+                } else {
+                    doTeleport.run();
                 }
             });
         });
@@ -154,9 +159,9 @@ public final class TeleportService {
      */
     public void dispatchToAnchor(Player mover, String anchorUuid, Runnable afterDispatch) {
         tasks.entity(mover, () -> {
-            recordBack(mover);
             startWarmup(mover, () -> {
-                network.connectAnchor(mover, anchorUuid);
+                recordBack(mover);
+                network.connectAnchor(mover, mover.getUniqueId().toString(), anchorUuid);
                 if (afterDispatch != null) {
                     afterDispatch.run();
                 }
@@ -164,18 +169,20 @@ public final class TeleportService {
         });
     }
 
-    /** /back entry point; the cooldown is enforced by the caller. */
+    /** /back entry point; the cooldown only burns when a position exists. */
     public void goBack(Player player) {
-        goHistory(player, Database.BACK_PREFIX, "back.none", "back.going", PendingTeleport.Source.BACK);
+        goHistory(player, CooldownManager.Kind.BACK, Database.BACK_PREFIX, "back.none", "back.going",
+                PendingTeleport.Source.BACK);
     }
 
-    /** /dback entry point; the cooldown is enforced by the caller. */
+    /** /dback entry point; the cooldown only burns when a position exists. */
     public void goDeathBack(Player player) {
-        goHistory(player, Database.DEATH_PREFIX, "dback.none", "dback.going", PendingTeleport.Source.DEATH);
+        goHistory(player, CooldownManager.Kind.DBACK, Database.DEATH_PREFIX, "dback.none", "dback.going",
+                PendingTeleport.Source.DEATH);
     }
 
-    private void goHistory(Player player, String colPrefix, String emptyKey, String goingKey,
-                           PendingTeleport.Source source) {
+    private void goHistory(Player player, CooldownManager.Kind kind, String colPrefix, String emptyKey,
+                           String goingKey, PendingTeleport.Source source) {
         tasks.async(() -> {
             Position back;
             try {
@@ -188,6 +195,7 @@ public final class TeleportService {
                 messages.send(player, emptyKey);
                 return;
             }
+            cooldowns.apply(player.getUniqueId(), kind);
             messages.send(player, goingKey);
             send(player, back, source, back.world, null);
         });
@@ -309,7 +317,8 @@ public final class TeleportService {
                             System.currentTimeMillis(), record.uuid().toString());
                     syncBus.pendingPut(admin.getUniqueId().toString(),
                             ConfigIO.gson().toJson(pending), PENDING_TTL_SECONDS);
-                    tasks.entity(admin, () -> network.connectAnchor(admin, record.uuid().toString()));
+                    tasks.entity(admin, () -> network.connectAnchor(admin,
+                            record.uuid().toString(), admin.getUniqueId().toString()));
                 } catch (Exception e) {
                     plugin.getSLF4JLogger().warn("Admin goto dispatch failed", e);
                     messages.send(admin, "common.teleport-failed");
@@ -405,7 +414,8 @@ public final class TeleportService {
                         PendingTeleport.Source.ADMIN, System.currentTimeMillis(),
                         admin.getUniqueId().toString());
                 syncBus.pendingPut(victim.toString(), ConfigIO.gson().toJson(pending), PENDING_TTL_SECONDS);
-                tasks.entity(stable, () -> network.connectAnchor(stable, victim.toString()));
+                tasks.entity(stable, () -> network.connectAnchor(stable,
+                        victim.toString(), stable.getUniqueId().toString()));
             } catch (Exception e) {
                 plugin.getSLF4JLogger().warn("Admin bring dispatch failed", e);
             }
@@ -415,7 +425,6 @@ public final class TeleportService {
     // ------------------------------------------------------------------ internals
 
     private void begin(Player player, Position dest, PendingTeleport.Source source, String label, Runnable afterDispatch) {
-        recordBack(player);
         boolean local = dest.server == null || dest.server.isBlank() || dest.server.equals(serverId);
         if (local) {
             World world = Bukkit.getWorld(dest.world);
@@ -425,7 +434,10 @@ public final class TeleportService {
             }
             Location target = new Location(world, dest.x, dest.y, dest.z, dest.yaw, dest.pitch);
             messages.send(player, "common.teleporting", "target", label);
-            startWarmup(player, () -> teleportNow(player, target, label));
+            startWarmup(player, () -> {
+                recordBack(player);
+                teleportNow(player, target, label);
+            });
             return;
         }
         if (!syncBus.crossServer()) {
@@ -433,7 +445,10 @@ public final class TeleportService {
             return;
         }
         messages.send(player, "common.teleporting", "target", label);
-        startWarmup(player, () -> dispatchCross(player, dest, source, afterDispatch));
+        startWarmup(player, () -> {
+            recordBack(player);
+            dispatchCross(player, dest, source, afterDispatch);
+        });
     }
 
     private void startWarmup(Player player, Runnable action) {
@@ -471,6 +486,8 @@ public final class TeleportService {
             if (Boolean.TRUE.equals(ok)) {
                 messages.send(player, "common.teleported", "target", label);
                 effects.teleport(player);
+            } else {
+                messages.send(player, "common.teleport-failed");
             }
         }));
     }

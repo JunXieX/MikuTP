@@ -26,6 +26,23 @@ import java.util.function.Consumer;
  * travel over the sync bus, so local and cross-server requests share one code
  * path. The bus applies every event to every backend, and only the backend
  * currently hosting the affected player acts on it.
+ *
+ * <p>Cross-server flows (S = requester's backend, T = target's backend):
+ * <pre>
+ * GO (requester travels, /tpa):
+ *   S: publish TP_NEW ──▶ T: show dialog ──▶ target accepts:
+ *   T: stash pending(requester ← target's live pos)
+ *      publish TP_RESPONDED(ACCEPT) ──▶ S: warmup requester ──▶
+ *   S: connect_anchor(requester → target) ──▶ T join: apply pending
+ *
+ * COME (target travels, /tpahere):
+ *   S: publish TP_NEW ──▶ T: show dialog ──▶ target accepts:
+ *   T: publish TP_RESPONDED(ACCEPT) ──▶ S: stash pending(target ← requester's live pos)
+ *      publish TP_READY ──▶ T: warmup target ──▶
+ *   T: connect_anchor(target → requester) ──▶ S join: apply pending
+ * </pre>
+ * Every hop also writes the request into the target's mailbox so a player who
+ * was offline during an event still receives it on rejoin.
  */
 public final class RequestService {
 
