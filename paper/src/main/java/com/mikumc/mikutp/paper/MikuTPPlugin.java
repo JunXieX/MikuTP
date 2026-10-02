@@ -132,6 +132,9 @@ public final class MikuTPPlugin extends JavaPlugin {
         if (requestService != null) {
             requestService.shutdown();
         }
+        if (coordinator != null) {
+            coordinator.shutdown();
+        }
         if (expansion != null) {
             expansion.unregister();
             expansion = null;
@@ -246,7 +249,14 @@ public final class MikuTPPlugin extends JavaPlugin {
     /** Reads or creates config.yml and the language file. */
     private void loadConfiguration(boolean initial) throws IOException {
         Path configFile = getDataFolder().toPath().resolve("config.yml");
-        MikuTPConfig loaded = ConfigIO.loadOrCreate(configFile, readResource("config.yml"), MikuTPConfig.class);
+        MikuTPConfig loaded;
+        try {
+            loaded = ConfigIO.loadOrCreate(configFile, readResource("config.yml"), MikuTPConfig.class);
+        } catch (Exception e) {
+            // A broken YAML must not take the whole plugin down: fall back to defaults.
+            getSLF4JLogger().error("config.yml 解析失败，已回退到内置默认配置：{}", e.toString());
+            loaded = new MikuTPConfig();
+        }
         if (config == null) {
             config = loaded;
         } else {

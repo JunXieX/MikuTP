@@ -4,6 +4,7 @@ import com.mikumc.mikutp.common.config.MikuTPConfig;
 import com.mikumc.mikutp.common.data.Database;
 import com.mikumc.mikutp.common.sync.SyncBus;
 import com.mikumc.mikutp.common.sync.SyncEvent;
+import io.papermc.paper.threadedregions.scheduler.ScheduledTask;
 import org.bukkit.Bukkit;
 import org.bukkit.entity.Player;
 import org.bukkit.plugin.java.JavaPlugin;
@@ -12,7 +13,6 @@ import java.util.HashMap;
 import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.TimeUnit;
-
 /**
  * Wires the sync bus to the services: routes incoming events to their owners,
  * publishes heartbeats and answers resync requests by dumping local state.
@@ -32,6 +32,7 @@ public final class SyncCoordinator {
     private final RequestService requestService;
     private final String serverId;
     private volatile long lastDump = 0;
+    private ScheduledTask heartbeatTask;
 
     public SyncCoordinator(JavaPlugin plugin, Tasks tasks, MikuTPConfig config, Database database,
                            SyncBus syncBus, HomeService homeService, ProfileService profileService,
@@ -54,7 +55,13 @@ public final class SyncCoordinator {
             // Ask the network for a full state dump so a fresh or long-offline
             // backend converges, then keep presence fresh.
             publishResync();
-            tasks.asyncRepeat(this::heartbeat, 5, 5, TimeUnit.SECONDS);
+            heartbeatTask = tasks.asyncRepeat(this::heartbeat, 5, 5, TimeUnit.SECONDS);
+        }
+    }
+
+    public void shutdown() {
+        if (heartbeatTask != null) {
+            heartbeatTask.cancel();
         }
     }
 

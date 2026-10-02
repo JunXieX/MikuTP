@@ -68,6 +68,8 @@ public final class RequestService {
     private final Map<UUID, Map<String, TpRequest>> incoming = new ConcurrentHashMap<>();
     private final Map<UUID, String> outgoing = new ConcurrentHashMap<>();
     private final Map<UUID, String> lastIncoming = new ConcurrentHashMap<>();
+    /** Request ids that were already answered; replayed TP_NEW events must not re-open them. */
+    private final java.util.Set<String> answeredRequests = ConcurrentHashMap.newKeySet();
     private final java.util.Set<String> deliveredEvents = ConcurrentHashMap.newKeySet();
     private final java.util.Set<String> handledEvents = ConcurrentHashMap.newKeySet();
     private volatile long lastDump = 0;
@@ -129,7 +131,6 @@ public final class RequestService {
             messages.send(requester, "common.cooldown", "seconds", String.valueOf(remaining));
             return;
         }
-        cooldowns.apply(id, CooldownManager.Kind.TPA);
         tasks.async(() -> {
             Player local = Bukkit.getPlayerExact(targetName);
             if (local != null) {
@@ -174,6 +175,8 @@ public final class RequestService {
             messages.send(requester, "common.player-not-found", "player", targetName);
             return;
         }
+        // All checks passed: only now does the cooldown burn.
+        cooldowns.apply(requester.getUniqueId(), CooldownManager.Kind.TPA);
         TpRequest request = newRequest(requester, targetId, targetName, here);
         outgoing.put(requester.getUniqueId(), request.id);
         publishRequest(request);
@@ -252,6 +255,8 @@ public final class RequestService {
 
     private void respondCommon(Player target, TpRequest request, Response response) {
         effects.click(target);
+        answeredRequests.add(request.id);
+        prune(answeredRequests);
         // The request is answered: drop its rejoin-mailbox copy so quitting and
         // rejoining cannot replay an already-handled dialog.
         syncBus.mailboxRemove(request.targetUuid, ConfigIO.gson().toJson(request));
@@ -422,6 +427,7 @@ public final class RequestService {
         }
         long now = System.currentTimeMillis();
         if (request.status != TpRequest.Status.PENDING
+                || answeredRequests.contains(request.id)
                 || request.createdAt + config.tpa.requestExpirySeconds * 1000L < now) {
             return;
         }
@@ -447,6 +453,7 @@ public final class RequestService {
                 if (request == null || request.targetUuid == null
                         || !request.targetUuid.equals(targetId.toString())
                         || request.status != TpRequest.Status.PENDING
+                        || answeredRequests.contains(request.id)
                         || request.createdAt + config.tpa.requestExpirySeconds * 1000L < now) {
                     continue;
                 }

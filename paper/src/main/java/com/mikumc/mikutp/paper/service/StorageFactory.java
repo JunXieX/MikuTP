@@ -19,6 +19,7 @@ public final class StorageFactory {
         HikariConfig h = new HikariConfig();
         h.setPoolName("MikuTP-SQLite");
         h.setMaximumPoolSize(1);
+        h.setConnectionTimeout(5000);
         h.setDriverClassName("org.sqlite.JDBC");
         h.setJdbcUrl("jdbc:sqlite:" + dataFolder.resolve("data.db").toAbsolutePath());
         HikariDataSource dataSource = new HikariDataSource(h);

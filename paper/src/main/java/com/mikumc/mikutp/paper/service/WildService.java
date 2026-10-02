@@ -134,8 +134,24 @@ public final class WildService {
             int z = (int) Math.round(centerZ + distance * Math.sin(angle));
             world.getChunkAtAsync(x >> 4, z >> 4).thenAccept(chunk ->
                     tasks.region(world, x >> 4, z >> 4, () -> evaluate(player, world, x, z, centerX, centerZ,
-                            minRadius, maxRadius, attempts)));
+                            minRadius, maxRadius, attempts)))
+                    .exceptionally(ex -> {
+                        // Chunk load failed (world unloaded mid-search, etc.): count it
+                        // as a spent attempt and carry on.
+                        if (attempts.decrementAndGet() > 0) {
+                            tasks.asyncDelayed(() -> attempt(player, world, centerX, centerZ,
+                                    minRadius, maxRadius, attempts), 100);
+                        } else {
+                            giveUp(player);
+                        }
+                        return null;
+                    });
         });
+    }
+
+    private void giveUp(Player player) {
+        cooldowns.clear(player.getUniqueId(), CooldownManager.Kind.WILD);
+        messages.send(player, "wild.failed");
     }
 
     /** Runs on the region thread that owns the candidate chunk. */
@@ -160,8 +176,7 @@ public final class WildService {
             tasks.asyncDelayed(() -> attempt(player, world, centerX, centerZ, minRadius, maxRadius, attempts), 100);
             return;
         }
-        cooldowns.clear(player.getUniqueId(), CooldownManager.Kind.WILD);
-        messages.send(player, "wild.failed");
+        giveUp(player);
     }
 
     private boolean isSafeLanding(World world, int x, int y, int z, Block ground) {
