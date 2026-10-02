@@ -466,7 +466,14 @@ public final class CommandRegistry {
         }));
         root.then(Commands.literal("permissions").executes(ctx -> {
             CommandSender sender = ctx.getSource().getSender();
-            var permissions = plugin.getPluginMeta().getPermissions();
+            var permissions = new java.util.ArrayList<>(plugin.getPluginMeta().getPermissions());
+            if (permissions.isEmpty()) {
+                // paper-plugin.yml permissions unavailable: fall back to the static registry.
+                for (var node : com.mikumc.mikutp.paper.PermissionNodes.NODES) {
+                    permissions.add(new org.bukkit.permissions.Permission(node.node(), node.description(),
+                            org.bukkit.permissions.PermissionDefault.valueOf(node.def().toUpperCase(java.util.Locale.ROOT))));
+                }
+            }
             sender.sendMessage(messages.render(sender, "admin.permissions", "count", String.valueOf(permissions.size())));
             for (var permission : permissions) {
                 sender.sendMessage(messages.render(sender, "admin.permissions-line",

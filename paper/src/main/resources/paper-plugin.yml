@@ -5,11 +5,14 @@ api-version: '26.2'
 authors: [JunXieX]
 description: 多功能传送套件：家、地标、传送请求、随机传送与跨服传送（Paper/Folia）。MikuMC 服务器原创插件，作者 JunXieX，交流群 1105054380
 folia-supported: true
-softdepend: [PlaceholderAPI]
-libraries:
-  - org.xerial:sqlite-jdbc:3.46.1.3
-  - com.zaxxer:HikariCP:6.2.1
-  - redis.clients:jedis:5.1.0
+loader: com.mikumc.mikutp.paper.MikuTPLoader
+
+dependencies:
+  server:
+    PlaceholderAPI:
+      load: BEFORE
+      required: false
+      join-classpath: true
 
 permissions:
   mikutp.home:

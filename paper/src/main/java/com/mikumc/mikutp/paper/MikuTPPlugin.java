@@ -63,6 +63,7 @@ public final class MikuTPPlugin extends JavaPlugin {
 
     @Override
     public void onEnable() {
+        registerPermissions();
         // softdepend loads PlaceholderAPI before us when present; isPluginEnabled also
         // covers the case where it exists but failed to enable.
         papiAvailable = getServer().getPluginManager().isPluginEnabled("PlaceholderAPI");
@@ -159,6 +160,20 @@ public final class MikuTPPlugin extends JavaPlugin {
     }
 
     // ------------------------------------------------------------------ internals
+
+    /** Registers every permission node with its Bukkit default. Belt and braces:
+     * paper-plugin.yml also declares them; a duplicate registration is ignored. */
+    private void registerPermissions() {
+        var pm = getServer().getPluginManager();
+        for (PermissionNodes.Node node : PermissionNodes.NODES) {
+            try {
+                pm.addPermission(new org.bukkit.permissions.Permission(node.node(), node.description(),
+                        org.bukkit.permissions.PermissionDefault.valueOf(node.def().toUpperCase(java.util.Locale.ROOT))));
+            } catch (IllegalArgumentException ignored) {
+                // Already declared by paper-plugin.yml.
+            }
+        }
+    }
 
     private SyncBus buildSyncBus() {
         if (!config.sync.enabled()) {

@@ -85,7 +85,7 @@ MikuTP 是一套面向 Paper / Folia / Velocity 的多功能传送插件：家�
 
 ## 权限
 
-全部节点在 `plugin.yml` 中声明，服主可直接输入 `/mtp permissions` 查看完整清单后在 LuckPerms 中配置。默认值：基础功能全员可用；`mikutp.warp.manage`、`mikutp.otp`、`mikutp.admin` 仅 OP；`mikutp.bypass.warmup`、`mikutp.bypass.cooldown`、`mikutp.homes.unlimited` 默认无人拥有（适合做会员特权）。
+全部节点在 `paper-plugin.yml` 中声明，服主可直接输入 `/mtp permissions` 查看完整清单后在 LuckPerms 中配置。默认值：基础功能全员可用；`mikutp.warp.manage`、`mikutp.otp`、`mikutp.admin` 仅 OP；`mikutp.bypass.warmup`、`mikutp.bypass.cooldown`、`mikutp.homes.unlimited` 默认无人拥有（适合做会员特权）。
 
 ## PlaceholderAPI 占位符
 
@@ -97,7 +97,7 @@ MikuTP 是一套面向 Paper / Folia / Velocity 的多功能传送插件：家�
 客户端版本低于 1.21.6（例如经 ViaVersion 进来的老版本客户端）无法渲染 Dialog。把 `dialogs.enabled` 改为 `false` 即可整体回退为可点击的聊天菜单。
 
 **Folia 26.1.2 提示 api-version 过高拒绝加载？**
-把 `plugin.yml` 里的 `api-version: '26.2'` 改为 `'26.1'` 即可。
+把 `paper-plugin.yml` 里的 `api-version: '26.2'` 改为 `'26.1'` 即可。
 
 **Redis 宕机会有什么影响？**
 本地功能（家、地标、单服传送、随机传送）完全正常；跨服传送暂停，Redis 恢复后插件自动补发积压的同步事件，无需人工干预。

@@ -17,12 +17,23 @@ dependencies {
     compileOnly("me.clip:placeholderapi:2.12.3")
     compileOnly("com.zaxxer:HikariCP:6.2.1")
     compileOnly(project(":common"))
+
+    testImplementation(platform("org.junit:junit-bom:5.11.4"))
+    testImplementation("org.junit.jupiter:junit-jupiter")
+    testRuntimeOnly("org.junit.platform:junit-platform-launcher")
+    testImplementation("org.yaml:snakeyaml:2.2")
+    // compileOnly deps are absent from the test classpath; the loader test needs them.
+    testImplementation("io.papermc.paper:paper-api:26.2.build.129-stable")
 }
 
 tasks.processResources {
     val props = mapOf("version" to project.version)
     inputs.properties(props)
-    filesMatching("plugin.yml") { expand(props) }
+    filesMatching("paper-plugin.yml") { expand(props) }
+}
+
+tasks.test {
+    useJUnitPlatform()
 }
 
 tasks.jar {
