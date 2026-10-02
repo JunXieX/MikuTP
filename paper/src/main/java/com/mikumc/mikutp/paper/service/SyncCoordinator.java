@@ -97,7 +97,7 @@ public final class SyncCoordinator {
             case HOME_DELETE -> homeService.applyRemoteDelete(event);
             case PROFILE -> profileService.applySync(event);
             case BACK -> teleports.applySyncBack(event);
-            case IGNORE_SET, IGNORE_DELETE, TP_NEW, TP_RESPONDED, TP_READY -> requestService.onSyncEvent(event);
+            case IGNORE_SET, IGNORE_DELETE, TP_NEW, TP_RESPONDED, TP_READY, TP_CANCEL -> requestService.onSyncEvent(event);
             case RESYNC_REQUEST -> dumpSelf();
         }
     }

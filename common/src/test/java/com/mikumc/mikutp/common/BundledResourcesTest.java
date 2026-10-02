@@ -46,7 +46,7 @@ class BundledResourcesTest {
                 "tpa.sent", "tpa.usage", "tpa.sent-here", "tpahere.usage", "tpa.received-chat",
                 "tpa.received-here-chat", "tpa.hint-chat", "tpa.accepted-target", "tpa.denied-target",
                 "tpa.accepted-requester", "tpa.denied-requester", "tpa.blocked-requester", "tpa.blocked-target",
-                "tpa.blocked-permanent-target", "tpa.no-pending", "tpa.self", "tpa.already-pending",
+                "tpa.blocked-permanent-target", "tpa.no-pending", "tpa.self", "tpa.revoked-target",
                 "tpa.target-toggled", "tpa.expired-requester", "tpa.toggled-on", "tpa.toggled-off",
                 "tpa.block-list", "tpa.block-list-empty", "tpa.unblocked", "tpa.not-blocked",
                 "wild.searching", "wild.searching-done", "wild.disabled", "wild.failed",

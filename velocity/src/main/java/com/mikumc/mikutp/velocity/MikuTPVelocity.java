@@ -21,7 +21,7 @@ import java.util.Optional;
  * message channel, executes server connects and routes deliveries between
  * backends. State lives in the shared database; this plugin stays stateless.
  */
-@Plugin(id = "mikutp", name = "MikuTP", version = "1.1.0",
+@Plugin(id = "mikutp", name = "MikuTP", version = "1.2.0",
         description = "Cross-server teleport bridge for MikuTP backends. MikuMC original plugin by JunXieX, group 1105054380.",
         authors = {"JunXieX"})
 public final class MikuTPVelocity {

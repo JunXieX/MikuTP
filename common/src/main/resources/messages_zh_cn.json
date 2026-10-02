@@ -46,7 +46,7 @@
   "tpa.blocked-permanent-target": "<prefix><green>已永久屏蔽 <white><player></white> 的传送请求。</green>",
   "tpa.no-pending": "<prefix><red>没有来自该玩家的待处理请求。</red>",
   "tpa.self": "<prefix><red>不能对自己发起传送请求。</red>",
-  "tpa.already-pending": "<prefix><red>你已有一个待处理的传送请求，请等待响应或过期。</red>",
+  "tpa.revoked-target": "<prefix><yellow><white><player></white> 撤销了发给你的传送请求。</yellow>",
   "tpa.target-toggled": "<prefix><red><white><player></white> 当前不接受任何传送请求。</red>",
   "tpa.expired-requester": "<prefix><red>你发给 <white><player></white> 的传送请求已过期。</red>",
   "tpa.toggled-on": "<prefix><green>已开启传送请求接收。</green>",

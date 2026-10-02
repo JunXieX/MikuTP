@@ -42,7 +42,9 @@ import java.util.function.Consumer;
  *   T: connect_anchor(target → requester) ──▶ S join: apply pending
  * </pre>
  * Every hop also writes the request into the target's mailbox so a player who
- * was offline during an event still receives it on rejoin.
+ * was offline during an event still receives it on rejoin. Sending a new
+ * request cancels the sender's previous one via TP_CANCEL (the old target is
+ * notified and their dialog is closed).
  */
 public final class RequestService {
 
@@ -158,10 +160,6 @@ public final class RequestService {
             messages.send(requester, "tpa.self");
             return;
         }
-        if (outgoing.containsKey(requester.getUniqueId())) {
-            messages.send(requester, "tpa.already-pending");
-            return;
-        }
         if (!profiles.isTpaEnabled(targetId)) {
             messages.send(requester, "tpa.target-toggled", "player", targetName);
             return;
@@ -175,7 +173,9 @@ public final class RequestService {
             messages.send(requester, "common.player-not-found", "player", targetName);
             return;
         }
-        // All checks passed: only now does the cooldown burn.
+        // All checks passed: revoke the previous outgoing request (its target is
+        // notified and their dialog closed), then burn the cooldown and send.
+        cancelOutgoing(requester);
         cooldowns.apply(requester.getUniqueId(), CooldownManager.Kind.TPA);
         TpRequest request = newRequest(requester, targetId, targetName, here);
         outgoing.put(requester.getUniqueId(), request.id);
@@ -192,6 +192,25 @@ public final class RequestService {
         return server != null && !server.isBlank();
     }
 
+    /**
+     * Revokes the requester's previous outgoing request: publishes TP_CANCEL so
+     * the backend hosting the old target removes it, closes their dialog and
+     * notifies them. A no-op when nothing is pending.
+     */
+    private void cancelOutgoing(Player requester) {
+        String oldId = outgoing.remove(requester.getUniqueId());
+        if (oldId == null) {
+            return;
+        }
+        answeredRequests.add(oldId);
+        prune(answeredRequests);
+        SyncEvent event = SyncEvent.create(SyncEvent.Type.TP_CANCEL, serverId);
+        event.playerUuid = requester.getUniqueId().toString();
+        event.playerName = requester.getName();
+        syncBus.publish(event);
+    }
+
+    /** The requester's previous outgoing request is being replaced. */
     private void publishRequest(TpRequest request) {
         SyncEvent event = SyncEvent.create(SyncEvent.Type.TP_NEW, serverId);
         event.request = request;
@@ -410,9 +429,47 @@ public final class RequestService {
             case TP_NEW -> deliverRemote(event);
             case TP_RESPONDED -> processResponse(event);
             case TP_READY -> processReady(event);
+            case TP_CANCEL -> processCancel(event);
             case IGNORE_SET, IGNORE_DELETE -> applyIgnoreSync(event);
             default -> {
             }
+        }
+    }
+
+    /**
+     * A requester sent a new request, revoking their previous one. Every backend
+     * scans its incoming map; the one hosting the old target removes the request,
+     * closes the dialog and notifies the target.
+     */
+    private void processCancel(SyncEvent event) {
+        String requesterUuid = event.playerUuid;
+        String requesterName = event.playerName;
+        if (requesterUuid == null || requesterName == null) {
+            return;
+        }
+        for (Map.Entry<UUID, Map<String, TpRequest>> entry : incoming.entrySet()) {
+            List<TpRequest> revoked = new ArrayList<>();
+            entry.getValue().values().removeIf(request -> {
+                if (request.requesterUuid.equals(requesterUuid)) {
+                    revoked.add(request);
+                    return true;
+                }
+                return false;
+            });
+            if (revoked.isEmpty()) {
+                continue;
+            }
+            Player target = Bukkit.getPlayer(entry.getKey());
+            if (target == null) {
+                continue;
+            }
+            for (TpRequest request : revoked) {
+                syncBus.mailboxRemove(request.targetUuid, ConfigIO.gson().toJson(request));
+            }
+            tasks.entity(target, () -> {
+                target.closeDialog();
+                messages.send(target, "tpa.revoked-target", "player", requesterName);
+            });
         }
     }
 
@@ -603,6 +660,11 @@ public final class RequestService {
                 if (requester != null) {
                     tasks.entity(requester, () -> messages.send(requester, "tpa.expired-requester",
                             "player", request.targetName));
+                }
+                // Close the dialog the target left open.
+                Player target = Bukkit.getPlayer(entry.getKey());
+                if (target != null) {
+                    tasks.entity(target, target::closeDialog);
                 }
                 return true;
             });

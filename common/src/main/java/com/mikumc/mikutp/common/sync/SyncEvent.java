@@ -14,7 +14,7 @@ public final class SyncEvent {
 
     public enum Type {
         HOME_SET, HOME_DELETE, PROFILE, BACK, IGNORE_SET, IGNORE_DELETE,
-        TP_NEW, TP_RESPONDED, TP_READY, RESYNC_REQUEST
+        TP_NEW, TP_RESPONDED, TP_READY, TP_CANCEL, RESYNC_REQUEST
     }
 
     /** Unique event id; consumers use it for idempotency. */
