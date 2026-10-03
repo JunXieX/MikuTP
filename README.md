@@ -37,7 +37,7 @@ MikuTP 是一套面向 Paper / Folia / Velocity 的多功能传送插件：家�
 
 ### 单服务器（默认，零依赖）
 
-1. 把 `MikuTP-Paper-1.2.0.jar` 放入 `plugins/`，重启。
+1. 把 `MikuTP-Paper-1.3.0.jar` 放入 `plugins/`，重启。
 2. 完成。数据存储在 `plugins/MikuTP/data.db`（SQLite），无需 Redis、无需 MySQL。
 
 ### 跨服网络（Velocity）
