@@ -68,7 +68,7 @@ public final class RequestService {
     /** Target player uuid -> request id -> request. Inner maps are concurrent:
      * consumer, sweep and command threads all touch them. */
     private final Map<UUID, Map<String, TpRequest>> incoming = new ConcurrentHashMap<>();
-    private final Map<UUID, String> outgoing = new ConcurrentHashMap<>();
+    private final Map<UUID, TpRequest> outgoingRequests = new ConcurrentHashMap<>();
     private final Map<UUID, String> lastIncoming = new ConcurrentHashMap<>();
     /** Request ids that were already answered; replayed TP_NEW events must not re-open them. */
     private final java.util.Set<String> answeredRequests = ConcurrentHashMap.newKeySet();
@@ -112,15 +112,10 @@ public final class RequestService {
         Map<String, TpRequest> mine = incoming.remove(player);
         if (mine != null) {
             for (TpRequest request : mine.values()) {
-                outgoing.remove(UUID.fromString(request.requesterUuid), request.id);
+                outgoingRequests.remove(UUID.fromString(request.requesterUuid));
             }
         }
-        String outgoingId = outgoing.remove(player);
-        if (outgoingId != null) {
-            for (Map<String, TpRequest> requests : incoming.values()) {
-                requests.values().removeIf(r -> r.id.equals(outgoingId));
-            }
-        }
+        outgoingRequests.remove(player);
     }
 
     // ------------------------------------------------------------------ sending
@@ -178,7 +173,7 @@ public final class RequestService {
         cancelOutgoing(requester);
         cooldowns.apply(requester.getUniqueId(), CooldownManager.Kind.TPA);
         TpRequest request = newRequest(requester, targetId, targetName, here);
-        outgoing.put(requester.getUniqueId(), request.id);
+        outgoingRequests.put(requester.getUniqueId(), request);
         publishRequest(request);
         messages.send(requester, here ? "tpa.sent-here" : "tpa.sent",
                 "player", targetName, "seconds", String.valueOf(config.tpa.requestExpirySeconds));
@@ -193,20 +188,20 @@ public final class RequestService {
     }
 
     /**
-     * Revokes the requester's previous outgoing request: publishes TP_CANCEL so
-     * the backend hosting the old target removes it, closes their dialog and
-     * notifies them. A no-op when nothing is pending.
+     * Revokes the requester's previous outgoing request: publishes TP_CANCEL
+     * carrying the full request, so the backend hosting the old target removes
+     * it, closes their dialog, notifies them and cleans the mailbox copy. A
+     * no-op when nothing is pending.
      */
     private void cancelOutgoing(Player requester) {
-        String oldId = outgoing.remove(requester.getUniqueId());
-        if (oldId == null) {
+        TpRequest revoked = outgoingRequests.remove(requester.getUniqueId());
+        if (revoked == null) {
             return;
         }
-        answeredRequests.add(oldId);
+        answeredRequests.add(revoked.id);
         prune(answeredRequests);
         SyncEvent event = SyncEvent.create(SyncEvent.Type.TP_CANCEL, serverId);
-        event.playerUuid = requester.getUniqueId().toString();
-        event.playerName = requester.getName();
+        event.request = revoked;
         syncBus.publish(event);
     }
 
@@ -241,7 +236,7 @@ public final class RequestService {
                 messages.send(target, "tpa.no-pending");
                 return;
             }
-            outgoing.remove(UUID.fromString(request.requesterUuid), requestId);
+            outgoingRequests.remove(UUID.fromString(request.requesterUuid));
             respondCommon(target, request, response);
         });
     }
@@ -442,29 +437,32 @@ public final class RequestService {
      * closes the dialog and notifies the target.
      */
     private void processCancel(SyncEvent event) {
-        String requesterUuid = event.playerUuid;
-        String requesterName = event.playerName;
+        TpRequest revokedRequest = event.request;
+        String requesterUuid = revokedRequest == null ? null : revokedRequest.requesterUuid;
+        String requesterName = revokedRequest == null ? null : revokedRequest.requesterName;
         if (requesterUuid == null || requesterName == null) {
             return;
         }
         for (Map.Entry<UUID, Map<String, TpRequest>> entry : incoming.entrySet()) {
-            List<TpRequest> revoked = new ArrayList<>();
+            List<TpRequest> found = new ArrayList<>();
             entry.getValue().values().removeIf(request -> {
                 if (request.requesterUuid.equals(requesterUuid)) {
-                    revoked.add(request);
+                    found.add(request);
                     return true;
                 }
                 return false;
             });
-            if (revoked.isEmpty()) {
+            if (found.isEmpty()) {
                 continue;
+            }
+            // Clean the mailbox copies too: the target may be offline right now,
+            // and a rejoin must not replay a revoked request.
+            for (TpRequest request : found) {
+                syncBus.mailboxRemove(request.targetUuid, ConfigIO.gson().toJson(request));
             }
             Player target = Bukkit.getPlayer(entry.getKey());
             if (target == null) {
                 continue;
-            }
-            for (TpRequest request : revoked) {
-                syncBus.mailboxRemove(request.targetUuid, ConfigIO.gson().toJson(request));
             }
             tasks.entity(target, () -> {
                 target.closeDialog();
@@ -560,7 +558,7 @@ public final class RequestService {
         if (requester == null) {
             return;
         }
-        outgoing.remove(requester.getUniqueId(), request.id);
+        outgoingRequests.remove(requester.getUniqueId());
         tasks.entity(requester, () -> {
             Response response;
             try {
@@ -611,7 +609,7 @@ public final class RequestService {
         if (mover == null) {
             return;
         }
-        outgoing.remove(mover.getUniqueId(), request.id);
+        outgoingRequests.remove(mover.getUniqueId());
         messages.send(mover, "tpa.accepted-requester", "player", request.requesterName);
         Player anchor = Bukkit.getPlayer(UUID.fromString(request.requesterUuid));
         if (anchor != null) {
@@ -655,7 +653,7 @@ public final class RequestService {
                 if (request.createdAt + expiryMs >= now) {
                     return false;
                 }
-                outgoing.remove(UUID.fromString(request.requesterUuid), request.id);
+                outgoingRequests.remove(UUID.fromString(request.requesterUuid));
                 Player requester = Bukkit.getPlayer(UUID.fromString(request.requesterUuid));
                 if (requester != null) {
                     tasks.entity(requester, () -> messages.send(requester, "tpa.expired-requester",
