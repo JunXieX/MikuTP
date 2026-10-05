@@ -88,9 +88,9 @@ public final class MikuTPPlugin extends JavaPlugin {
         effects = new Effects(config.teleport.sounds);
         cooldowns = new CooldownManager(this::cooldownSeconds);
         syncBus = config.sync.enabled()
-                ? new VelocitySyncBus(this, tasks)
+                ? new VelocitySyncBus(this, tasks, config.sync.token)
                 : new LoopbackSyncBus();
-        network = new NetworkService(this, tasks, messages);
+        network = new NetworkService(this, tasks, messages, config);
         profiles = new ProfileService(this, tasks, database, syncBus, config.crossServer.serverId);
         teleports = new TeleportService(this, tasks, config, database, messages, effects,
                 new WarmupManager(tasks, messages, effects, () -> config.teleport.warmupSeconds),
@@ -100,8 +100,13 @@ public final class MikuTPPlugin extends JavaPlugin {
         requestService = new RequestService(this, tasks, config, database, messages, effects, cooldowns,
                 teleports, profiles, network, syncBus);
         wildService = new WildService(this, tasks, config, messages, cooldowns, teleports);
-        coordinator = new SyncCoordinator(this, config, database, syncBus,
+        coordinator = new SyncCoordinator(this, tasks, config, database, syncBus,
                 homeService, profiles, teleports, requestService);
+
+        if (config.sync.enabled() && config.sync.token.isBlank()) {
+            getSLF4JLogger().error("sync.mode=VELOCITY 但 sync.token 为空：所有跨服同步消息都会被拒绝。"
+                    + "请在 config.yml 与代理端 MikuTP 配置里设置完全相同的 token。");
+        }
 
         dialogs = new DialogFactory(tasks, messages, () -> config.dialogs.listPageSize);
         chats = new ChatMenus(messages);
@@ -238,6 +243,10 @@ public final class MikuTPPlugin extends JavaPlugin {
             config = loaded;
         } else {
             config.copyFrom(loaded);
+        }
+        if (loaded.configVersion != MikuTPConfig.CURRENT_VERSION) {
+            getSLF4JLogger().info("config.yml 的 config_version 为 {}（本版本为 {}），建议对照内置默认配置核对新增项",
+                    loaded.configVersion, MikuTPConfig.CURRENT_VERSION);
         }
         MessageBundle bundle = new MessageBundle(readResource("messages_zh_cn.json"));
         bundle.loadOverrides(getDataFolder().toPath().resolve(config.languageFile));

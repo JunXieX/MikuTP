@@ -1,8 +1,17 @@
 package com.mikumc.mikutp.common.net;
 
+import com.google.gson.Gson;
 import com.google.gson.JsonArray;
+import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
+
+import javax.crypto.Mac;
+import javax.crypto.spec.SecretKeySpec;
+import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.Base64;
+import java.util.List;
 
 /**
  * Wire format of the plugin message channel shared by the backends and the
@@ -16,9 +25,14 @@ import com.google.gson.JsonParser;
  *
  * <p>Proxy to backend: {@code events} (sync events routed or fanned out to
  * every server), {@code pending} (a cross-server handoff delivered as the
- * player arrives on the destination server), {@code resolve_result}, and
- * {@code connect_result} reported back to the originating backend when a
- * connect request fails.
+ * player arrives on the destination server), {@code player_list},
+ * {@code resolve_result}, and {@code connect_result}.
+ *
+ * <p>Every message carries an HMAC-SHA256 signature over its canonical JSON
+ * form ({@code sig} member). The channel is registered as an incoming plugin
+ * channel, which also receives payloads a modified client may forge; the
+ * signature is what separates genuine proxy traffic from forged traffic, so
+ * both ends must share the same token.
  */
 public final class ProxyMessages {
 
@@ -34,6 +48,11 @@ public final class ProxyMessages {
     public static final String TYPE_BUS = "bus";
     public static final String TYPE_EVENTS = "events";
     public static final String TYPE_PENDING = "pending";
+
+    /** Member holding the HMAC-SHA256 signature of the message without it. */
+    public static final String SIGNATURE_MEMBER = "sig";
+
+    private static final Gson GSON = new Gson();
 
     private ProxyMessages() {
     }
@@ -75,7 +94,7 @@ public final class ProxyMessages {
         return o.toString();
     }
 
-    public static String encodePlayerList(String id, java.util.List<String> playerUuids) {
+    public static String encodePlayerList(String id, List<String> playerUuids) {
         JsonObject o = new JsonObject();
         o.addProperty("t", TYPE_PLAYER_LIST);
         o.addProperty("id", id);
@@ -107,20 +126,25 @@ public final class ProxyMessages {
         return o.toString();
     }
 
-    /** One bus batch: a list of sync events routed/fanned out by the proxy. */
-    public static String encodeEventsBatch(java.util.List<SyncEventWire> events) {
+    /**
+     * One events batch: the {@code events} array holds event objects (not
+     * stringified JSON), so a receiver can deserialize each element straight
+     * into a sync event.
+     */
+    public static String encodeEventsBatch(List<String> eventJson) {
         JsonObject o = new JsonObject();
         o.addProperty("t", TYPE_EVENTS);
         JsonArray array = new JsonArray();
-        for (SyncEventWire wire : events) {
-            array.add(wire.toJson());
+        for (String json : eventJson) {
+            JsonElement element = JsonParser.parseString(json);
+            array.add(element.isJsonObject() ? element : new JsonObject());
         }
         o.add("events", array);
         return o.toString();
     }
 
     /** One backend-to-proxy bus batch; ops are pre-built wire objects. */
-    public static String encodeBusBatch(java.util.List<JsonObject> ops) {
+    public static String encodeBusBatch(List<JsonObject> ops) {
         JsonObject o = new JsonObject();
         o.addProperty("t", TYPE_BUS);
         JsonArray array = new JsonArray();
@@ -162,7 +186,16 @@ public final class ProxyMessages {
     /** Returns null when the payload is not a valid message object. */
     public static JsonObject decode(byte[] data) {
         try {
-            com.google.gson.JsonElement el = JsonParser.parseString(new String(data, java.nio.charset.StandardCharsets.UTF_8));
+            return decode(new String(data, StandardCharsets.UTF_8));
+        } catch (Exception ignored) {
+            return null;
+        }
+    }
+
+    /** Returns null when the text is not a valid message object. */
+    public static JsonObject decode(String text) {
+        try {
+            JsonElement el = JsonParser.parseString(text);
             if (el.isJsonObject()) {
                 return el.getAsJsonObject();
             }
@@ -175,11 +208,68 @@ public final class ProxyMessages {
         return o.has("t") && o.get("t").isJsonPrimitive() ? o.get("t").getAsString() : null;
     }
 
-    /** Minimal wire shape of a sync event, shared by backend and proxy. */
-    public record SyncEventWire(String json) {
-        public JsonObject toJson() {
-            com.google.gson.JsonElement el = JsonParser.parseString(json);
-            return el.isJsonObject() ? el.getAsJsonObject() : new JsonObject();
+    public static String string(JsonObject o, String member) {
+        return o.has(member) && o.get(member).isJsonPrimitive() ? o.get(member).getAsString() : null;
+    }
+
+    public static List<String> stringList(JsonObject o, String member) {
+        List<String> out = new ArrayList<>();
+        if (o.has(member) && o.get(member).isJsonArray()) {
+            for (JsonElement element : o.getAsJsonArray(member)) {
+                if (element.isJsonPrimitive()) {
+                    out.add(element.getAsString());
+                }
+            }
         }
+        return out;
+    }
+
+    /**
+     * Signs {@code json} in place: the signature covers the canonical JSON form
+     * of the message without the {@code sig} member. A blank token produces an
+     * unauthenticated message, which every receiver rejects.
+     */
+    public static String sign(String json, String token) {
+        JsonObject o = decode(json);
+        if (o == null) {
+            return json;
+        }
+        o.remove(SIGNATURE_MEMBER);
+        o.addProperty(SIGNATURE_MEMBER, signature(o, token));
+        return o.toString();
+    }
+
+    /**
+     * Verifies the signature of a decoded message. Must be called before the
+     * message is used: it consumes the {@code sig} member.
+     */
+    public static boolean verify(JsonObject message, String token) {
+        if (token == null || token.isBlank()) {
+            return false;
+        }
+        String received = string(message, SIGNATURE_MEMBER);
+        if (received == null || received.isBlank()) {
+            return false;
+        }
+        message.remove(SIGNATURE_MEMBER);
+        String expected = signature(message, token);
+        return constantTimeEquals(received, expected);
+    }
+
+    private static String signature(JsonObject message, String token) {
+        try {
+            Mac mac = Mac.getInstance("HmacSHA256");
+            mac.init(new SecretKeySpec(
+                    token == null ? new byte[0] : token.getBytes(StandardCharsets.UTF_8), "HmacSHA256"));
+            byte[] digest = mac.doFinal(GSON.toJson(message).getBytes(StandardCharsets.UTF_8));
+            return Base64.getUrlEncoder().withoutPadding().encodeToString(digest);
+        } catch (Exception e) {
+            throw new IllegalStateException("HmacSHA256 unavailable", e);
+        }
+    }
+
+    private static boolean constantTimeEquals(String a, String b) {
+        return java.security.MessageDigest.isEqual(
+                a.getBytes(StandardCharsets.UTF_8), b.getBytes(StandardCharsets.UTF_8));
     }
 }

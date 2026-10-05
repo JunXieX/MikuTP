@@ -1,7 +1,6 @@
 package com.mikumc.mikutp.velocity;
 
 import com.google.gson.Gson;
-import com.google.gson.JsonArray;
 import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 import com.google.inject.Inject;
@@ -13,6 +12,7 @@ import com.velocitypowered.api.event.connection.DisconnectEvent;
 import com.velocitypowered.api.event.player.ServerConnectedEvent;
 import com.velocitypowered.api.event.proxy.ProxyInitializeEvent;
 import com.velocitypowered.api.plugin.Plugin;
+import com.velocitypowered.api.plugin.annotation.DataDirectory;
 import com.velocitypowered.api.proxy.Player;
 import com.velocitypowered.api.proxy.ProxyServer;
 import com.velocitypowered.api.proxy.ServerConnection;
@@ -20,11 +20,17 @@ import com.velocitypowered.api.proxy.messages.MinecraftChannelIdentifier;
 import com.velocitypowered.api.proxy.server.RegisteredServer;
 import org.slf4j.Logger;
 
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Properties;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 
@@ -47,9 +53,11 @@ import java.util.concurrent.ConcurrentHashMap;
  *
  * <p>All state is in memory: backend SQLite databases stay the source of
  * truth, and a proxy restart is healed by the activation-time resync of the
- * backends.
+ * backends. Every message is authenticated with the shared token from
+ * {@code plugins/mikutp/config.properties}; without a token the hub refuses
+ * backend traffic so a modified client can never drive it.
  */
-@Plugin(id = "mikutp", name = "MikuTP", version = "1.3.0",
+@Plugin(id = "mikutp", name = "MikuTP", version = "1.4.0",
         description = "Cross-server teleport hub for MikuTP backends. MikuMC original plugin by JunXieX, group 1105054380.",
         authors = {"JunXieX"})
 public final class MikuTPVelocity {
@@ -60,9 +68,11 @@ public final class MikuTPVelocity {
     private static final int MAX_EVENTS_PER_BATCH = 64;
     private static final long MAILBOX_TTL_MS = 120_000;
     private static final long PENDING_TTL_MS = 300_000;
+    private static final String CONFIG_FILE = "config.properties";
 
     private final ProxyServer server;
     private final Logger logger;
+    private final Path dataDirectory;
 
     /** Cross-server pending teleport handoffs, delivered on arrival. */
     private final Map<UUID, PendingEntry> pendingEntries = new ConcurrentHashMap<>();
@@ -70,6 +80,8 @@ public final class MikuTPVelocity {
     private final Map<UUID, List<MailboxEntry>> mailboxes = new ConcurrentHashMap<>();
     /** Events queued for servers that currently have no players. */
     private final Map<String, List<String>> outbound = new ConcurrentHashMap<>();
+    private volatile String token = "";
+    private volatile boolean warnedRejected = false;
 
     private record PendingEntry(String payload, long expiry) {
     }
@@ -78,15 +90,47 @@ public final class MikuTPVelocity {
     }
 
     @Inject
-    public MikuTPVelocity(ProxyServer server, Logger logger) {
+    public MikuTPVelocity(ProxyServer server, Logger logger, @DataDirectory Path dataDirectory) {
         this.server = server;
         this.logger = logger;
+        this.dataDirectory = dataDirectory;
     }
 
     @Subscribe
     public void onInit(ProxyInitializeEvent event) {
+        loadConfig();
         server.getChannelRegistrar().register(CHANNEL);
         logger.info("MikuTP hub ready on channel {}", CHANNEL.getId());
+    }
+
+    /** Reads (and creates a documented template for) {@code plugins/mikutp/config.properties}. */
+    private void loadConfig() {
+        Path file = dataDirectory.resolve(CONFIG_FILE);
+        try {
+            Files.createDirectories(dataDirectory);
+            if (Files.notExists(file)) {
+                try (OutputStream out = Files.newOutputStream(file)) {
+                    out.write(("""
+                            # MikuTP 跨服代理配置
+                            # token：跨服通信的共享密钥，必须与每台后端 config.yml 中的 sync.token 完全一致。
+                            # 留空时本插件会拒绝所有后端消息（防止被改造过的客户端伪造同步数据）。
+                            token=
+                            """).getBytes(StandardCharsets.UTF_8));
+                }
+            }
+            Properties properties = new Properties();
+            try (InputStream in = Files.newInputStream(file)) {
+                properties.load(in);
+            }
+            token = properties.getProperty("token", "").trim();
+        } catch (IOException e) {
+            logger.warn("Failed to read {}", file, e);
+            token = "";
+        }
+        if (token.isEmpty()) {
+            logger.error("No sync token configured: set 'token' in {} to the same value as sync.token "
+                    + "in every backend config.yml, otherwise cross-server sync is refused.", file);
+        }
     }
 
     @Subscribe
@@ -103,10 +147,21 @@ public final class MikuTPVelocity {
         if (message == null) {
             return;
         }
+        if (!ProxyMessages.verify(message, token)) {
+            warnRejected();
+            return;
+        }
         try {
             handle(message, source);
         } catch (Exception e) {
             logger.warn("Dropped malformed MikuTP message: {}", e.toString());
+        }
+    }
+
+    private void warnRejected() {
+        if (!warnedRejected) {
+            warnedRejected = true;
+            logger.warn("Dropped an unauthenticated MikuTP message; the backend token does not match this proxy's.");
         }
     }
 
@@ -136,7 +191,7 @@ public final class MikuTPVelocity {
                 continue;
             }
             JsonObject op = element.getAsJsonObject();
-            String kind = string(op, "k");
+            String kind = ProxyMessages.string(op, "k");
             if (kind == null) {
                 continue;
             }
@@ -161,8 +216,8 @@ public final class MikuTPVelocity {
     }
 
     private void storePending(JsonObject op) {
-        String uuid = string(op, "uuid");
-        String payload = string(op, "payload");
+        String uuid = ProxyMessages.string(op, "uuid");
+        String payload = ProxyMessages.string(op, "payload");
         if (uuid == null || payload == null) {
             return;
         }
@@ -286,15 +341,13 @@ public final class MikuTPVelocity {
         return batch;
     }
 
+    /** Sends an events batch; each element is an event object, matching the backend parser. */
     private void sendEvents(ServerConnection connection, List<SyncEvent> events) {
-        JsonArray array = new JsonArray();
+        List<String> json = new ArrayList<>(events.size());
         for (SyncEvent event : events) {
-            array.add(GSON.toJson(event));
+            json.add(GSON.toJson(event));
         }
-        JsonObject o = new JsonObject();
-        o.addProperty("t", ProxyMessages.TYPE_EVENTS);
-        o.add("events", array);
-        connection.sendPluginMessage(CHANNEL, o.toString().getBytes(StandardCharsets.UTF_8));
+        send(connection, ProxyMessages.encodeEventsBatch(json));
     }
 
     // ------------------------------------------------------------------ player-scoped delivery
@@ -337,9 +390,7 @@ public final class MikuTPVelocity {
         if (entry == null || entry.expiry() <= System.currentTimeMillis()) {
             return;
         }
-        connection.sendPluginMessage(CHANNEL, ProxyMessages
-                .encodePending(uuid.toString(), entry.payload(), 0)
-                .getBytes(StandardCharsets.UTF_8));
+        send(connection, ProxyMessages.encodePending(uuid.toString(), entry.payload(), 0));
     }
 
     private void deliverMailbox(UUID uuid, ServerConnection connection) {
@@ -417,12 +468,12 @@ public final class MikuTPVelocity {
     // ------------------------------------------------------------------ connects
 
     private void connect(JsonObject message, ServerConnection source) {
-        String playerName = string(message, "player");
-        String serverName = string(message, "server");
-        if (playerName == null || serverName == null) {
+        String playerUuid = ProxyMessages.string(message, "player");
+        String serverName = ProxyMessages.string(message, "server");
+        if (playerUuid == null || serverName == null) {
             return;
         }
-        Optional<Player> player = parsePlayer(playerName);
+        Optional<Player> player = parsePlayer(playerUuid);
         Optional<RegisteredServer> target = server.getServer(serverName);
         if (player.isEmpty()) {
             return;
@@ -444,13 +495,13 @@ public final class MikuTPVelocity {
     }
 
     private void connectAnchor(JsonObject message, ServerConnection source) {
-        String playerName = string(message, "player");
-        String anchorName = string(message, "anchor");
-        if (playerName == null || anchorName == null) {
+        String playerUuid = ProxyMessages.string(message, "player");
+        String anchorUuid = ProxyMessages.string(message, "anchor");
+        if (playerUuid == null || anchorUuid == null) {
             return;
         }
-        Optional<Player> player = parsePlayer(playerName);
-        Optional<ServerConnection> anchorServer = parsePlayer(anchorName).flatMap(Player::getCurrentServer);
+        Optional<Player> player = parsePlayer(playerUuid);
+        Optional<ServerConnection> anchorServer = parsePlayer(anchorUuid).flatMap(Player::getCurrentServer);
         if (player.isEmpty() || anchorServer.isEmpty()) {
             send(source, ProxyMessages.encodeConnectResult(false, "anchor_offline"));
             return;
@@ -466,11 +517,11 @@ public final class MikuTPVelocity {
     }
 
     private void listPlayers(JsonObject message, ServerConnection source) {
-        String id = string(message, "id");
+        String id = ProxyMessages.string(message, "id");
         if (id == null) {
             return;
         }
-        String serverName = string(message, "server");
+        String serverName = ProxyMessages.string(message, "server");
         List<String> uuids = new ArrayList<>();
         if (serverName == null) {
             for (Player player : server.getAllPlayers()) {
@@ -484,8 +535,8 @@ public final class MikuTPVelocity {
     }
 
     private void resolvePlayer(JsonObject message, ServerConnection source) {
-        String id = string(message, "id");
-        String name = string(message, "name");
+        String id = ProxyMessages.string(message, "id");
+        String name = ProxyMessages.string(message, "name");
         if (id == null || name == null) {
             return;
         }
@@ -504,14 +555,9 @@ public final class MikuTPVelocity {
         }
     }
 
+    /** Signs and sends one message to a backend. */
     private void send(ServerConnection connection, String json) {
-        connection.sendPluginMessage(CHANNEL, json.getBytes(StandardCharsets.UTF_8));
-    }
-
-    private static String string(JsonObject o, String member) {
-        if (!o.has(member) || !o.get(member).isJsonPrimitive()) {
-            return null;
-        }
-        return o.get(member).getAsString();
+        connection.sendPluginMessage(CHANNEL,
+                ProxyMessages.sign(json, token).getBytes(StandardCharsets.UTF_8));
     }
 }

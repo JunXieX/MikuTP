@@ -106,16 +106,28 @@ public final class TeleportService {
             plugin.getSLF4JLogger().warn("Malformed pending teleport payload", e);
             return;
         }
-        if (pending == null || pending.position == null) {
+        if (pending == null || pending.position == null || expired(pending)) {
             return;
         }
-        arriving.put(player.getUniqueId(), pending);
+        UUID id = player.getUniqueId();
+        arriving.put(id, pending);
+        // The proxy can deliver this after PlayerJoinEvent already ran; applying
+        // right away keeps the handoff from waiting for the player's next login.
+        if (player.isOnline()) {
+            tasks.entity(player, () -> applyPending(id));
+        }
+    }
+
+    /** A buffered handoff is only useful while it is fresh. */
+    private static boolean expired(PendingTeleport pending) {
+        return pending.createdAt > 0
+                && System.currentTimeMillis() - pending.createdAt > PENDING_TTL_SECONDS * 1000L;
     }
 
     /** Consumes a buffered cross-server handoff for a player who just arrived. */
     public void applyPending(UUID playerUuid) {
         PendingTeleport pending = arriving.remove(playerUuid);
-        if (pending == null || pending.position == null) {
+        if (pending == null || pending.position == null || expired(pending)) {
             return;
         }
         String destServer = pending.position.server;
@@ -276,14 +288,14 @@ public final class TeleportService {
         });
     }
 
-    /** Applies a replicated return position from another backend. */
-    public void applySyncBack(SyncEvent event) {
-        try {
-            String prefix = "death".equals(event.backKind) ? Database.DEATH_PREFIX : Database.BACK_PREFIX;
-            database.setPosition(event.playerUuid, event.backPosition, prefix);
-        } catch (Exception e) {
-            plugin.getSLF4JLogger().warn("Failed to apply replicated position", e);
+    /** Applies a replicated return position from another backend; the write joins
+     * the caller's batched transaction. */
+    public void applySyncBack(SyncEvent event, Database.Tx tx) throws java.sql.SQLException {
+        if (event.playerUuid == null || event.backPosition == null) {
+            return;
         }
+        String prefix = "death".equals(event.backKind) ? Database.DEATH_PREFIX : Database.BACK_PREFIX;
+        tx.setPosition(event.playerUuid, event.backPosition, prefix);
     }
 
     // ------------------------------------------------------------------ admin commands

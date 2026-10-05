@@ -37,15 +37,17 @@ public final class VelocitySyncBus implements SyncBus {
 
     private final JavaPlugin plugin;
     private final Tasks tasks;
+    private final String token;
     private final ConcurrentLinkedDeque<com.google.gson.JsonObject> outbound = new ConcurrentLinkedDeque<>();
     private volatile Consumer<SyncEvent> applier = event -> {
     };
     private volatile boolean running;
     private ScheduledTask flushTask;
 
-    public VelocitySyncBus(JavaPlugin plugin, Tasks tasks) {
+    public VelocitySyncBus(JavaPlugin plugin, Tasks tasks, String token) {
         this.plugin = plugin;
         this.tasks = tasks;
+        this.token = token;
     }
 
     @Override
@@ -106,7 +108,8 @@ public final class VelocitySyncBus implements SyncBus {
         if (ops.isEmpty()) {
             return;
         }
-        send(ProxyMessages.encodeBusBatch(ops), ops);
+        // The proxy authenticates every batch with the shared token.
+        send(ProxyMessages.sign(ProxyMessages.encodeBusBatch(ops), token), ops);
     }
 
     /** Picks any online player as the carrier; without one the ops go back to
@@ -119,8 +122,12 @@ public final class VelocitySyncBus implements SyncBus {
             }
             return;
         }
-        tasks.entity(carrier, () -> carrier.sendPluginMessage(plugin,
-                ProxyMessages.CHANNEL, batchJson.getBytes(java.nio.charset.StandardCharsets.UTF_8)));
+        tasks.entity(carrier, () -> {
+            if (carrier.isOnline()) {
+                carrier.sendPluginMessage(plugin, ProxyMessages.CHANNEL,
+                        batchJson.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            }
+        });
     }
 
     private static Player pickCarrier() {

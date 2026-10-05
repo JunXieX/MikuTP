@@ -36,25 +36,25 @@ class BundledResourcesTest {
         assertTrue(bundle.has("wild.searching"));
         // Every key referenced by the code must exist in the bundle.
         String[] required = {
-                "common.no-permission", "common.player-only", "common.player-not-found", "common.cooldown",
+                "common.player-not-found", "common.cooldown",
                 "common.warmup.started", "common.warmup.countdown", "common.warmup.cancelled-move",
                 "common.warmup.cancelled-damage", "common.teleporting", "common.teleported",
                 "common.teleport-failed", "common.cross-connect-failed", "common.cross-disabled",
                 "common.invalid-name", "common.reload-done",
                 "home.limit-reached", "home.set", "home.deleted", "home.not-found", "home.empty", "home.going",
-                "warp.set", "warp.deleted", "warp.not-found", "warp.empty", "warp.going",
+                "warp.set", "warp.deleted", "warp.not-found", "warp.empty", "warp.going", "warp.disabled",
                 "tpa.sent", "tpa.usage", "tpa.sent-here", "tpahere.usage", "tpa.received-chat",
                 "tpa.received-here-chat", "tpa.hint-chat", "tpa.accepted-target", "tpa.denied-target",
                 "tpa.accepted-requester", "tpa.denied-requester", "tpa.blocked-requester", "tpa.blocked-target",
                 "tpa.blocked-permanent-target", "tpa.no-pending", "tpa.self", "tpa.revoked-target",
                 "tpa.target-toggled", "tpa.expired-requester", "tpa.toggled-on", "tpa.toggled-off",
-                "tpa.block-list", "tpa.block-list-empty", "tpa.unblocked", "tpa.not-blocked",
+                "tpa.block-list", "tpa.block-list-empty", "tpa.unblocked", "tpa.not-blocked", "tpa.disabled",
                 "wild.searching", "wild.searching-done", "wild.disabled", "wild.failed",
                 "back.none", "back.going", "dback.none", "dback.going",
                 "outtp.usage", "outtp.none", "otp.usage", "otph.usage",
                 "admin.self", "admin.target-left", "admin.pulled-you", "admin.bring-started",
                 "admin.bring-all-done", "admin.resync-done", "admin.permissions", "admin.permissions-line",
-                "admin.info", "admin.unknown-sub",
+                "admin.info",
                 "dialog.tpa.title", "dialog.tpa.hint", "dialog.tpa.input-label", "dialog.tpa.send",
                 "dialog.tpa.here-send", "dialog.request.title", "dialog.request.body-go",
                 "dialog.request.body-come", "dialog.request.accept", "dialog.request.deny",
@@ -66,6 +66,16 @@ class BundledResourcesTest {
         for (String key : required) {
             assertTrue(bundle.has(key), "missing message key: " + key);
         }
+    }
+
+    /** The placeholder a template is rendered with must actually exist in it. */
+    @Test
+    void templatesCarryThePlaceholdersTheCodeSupplies() throws Exception {
+        MessageBundle bundle = new MessageBundle(read("/messages_zh_cn.json"));
+        assertTrue(bundle.raw("admin.info").contains("<info>"), "admin.info must render the <info> placeholder");
+        assertTrue(bundle.raw("common.warmup.countdown").contains("<seconds>"));
+        assertTrue(bundle.raw("home.limit-reached").contains("<limit>"));
+        assertTrue(bundle.raw("tpa.hint-chat").contains("<id>"));
     }
 
     private String read(String resource) throws Exception {

@@ -15,6 +15,7 @@ import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class DatabaseTest {
@@ -148,5 +149,56 @@ class DatabaseTest {
         assertTrue(database.isIgnored("tgt-uuid", "req-uuid", now + 999_999_999));
         assertTrue(database.clearIgnore("tgt-uuid", "req-uuid"));
         assertFalse(database.isIgnored("tgt-uuid", "req-uuid", now));
+    }
+
+    /** Replicated state is applied through one transaction, preserving arrival order. */
+    @Test
+    void transactionAppliesManyWritesInOrder() throws Exception {
+        database.runTransaction(tx -> {
+            tx.upsertPlayer("uuid-a", "Alice", 10L);
+            tx.saveHome(new Home("uuid-a", "base", new Position("s1", "world", 1, 1, 1, 0f, 0f), 1L));
+            tx.saveHome(new Home("uuid-a", "farm", new Position("s1", "world", 2, 2, 2, 0f, 0f), 2L));
+            tx.setPosition("uuid-a", new Position("s1", "world", 3, 3, 3, 0f, 0f), Database.BACK_PREFIX);
+            tx.addIgnore(new IgnoreEntry("uuid-a", "uuid-b", IgnoreEntry.PERMANENT, 1L));
+        });
+
+        assertEquals("Alice", database.getPlayer("uuid-a").orElseThrow().name);
+        assertEquals(2, database.countHomes("uuid-a"));
+        assertEquals(3.0, database.getPosition("uuid-a", Database.BACK_PREFIX).orElseThrow().x);
+        assertTrue(database.isIgnored("uuid-a", "uuid-b", System.currentTimeMillis()));
+
+        // A delete queued after the set wins: order within the batch is kept.
+        database.runTransaction(tx -> {
+            tx.saveHome(new Home("uuid-a", "base", new Position("s1", "world", 9, 9, 9, 0f, 0f), 3L));
+            tx.deleteHome("uuid-a", "base");
+        });
+        assertTrue(database.getHome("uuid-a", "base").isEmpty());
+    }
+
+    @Test
+    void transactionRollsBackOnFailure() throws Exception {
+        assertThrows(java.sql.SQLException.class, () -> database.runTransaction(tx -> {
+            tx.upsertPlayer("uuid-x", "Ghost", 1L);
+            throw new java.sql.SQLException("boom");
+        }));
+        assertTrue(database.getPlayer("uuid-x").isEmpty());
+    }
+
+    @Test
+    void rejectsUnsafeTablePrefix() {
+        Database.ConnectionProvider unused = new Database.ConnectionProvider() {
+            @Override
+            public Connection acquire() {
+                throw new UnsupportedOperationException("no connection expected");
+            }
+
+            @Override
+            public void close() {
+            }
+        };
+        assertThrows(IllegalArgumentException.class, () -> new Database(unused, "bad prefix;"));
+        assertThrows(IllegalArgumentException.class, () -> new Database(unused, "players --"));
+        // Letters, digits and underscores are the documented shape.
+        new Database(unused, "mikutp_2");
     }
 }

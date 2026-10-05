@@ -85,20 +85,25 @@ public final class ProfileService {
         syncBus.publish(event);
     }
 
-    /** Applies a replicated profile from another backend. */
-    public void applySync(SyncEvent event) {
+    /** Applies a replicated profile from another backend; the write joins the
+     * caller's batched transaction. */
+    public void applySync(SyncEvent event, Database.Tx tx) throws java.sql.SQLException {
         if (event.playerUuid == null || event.playerName == null) {
             return;
         }
-        try {
-            database.upsertPlayer(event.playerUuid, event.playerName, event.lastOnline);
-            database.setTpaEnabled(event.playerUuid, event.tpaEnabled);
-        } catch (Exception e) {
-            plugin.getSLF4JLogger().warn("Failed to apply replicated profile", e);
-        }
-        UUID uuid = UUID.fromString(event.playerUuid);
-        if (Bukkit.getPlayer(uuid) != null) {
+        tx.upsertPlayer(event.playerUuid, event.playerName, event.lastOnline);
+        tx.setTpaEnabled(event.playerUuid, event.tpaEnabled);
+        UUID uuid = parseUuid(event.playerUuid);
+        if (uuid != null && Bukkit.getPlayer(uuid) != null) {
             tpaEnabled.put(uuid, event.tpaEnabled);
+        }
+    }
+
+    private static UUID parseUuid(String value) {
+        try {
+            return UUID.fromString(value);
+        } catch (IllegalArgumentException e) {
+            return null;
         }
     }
 

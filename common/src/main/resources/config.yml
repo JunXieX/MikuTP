@@ -26,6 +26,10 @@ sync:
   # NONE = 单服务器（完全不需要代理插件参与）；VELOCITY = 跨服同步模式
   # （需要安装代理端 MikuTP-Velocity，无需 Redis、无需 MySQL）
   mode: NONE
+  # 跨服通信共享密钥：必须与代理端 plugins/mikutp/config.properties 里的 token 完全一致。
+  # 留空时本插件会拒绝所有跨服同步消息（插件消息通道也能被改造过的客户端访问，
+  # 没有密钥就无法区分真实代理与伪造数据）。
+  token: ""
 
 # ---------------- 传送行为 ----------------
 teleport:

@@ -56,8 +56,10 @@ public final class CooldownManager {
                 .put(kind, System.currentTimeMillis() + seconds * 1000L);
     }
 
+    /** Clears every cooldown and the cached bypass flag (called on quit). */
     public void clear(UUID player) {
         until.remove(player);
+        bypass.remove(player);
     }
 
     public void clear(UUID player, Kind kind) {

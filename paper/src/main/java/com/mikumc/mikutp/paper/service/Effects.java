@@ -10,6 +10,17 @@ import org.bukkit.entity.Player;
  */
 public final class Effects {
 
+    private static final Sound TELEPORT =
+            Sound.sound(Key.key("entity.enderman.teleport"), Sound.Source.MASTER, 0.6f, 1.0f);
+    private static final Sound WARMUP_TICK =
+            Sound.sound(Key.key("block.note_block.hat"), Sound.Source.MASTER, 0.6f, 1.4f);
+    private static final Sound CANCELLED =
+            Sound.sound(Key.key("entity.villager.no"), Sound.Source.MASTER, 0.6f, 0.8f);
+    private static final Sound REQUEST =
+            Sound.sound(Key.key("entity.experience_orb.pickup"), Sound.Source.MASTER, 0.6f, 1.2f);
+    private static final Sound CLICK =
+            Sound.sound(Key.key("ui.button.click"), Sound.Source.MASTER, 0.6f, 1.0f);
+
     private volatile boolean enabled;
 
     public Effects(boolean enabled) {
@@ -21,29 +32,28 @@ public final class Effects {
     }
 
     public void teleport(Player player) {
-        play(player, "entity.enderman.teleport", 1.0f);
+        play(player, TELEPORT);
     }
 
     public void warmupTick(Player player) {
-        play(player, "block.note_block.hat", 1.4f);
+        play(player, WARMUP_TICK);
     }
 
     public void cancelled(Player player) {
-        play(player, "entity.villager.no", 0.8f);
+        play(player, CANCELLED);
     }
 
     public void requestReceived(Player player) {
-        play(player, "entity.experience_orb.pickup", 1.2f);
+        play(player, REQUEST);
     }
 
     public void click(Player player) {
-        play(player, "ui.button.click", 1.0f);
+        play(player, CLICK);
     }
 
-    public void play(Player player, String soundKey, float pitch) {
-        if (!enabled) {
-            return;
+    private void play(Player player, Sound sound) {
+        if (enabled) {
+            player.playSound(sound);
         }
-        player.playSound(Sound.sound(Key.key(soundKey), Sound.Source.MASTER, 0.6f, pitch));
     }
 }

@@ -36,20 +36,25 @@ MikuTP 是一套面向 Paper / Folia / Velocity 的多功能传送插件：家�
 
 ### 单服务器（默认，零依赖）
 
-1. 把 `MikuTP-Paper-1.3.0.jar` 放入 `plugins/`，重启。
+1. 把 `MikuTP-Paper-1.4.0.jar` 放入 `plugins/`，重启。
 2. 完成。数据存储在 `plugins/MikuTP/data.db`（SQLite），无需任何外部服务。
 
 ### 跨服网络（Velocity）
 
 1. 每台后端服务器安装 `MikuTP-Paper`，代理安装 `MikuTP-Velocity`。
-2. 每台后端编辑 `plugins/MikuTP/config.yml`：
-   ```yaml
-   sync:
-     mode: VELOCITY       # 开启跨服同步
-   cross_server:
-     server_id: survival  # 必须与 velocity.toml 中的服务器名完全一致
-   ```
+2. **设置共享密钥（必做）**：跨服消息走的是插件消息通道，而该通道同样能被改造过的客户端访问，因此必须用密钥区分「真实代理」与「伪造数据」。两端填同一个值：
+   - 每台后端的 `plugins/MikuTP/config.yml`：
+     ```yaml
+     sync:
+       mode: VELOCITY       # 开启跨服同步
+       token: "请填写一串随机字符串"
+     cross_server:
+       server_id: survival  # 必须与 velocity.toml 中的服务器名完全一致
+     ```
+   - 代理首次启动会生成 `plugins/mikutp/config.properties`，把其中的 `token` 改成**完全相同**的值。
 3. 依次重启全部后端。此后家、玩家档案、屏蔽列表自动全网同步；`/tpa`、`/home`、`/back`、`/otp` 全部支持跨服。
+
+> 密钥留空时：插件会拒绝所有跨服同步消息并在控制台报错（安全默认）；单服务器模式（`mode: NONE`）下完全不受影响。
 
 数据安全：本地 SQLite 是唯一事实源，代理只承担同步。代理短暂重启不影响本地功能，恢复后自动对齐全网数据，不会丢数据。
 
@@ -93,6 +98,9 @@ MikuTP 是一套面向 Paper / Folia / Velocity 的多功能传送插件：家�
 **Folia 26.1.2 提示 api-version 过高拒绝加载？**
 把 `paper-plugin.yml` 里的 `api-version: '26.2'` 改为 `'26.1'` 即可。
 
+**跨服同步不生效，控制台提示 token？**
+两端 token 必须完全一致：后端 `config.yml` 的 `sync.token` 与代理 `plugins/mikutp/config.properties` 的 `token`；任一为空都会拒绝同步，这是防止伪造同步消息的安全默认。
+
 **代理重启会有什么影响？**
 本地功能（家、地标、单服传送、随机传送）完全正常；跨服传送暂停，代理恢复后插件自动重新对齐全网数据，无需人工干预。
 
@@ -103,5 +111,7 @@ MikuTP 是一套面向 Paper / Folia / Velocity 的多功能传送插件：家�
 
 - 原生 Dialog 菜单 + 可点击聊天菜单双通道，所有文案可自定义
 - 完全兼容 Folia：全程区域化调度器 + `teleportAsync`，无主线程假设
+- 跨服消息带 HMAC 签名校验，插件消息通道无法被改造过的客户端伪造
 - 本地 SQLite 为唯一事实源，Velocity 代理做事件扇出与路由，玩家加入时自动重新对齐全网状态，不丢任何本地数据
+- 全网状态回填按批事务写入，状态量大时不会打满数据库连接
 - 零打包依赖：运行库全部由服务端按需自动下载

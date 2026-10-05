@@ -8,7 +8,10 @@ import java.util.List;
  */
 public final class MikuTPConfig {
 
-    public int configVersion = 2;
+    /** Config structure version shipped with this build; older files are diagnosed on load. */
+    public static final int CURRENT_VERSION = 2;
+
+    public int configVersion = CURRENT_VERSION;
 
     /** Local SQLite storage settings. */
     public Storage storage = new Storage();
@@ -119,6 +122,12 @@ public final class MikuTPConfig {
     public static final class Sync {
         /** NONE = single server (no proxy messaging); VELOCITY = local SQLite plus the Velocity hub. */
         public String mode = "NONE";
+        /**
+         * Shared secret authenticating proxy traffic. Every backend and the
+         * proxy must use the same non-blank value; without it cross-server
+         * messages are refused (a modified client could otherwise forge them).
+         */
+        public String token = "";
         /** True when cross-server features are switched on. */
         public boolean enabled() {
             return "VELOCITY".equalsIgnoreCase(mode);
@@ -153,10 +162,12 @@ public final class MikuTPConfig {
     }
 
     public static final class Warp {
+        /** Master switch for /warp, /setwarp and /delwarp. */
         public boolean enabled = true;
     }
 
     public static final class Tpa {
+        /** Master switch for /tpa, /tpahere and the answer commands. */
         public boolean enabled = true;
         /** Seconds before an unanswered request expires. */
         public int requestExpirySeconds = 60;

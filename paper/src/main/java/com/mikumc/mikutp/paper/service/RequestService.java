@@ -127,6 +127,9 @@ public final class RequestService {
 
     /** Sends a request from {@code requester} to {@code targetName}. */
     public void send(Player requester, String targetName, boolean here) {
+        if (featureDisabled(requester)) {
+            return;
+        }
         UUID id = requester.getUniqueId();
         long remaining = cooldowns.remaining(id, CooldownManager.Kind.TPA);
         if (remaining > 0) {
@@ -338,12 +341,18 @@ public final class RequestService {
     }
 
     public void toggle(Player player) {
+        if (featureDisabled(player)) {
+            return;
+        }
         boolean next = !profiles.isTpaEnabled(player.getUniqueId());
         profiles.setTpaEnabled(player.getUniqueId(), next);
         messages.send(player, next ? "tpa.toggled-on" : "tpa.toggled-off");
     }
 
     public void block(Player blocker, String targetName, boolean permanent) {
+        if (featureDisabled(blocker)) {
+            return;
+        }
         profiles.resolve(targetName).thenAccept(opt -> {
             if (opt.isEmpty()) {
                 messages.send(blocker, "common.player-not-found", "player", targetName);
@@ -375,6 +384,9 @@ public final class RequestService {
     }
 
     public void unblock(Player blocker, String targetName) {
+        if (featureDisabled(blocker)) {
+            return;
+        }
         profiles.resolve(targetName).thenAccept(opt -> {
             if (opt.isEmpty()) {
                 messages.send(blocker, "common.player-not-found", "player", targetName);
@@ -398,17 +410,21 @@ public final class RequestService {
     }
 
     public void listBlocks(Player blocker) {
+        if (featureDisabled(blocker)) {
+            return;
+        }
         tasks.async(() -> {
             try {
-                List<IgnoreEntry> entries = database.listIgnores(blocker.getUniqueId().toString(), System.currentTimeMillis());
+                List<Database.IgnoreView> entries =
+                        database.listIgnores(blocker.getUniqueId().toString(), System.currentTimeMillis());
                 if (entries.isEmpty()) {
                     messages.send(blocker, "tpa.block-list-empty");
                     return;
                 }
                 List<String> names = new ArrayList<>();
-                for (IgnoreEntry entry : entries) {
-                    String name = database.getPlayer(entry.blockedUuid).map(p -> p.name).orElse(entry.blockedUuid);
-                    names.add(entry.expiresAt == IgnoreEntry.PERMANENT ? name : name + "*");
+                for (Database.IgnoreView entry : entries) {
+                    String name = entry.name() == null ? entry.blockedUuid() : entry.name();
+                    names.add(entry.expiresAt() == IgnoreEntry.PERMANENT ? name : name + "*");
                 }
                 messages.send(blocker, "tpa.block-list", "count", String.valueOf(names.size()),
                         "players", String.join(", ", names));
@@ -416,6 +432,15 @@ public final class RequestService {
                 plugin.getSLF4JLogger().warn("Failed to list ignores", e);
             }
         });
+    }
+
+    /** True (and tells the player) when the request feature is switched off. */
+    private boolean featureDisabled(Player player) {
+        if (config.tpa.enabled) {
+            return false;
+        }
+        messages.send(player, "tpa.disabled");
+        return true;
     }
 
     // ------------------------------------------------------------------ sync events
@@ -427,7 +452,6 @@ public final class RequestService {
             case TP_RESPONDED -> processResponse(event);
             case TP_READY -> processReady(event);
             case TP_CANCEL -> processCancel(event);
-            case IGNORE_SET, IGNORE_DELETE -> applyIgnoreSync(event);
             default -> {
             }
         }
@@ -615,19 +639,17 @@ public final class RequestService {
         }
     }
 
-    private void applyIgnoreSync(SyncEvent event) {
+    /** Applies a replicated ignore change; the write joins the caller's batched
+     * transaction. */
+    public void applyIgnoreSync(SyncEvent event, Database.Tx tx) throws java.sql.SQLException {
         if (event.blockerUuid == null || event.blockedUuid == null) {
             return;
         }
-        try {
-            if (event.type == SyncEvent.Type.IGNORE_SET) {
-                applyIgnore(new IgnoreEntry(event.blockerUuid, event.blockedUuid,
-                        event.expiresAt, System.currentTimeMillis()));
-            } else {
-                database.clearIgnore(event.blockerUuid, event.blockedUuid);
-            }
-        } catch (Exception e) {
-            plugin.getSLF4JLogger().warn("Failed to apply replicated ignore entry", e);
+        if (event.type == SyncEvent.Type.IGNORE_SET) {
+            tx.addIgnore(new IgnoreEntry(event.blockerUuid, event.blockedUuid,
+                    event.expiresAt, System.currentTimeMillis()));
+        } else {
+            tx.clearIgnore(event.blockerUuid, event.blockedUuid);
         }
     }
 

@@ -1,12 +1,13 @@
 package com.mikumc.mikutp.paper.service;
 
+import com.mikumc.mikutp.common.config.MikuTPConfig;
 import com.mikumc.mikutp.common.net.ProxyMessages;
 import com.mikumc.mikutp.common.sync.SyncEvent;
 import org.bukkit.entity.Player;
 import org.bukkit.plugin.java.JavaPlugin;
 
 import java.nio.charset.StandardCharsets;
-import java.util.ArrayList;
+import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
@@ -19,24 +20,34 @@ import java.util.function.Consumer;
  * player connection; the proxy fans sync events out to every server, hands
  * pending teleports to the arriving player's backend, executes server
  * connects and answers player lookups.
+ *
+ * <p>The channel is registered as an incoming plugin channel, so it also
+ * receives payloads a modified client can forge. Every message is therefore
+ * authenticated with the shared {@code sync.token}: unsigned or wrongly signed
+ * payloads are dropped, and in single-server mode nothing is accepted at all.
  */
 public final class NetworkService {
 
     private final JavaPlugin plugin;
     private final Tasks tasks;
     private final MessageService messages;
-    private final Map<String, CompletableFuture<java.util.List<String>>>
+    private final boolean crossServer;
+    private final String token;
+    private final Map<String, CompletableFuture<List<String>>>
             playerListFutures = new ConcurrentHashMap<>();
     private final Map<String, CompletableFuture<UUID>> resolveFutures = new ConcurrentHashMap<>();
     private volatile Consumer<SyncEvent> eventHandler = event -> {
     };
     private volatile BiConsumer<Player, String> pendingHandler = (player, payload) -> {
     };
+    private volatile boolean warnedRejected = false;
 
-    public NetworkService(JavaPlugin plugin, Tasks tasks, MessageService messages) {
+    public NetworkService(JavaPlugin plugin, Tasks tasks, MessageService messages, MikuTPConfig config) {
         this.plugin = plugin;
         this.tasks = tasks;
         this.messages = messages;
+        this.crossServer = config.sync.enabled();
+        this.token = config.sync.token;
         var messenger = plugin.getServer().getMessenger();
         messenger.registerOutgoingPluginChannel(plugin, ProxyMessages.CHANNEL);
         messenger.registerIncomingPluginChannel(plugin, ProxyMessages.CHANNEL,
@@ -60,8 +71,17 @@ public final class NetworkService {
     }
 
     private void onIncoming(Player carrier, byte[] bytes) {
+        // Without a proxy in the picture no legitimate sender exists, and a
+        // modified client can reach this channel: refuse everything.
+        if (!crossServer) {
+            return;
+        }
         com.google.gson.JsonObject o = ProxyMessages.decode(bytes);
         if (o == null) {
+            return;
+        }
+        if (!ProxyMessages.verify(o, token)) {
+            warnRejected();
             return;
         }
         String type = ProxyMessages.type(o);
@@ -82,27 +102,37 @@ public final class NetworkService {
             return;
         }
         if (ProxyMessages.TYPE_PENDING.equals(type)) {
-            if (o.has("payload") && o.get("payload").isJsonPrimitive()) {
-                String payload = o.get("payload").getAsString();
+            String payload = ProxyMessages.string(o, "payload");
+            if (payload != null) {
                 pendingHandler.accept(carrier, payload);
             }
             return;
         }
+        if (ProxyMessages.TYPE_PLAYER_LIST.equals(type)) {
+            String id = ProxyMessages.string(o, "id");
+            if (id != null) {
+                var future = playerListFutures.remove(id);
+                if (future != null) {
+                    future.complete(ProxyMessages.stringList(o, "players"));
+                }
+            }
+            return;
+        }
         if (ProxyMessages.TYPE_RESOLVE_RESULT.equals(type)) {
-            String id = o.has("id") && o.get("id").isJsonPrimitive() ? o.get("id").getAsString() : null;
+            String id = ProxyMessages.string(o, "id");
             if (id != null) {
                 var future = resolveFutures.remove(id);
                 if (future != null) {
-                    boolean found = o.has("found") && o.get("found").getAsBoolean();
-                    if (found && o.has("uuid") && o.get("uuid").isJsonPrimitive()) {
+                    boolean found = o.has("found") && o.get("found").isJsonPrimitive() && o.get("found").getAsBoolean();
+                    String uuid = ProxyMessages.string(o, "uuid");
+                    UUID resolved = null;
+                    if (found && uuid != null) {
                         try {
-                            future.complete(UUID.fromString(o.get("uuid").getAsString()));
-                        } catch (IllegalArgumentException e) {
-                            future.complete(null);
+                            resolved = UUID.fromString(uuid);
+                        } catch (IllegalArgumentException ignored) {
                         }
-                    } else {
-                        future.complete(null);
                     }
+                    future.complete(resolved);
                 }
             }
             return;
@@ -112,6 +142,14 @@ public final class NetworkService {
             if (!ok) {
                 tasks.entity(carrier, () -> messages.send(carrier, "common.cross-connect-failed"));
             }
+        }
+    }
+
+    private void warnRejected() {
+        if (!warnedRejected) {
+            warnedRejected = true;
+            plugin.getSLF4JLogger().warn("Dropped an unauthenticated plugin message on {}; "
+                    + "check that sync.token matches the proxy token", ProxyMessages.CHANNEL);
         }
     }
 
@@ -129,14 +167,14 @@ public final class NetworkService {
     }
 
     /** Asks the proxy for the online players of one server, or the whole network when null. */
-    public CompletableFuture<java.util.List<String>> requestPlayerList(Player carrier, String serverName) {
+    public CompletableFuture<List<String>> requestPlayerList(Player carrier, String serverName) {
         String id = UUID.randomUUID().toString();
-        var future = new CompletableFuture<java.util.List<String>>();
+        var future = new CompletableFuture<List<String>>();
         playerListFutures.put(id, future);
         tasks.asyncDelayed(() -> {
             var pending = playerListFutures.remove(id);
             if (pending != null && !pending.isDone()) {
-                pending.complete(java.util.List.of());
+                pending.complete(List.of());
             }
         }, 5000);
         send(carrier, ProxyMessages.encodeListPlayers(id, serverName));
@@ -159,7 +197,11 @@ public final class NetworkService {
     }
 
     private void send(Player carrier, String json) {
-        tasks.entity(carrier, () -> carrier.sendPluginMessage(plugin,
-                ProxyMessages.CHANNEL, json.getBytes(StandardCharsets.UTF_8)));
+        String signed = ProxyMessages.sign(json, token);
+        tasks.entity(carrier, () -> {
+            if (carrier.isOnline()) {
+                carrier.sendPluginMessage(plugin, ProxyMessages.CHANNEL, signed.getBytes(StandardCharsets.UTF_8));
+            }
+        });
     }
 }

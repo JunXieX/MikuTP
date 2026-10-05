@@ -34,6 +34,8 @@ public final class HomeService {
     private final Map<UUID, List<Home>> cache = new ConcurrentHashMap<>();
     /** Home limits captured on the join thread; PlaceholderAPI reads these off-thread. */
     private final Map<UUID, Integer> limitCache = new ConcurrentHashMap<>();
+    /** Striped monitors: two /sethome in flight must not both pass the limit check. */
+    private final Object[] locks = new Object[64];
 
     public HomeService(JavaPlugin plugin, Tasks tasks, MikuTPConfig config, Database database,
                        MessageService messages, CooldownManager cooldowns, TeleportService teleports,
@@ -47,6 +49,13 @@ public final class HomeService {
         this.teleports = teleports;
         this.syncBus = syncBus;
         this.serverId = config.crossServer.serverId;
+        for (int i = 0; i < locks.length; i++) {
+            locks[i] = new Object();
+        }
+    }
+
+    private Object lockFor(UUID player) {
+        return locks[(player.hashCode() & 0x7fffffff) % locks.length];
     }
 
     public void onJoin(Player player) {
@@ -109,27 +118,29 @@ public final class HomeService {
         Location loc = player.getLocation().clone();
         UUID id = player.getUniqueId();
         tasks.async(() -> {
-            try {
-                List<Home> current = new ArrayList<>(homes(id));
-                boolean exists = current.stream().anyMatch(h -> h.name.equalsIgnoreCase(wanted));
-                if (!exists && current.size() >= maxHomes) {
-                    messages.send(player, "home.limit-reached", "limit", String.valueOf(maxHomes));
-                    return;
-                }
-                // Pre-lowercase rows from older versions: remove case variants first.
-                for (Home existing : current) {
-                    if (!existing.name.equals(wanted) && existing.name.equalsIgnoreCase(wanted)) {
-                        database.deleteHome(id.toString(), existing.name);
+            synchronized (lockFor(id)) {
+                try {
+                    List<Home> current = new ArrayList<>(homes(id));
+                    boolean exists = current.stream().anyMatch(h -> h.name.equalsIgnoreCase(wanted));
+                    if (!exists && current.size() >= maxHomes) {
+                        messages.send(player, "home.limit-reached", "limit", String.valueOf(maxHomes));
+                        return;
                     }
+                    // Pre-lowercase rows from older versions: remove case variants first.
+                    for (Home existing : current) {
+                        if (!existing.name.equals(wanted) && existing.name.equalsIgnoreCase(wanted)) {
+                            database.deleteHome(id.toString(), existing.name);
+                        }
+                    }
+                    Home home = new Home(id.toString(), wanted, positionOf(loc), System.currentTimeMillis());
+                    database.saveHome(home);
+                    cache.put(id, sort(replace(current, home)));
+                    messages.send(player, "home.set", "name", wanted);
+                    publishHomeSet(home);
+                } catch (Exception e) {
+                    plugin.getSLF4JLogger().warn("Failed to save home", e);
+                    messages.send(player, "common.teleport-failed");
                 }
-                Home home = new Home(id.toString(), wanted, positionOf(loc), System.currentTimeMillis());
-                database.saveHome(home);
-                cache.put(id, sort(replace(current, home)));
-                messages.send(player, "home.set", "name", wanted);
-                publishHomeSet(home);
-            } catch (Exception e) {
-                plugin.getSLF4JLogger().warn("Failed to save home", e);
-                messages.send(player, "common.teleport-failed");
             }
         });
     }
@@ -138,27 +149,29 @@ public final class HomeService {
         UUID id = player.getUniqueId();
         String wanted = name.toLowerCase(java.util.Locale.ROOT);
         tasks.async(() -> {
-            try {
-                boolean removed = database.deleteHome(id.toString(), wanted);
-                if (!removed) {
-                    // Case variant stored by an older version: delete by its stored name.
-                    for (Home home : database.listHomes(id.toString())) {
-                        if (home.name.equalsIgnoreCase(wanted)) {
-                            removed = database.deleteHome(id.toString(), home.name);
-                            break;
+            synchronized (lockFor(id)) {
+                try {
+                    boolean removed = database.deleteHome(id.toString(), wanted);
+                    if (!removed) {
+                        // Case variant stored by an older version: delete by its stored name.
+                        for (Home home : database.listHomes(id.toString())) {
+                            if (home.name.equalsIgnoreCase(wanted)) {
+                                removed = database.deleteHome(id.toString(), home.name);
+                                break;
+                            }
                         }
                     }
+                    if (removed) {
+                        cache.computeIfPresent(id, (k, list) -> sort(list.stream()
+                                .filter(h -> !h.name.equalsIgnoreCase(wanted)).toList()));
+                        messages.send(player, "home.deleted", "name", wanted);
+                        publishHomeDelete(id.toString(), wanted);
+                    } else {
+                        messages.send(player, "home.not-found", "name", wanted);
+                    }
+                } catch (Exception e) {
+                    plugin.getSLF4JLogger().warn("Failed to delete home", e);
                 }
-                if (removed) {
-                    cache.computeIfPresent(id, (k, list) -> sort(list.stream()
-                            .filter(h -> !h.name.equalsIgnoreCase(wanted)).toList()));
-                    messages.send(player, "home.deleted", "name", wanted);
-                    publishHomeDelete(id.toString(), wanted);
-                } else {
-                    messages.send(player, "home.not-found", "name", wanted);
-                }
-            } catch (Exception e) {
-                plugin.getSLF4JLogger().warn("Failed to delete home", e);
             }
         });
     }
@@ -187,30 +200,37 @@ public final class HomeService {
         syncBus.publish(event);
     }
 
-    /** Applies a replicated home change from another backend. */
-    public void applyRemoteSet(com.mikumc.mikutp.common.sync.SyncEvent event) {
+    /** Applies a replicated home change from another backend; the write joins the
+     * caller's batched transaction. */
+    public void applyRemoteSet(com.mikumc.mikutp.common.sync.SyncEvent event, Database.Tx tx) throws java.sql.SQLException {
         if (event.ownerUuid == null || event.homeName == null || event.homePosition == null) {
             return;
         }
-        try {
-            Home home = new Home(event.ownerUuid, event.homeName, event.homePosition, event.homeCreatedAt);
-            database.saveHome(home);
-            cache.computeIfPresent(UUID.fromString(event.ownerUuid), (k, list) -> sort(replace(list, home)));
-        } catch (Exception e) {
-            plugin.getSLF4JLogger().warn("Failed to apply replicated home", e);
+        Home home = new Home(event.ownerUuid, event.homeName, event.homePosition, event.homeCreatedAt);
+        tx.saveHome(home);
+        UUID owner = parseUuid(event.ownerUuid);
+        if (owner != null) {
+            cache.computeIfPresent(owner, (k, list) -> sort(replace(list, home)));
         }
     }
 
-    public void applyRemoteDelete(com.mikumc.mikutp.common.sync.SyncEvent event) {
+    public void applyRemoteDelete(com.mikumc.mikutp.common.sync.SyncEvent event, Database.Tx tx) throws java.sql.SQLException {
         if (event.ownerUuid == null || event.homeName == null) {
             return;
         }
-        try {
-            database.deleteHome(event.ownerUuid, event.homeName);
-            cache.computeIfPresent(UUID.fromString(event.ownerUuid), (k, list) -> sort(list.stream()
+        tx.deleteHome(event.ownerUuid, event.homeName);
+        UUID owner = parseUuid(event.ownerUuid);
+        if (owner != null) {
+            cache.computeIfPresent(owner, (k, list) -> sort(list.stream()
                     .filter(h -> !h.name.equalsIgnoreCase(event.homeName)).toList()));
-        } catch (Exception e) {
-            plugin.getSLF4JLogger().warn("Failed to apply replicated home deletion", e);
+        }
+    }
+
+    private static UUID parseUuid(String value) {
+        try {
+            return UUID.fromString(value);
+        } catch (IllegalArgumentException e) {
+            return null;
         }
     }
 
