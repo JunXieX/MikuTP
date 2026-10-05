@@ -28,36 +28,30 @@ MikuTP 是一套面向 Paper / Folia / Velocity 的多功能传送插件：家�
 | 后端服务端 | Paper 26.2+ 或 Folia 26.1.2+（MC 26.x） |
 | Java | 25 |
 | 跨服代理 | Velocity 4.2+（仅跨服模式需要） |
-| Redis | 6.2+（仅跨服模式需要） |
 | 客户端 | 原生对话框需 MC 1.21.6+，旧版客户端请关闭 `dialogs.enabled`（自动回退聊天菜单） |
 
-首次启动会自动从 Maven Central 下载 SQLite / HikariCP / Jedis 运行库，需要服务器能访问外网。
+首次启动会自动从 Maven Central 下载 SQLite / HikariCP 运行库，需要服务器能访问外网。
 
 ## 安装
 
 ### 单服务器（默认，零依赖）
 
 1. 把 `MikuTP-Paper-1.3.0.jar` 放入 `plugins/`，重启。
-2. 完成。数据存储在 `plugins/MikuTP/data.db`（SQLite），无需 Redis、无需 MySQL。
+2. 完成。数据存储在 `plugins/MikuTP/data.db`（SQLite），无需任何外部服务。
 
 ### 跨服网络（Velocity）
 
 1. 每台后端服务器安装 `MikuTP-Paper`，代理安装 `MikuTP-Velocity`。
-2. 部署一台 Redis（建议设密码、仅监听内网）。
-3. 每台后端编辑 `plugins/MikuTP/config.yml`：
+2. 每台后端编辑 `plugins/MikuTP/config.yml`：
    ```yaml
    sync:
-     mode: REDIS          # 开启跨服同步
-     redis:
-       host: 你的Redis地址
-       port: 6379
-       password: "你的密码"
+     mode: VELOCITY       # 开启跨服同步
    cross_server:
      server_id: survival  # 必须与 velocity.toml 中的服务器名完全一致
    ```
-4. 依次重启全部后端。此后家、玩家档案、屏蔽列表自动全网同步；`/tpa`、`/home`、`/back`、`/otp` 全部支持跨服。
+3. 依次重启全部后端。此后家、玩家档案、屏蔽列表自动全网同步；`/tpa`、`/home`、`/back`、`/otp` 全部支持跨服。
 
-数据安全：本地 SQLite 是唯一事实源，Redis 只承担同步。Redis 短暂宕机不影响本地功能，恢复后自动补同步，不会丢数据。
+数据安全：本地 SQLite 是唯一事实源，代理只承担同步。代理短暂重启不影响本地功能，恢复后自动对齐全网数据，不会丢数据。
 
 ## 命令
 
@@ -99,15 +93,15 @@ MikuTP 是一套面向 Paper / Folia / Velocity 的多功能传送插件：家�
 **Folia 26.1.2 提示 api-version 过高拒绝加载？**
 把 `paper-plugin.yml` 里的 `api-version: '26.2'` 改为 `'26.1'` 即可。
 
-**Redis 宕机会有什么影响？**
-本地功能（家、地标、单服传送、随机传送）完全正常；跨服传送暂停，Redis 恢复后插件自动补发积压的同步事件，无需人工干预。
+**代理重启会有什么影响？**
+本地功能（家、地标、单服传送、随机传送）完全正常；跨服传送暂停，代理恢复后插件自动重新对齐全网数据，无需人工干预。
 
 **跨服请求/传送有延迟？**
-事件经 Redis 推送，通常毫秒级到达；跨服传送还包含可配置的预热倒计时与服务器切换时间，属于正常现象。
+事件经代理推送，通常毫秒级到达；跨服传送还包含可配置的预热倒计时与服务器切换时间，属于正常现象。
 
 ## 技术亮点
 
 - 原生 Dialog 菜单 + 可点击聊天菜单双通道，所有文案可自定义
 - 完全兼容 Folia：全程区域化调度器 + `teleportAsync`，无主线程假设
-- 本地 SQLite 为唯一事实源，Redis Stream + 消费组做增量同步，本地 outbox 保证 Redis 宕机期间事件不丢
+- 本地 SQLite 为唯一事实源，Velocity 代理做事件扇出与路由，玩家加入时自动重新对齐全网状态，不丢任何本地数据
 - 零打包依赖：运行库全部由服务端按需自动下载
