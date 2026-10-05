@@ -109,9 +109,9 @@ public final class MikuTPConfig {
 
     public static final class CrossServer {
         /**
-         * Identifier of this backend server; also the Redis consumer name and the
-         * origin tag on sync events. Should match the proxy server name when this
-         * backend takes part in a network.
+         * Identifier of this backend server: the origin tag on sync events.
+         * Should match the proxy server name when this backend takes part in
+         * a network.
          */
         public String serverId = "server";
     }
