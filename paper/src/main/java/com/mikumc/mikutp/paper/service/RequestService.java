@@ -1,6 +1,5 @@
 package com.mikumc.mikutp.paper.service;
 
-import com.mikumc.mikutp.common.config.ConfigIO;
 import com.mikumc.mikutp.common.config.MikuTPConfig;
 import com.mikumc.mikutp.common.data.Database;
 import com.mikumc.mikutp.common.data.IgnoreEntry;
@@ -59,6 +58,7 @@ public final class RequestService {
     private final CooldownManager cooldowns;
     private final TeleportService teleports;
     private final ProfileService profiles;
+    private final NetworkService network;
     private final SyncBus syncBus;
     private final String serverId;
 
@@ -74,12 +74,15 @@ public final class RequestService {
     private final java.util.Set<String> answeredRequests = ConcurrentHashMap.newKeySet();
     private final java.util.Set<String> deliveredEvents = ConcurrentHashMap.newKeySet();
     private final java.util.Set<String> handledEvents = ConcurrentHashMap.newKeySet();
+    /** Mailbox payloads pushed by the proxy for a joining player. */
+    private final Map<UUID, List<TpRequest>> mailboxArrivals = new ConcurrentHashMap<>();
     private volatile long lastDump = 0;
     private ScheduledTask sweepTask;
 
     public RequestService(JavaPlugin plugin, Tasks tasks, MikuTPConfig config, Database database,
                           MessageService messages, Effects effects, CooldownManager cooldowns,
-                          TeleportService teleports, ProfileService profiles, SyncBus syncBus) {
+                          TeleportService teleports, ProfileService profiles, NetworkService network,
+                          SyncBus syncBus) {
         this.plugin = plugin;
         this.tasks = tasks;
         this.config = config;
@@ -89,6 +92,7 @@ public final class RequestService {
         this.cooldowns = cooldowns;
         this.teleports = teleports;
         this.profiles = profiles;
+        this.network = network;
         this.syncBus = syncBus;
         this.serverId = config.crossServer.serverId;
     }
@@ -109,6 +113,7 @@ public final class RequestService {
 
     public void onQuit(UUID player) {
         lastIncoming.remove(player);
+        mailboxArrivals.remove(player);
         Map<String, TpRequest> mine = incoming.remove(player);
         if (mine != null) {
             for (TpRequest request : mine.values()) {
@@ -164,10 +169,26 @@ public final class RequestService {
             return;
         }
         boolean onlineHere = Bukkit.getPlayer(targetId) != null;
-        if (!onlineHere && !isPresentRemotely(targetId)) {
+        if (!onlineHere && !syncBus.crossServer()) {
             messages.send(requester, "common.player-not-found", "player", targetName);
             return;
         }
+        if (onlineHere) {
+            proceed(requester, targetId, targetName, here);
+            return;
+        }
+        // The target is elsewhere on the network: confirm they are still online
+        // via the proxy before sending.
+        network.resolveRemote(requester, targetName).thenAccept(found -> {
+            if (found == null || !found.equals(targetId)) {
+                messages.send(requester, "common.player-not-found", "player", targetName);
+                return;
+            }
+            proceed(requester, targetId, targetName, here);
+        });
+    }
+
+    private void proceed(Player requester, UUID targetId, String targetName, boolean here) {
         // All checks passed: revoke the previous outgoing request (its target is
         // notified and their dialog closed), then burn the cooldown and send.
         cancelOutgoing(requester);
@@ -177,14 +198,6 @@ public final class RequestService {
         publishRequest(request);
         messages.send(requester, here ? "tpa.sent-here" : "tpa.sent",
                 "player", targetName, "seconds", String.valueOf(config.tpa.requestExpirySeconds));
-    }
-
-    private boolean isPresentRemotely(UUID targetId) {
-        if (!syncBus.crossServer()) {
-            return false;
-        }
-        String server = syncBus.presenceGet(targetId);
-        return server != null && !server.isBlank();
     }
 
     /**
@@ -210,12 +223,6 @@ public final class RequestService {
         SyncEvent event = SyncEvent.create(SyncEvent.Type.TP_NEW, serverId);
         event.request = request;
         syncBus.publish(event);
-        if (syncBus.crossServer()) {
-            // If the target happens to be offline while the event flies, the request
-            // waits in their mailbox and is delivered the moment they rejoin.
-            syncBus.mailboxAdd(request.targetUuid,
-                    ConfigIO.gson().toJson(request), config.tpa.requestExpirySeconds);
-        }
     }
 
     private TpRequest newRequest(Player requester, UUID targetId, String targetName, boolean here) {
@@ -269,11 +276,6 @@ public final class RequestService {
 
     private void respondCommon(Player target, TpRequest request, Response response) {
         effects.click(target);
-        answeredRequests.add(request.id);
-        prune(answeredRequests);
-        // The request is answered: drop its rejoin-mailbox copy so quitting and
-        // rejoining cannot replay an already-handled dialog.
-        syncBus.mailboxRemove(request.targetUuid, ConfigIO.gson().toJson(request));
         switch (response) {
             case ACCEPT -> messages.send(target, "tpa.accepted-target", "player", request.requesterName);
             case DENY -> messages.send(target, "tpa.denied-target", "player", request.requesterName);
@@ -455,11 +457,6 @@ public final class RequestService {
             if (found.isEmpty()) {
                 continue;
             }
-            // Clean the mailbox copies too: the target may be offline right now,
-            // and a rejoin must not replay a revoked request.
-            for (TpRequest request : found) {
-                syncBus.mailboxRemove(request.targetUuid, ConfigIO.gson().toJson(request));
-            }
             Player target = Bukkit.getPlayer(entry.getKey());
             if (target == null) {
                 continue;
@@ -491,32 +488,31 @@ public final class RequestService {
         }
     }
 
-    /** Delivers requests that were queued while the target was offline, on rejoin. */
-    public void deliverMailbox(UUID targetId) {
-        if (!syncBus.crossServer()) {
+    /** Buffers mailbox payloads the proxy pushed for a joining player. */
+    public void bufferMailbox(UUID targetId, List<TpRequest> requests) {
+        if (requests.isEmpty()) {
             return;
         }
-        tasks.async(() -> {
-            long now = System.currentTimeMillis();
-            for (String payload : syncBus.mailboxTake(targetId.toString())) {
-                TpRequest request;
-                try {
-                    request = ConfigIO.gson().fromJson(payload, TpRequest.class);
-                } catch (Exception e) {
-                    continue;
-                }
-                if (request == null || request.targetUuid == null
-                        || !request.targetUuid.equals(targetId.toString())
-                        || request.status != TpRequest.Status.PENDING
-                        || answeredRequests.contains(request.id)
-                        || request.createdAt + config.tpa.requestExpirySeconds * 1000L < now) {
-                    continue;
-                }
-                if (trackIncoming(request)) {
-                    showToTarget(request);
-                }
+        mailboxArrivals.computeIfAbsent(targetId, k -> new ArrayList<>()).addAll(requests);
+    }
+
+    /** Applies buffered mailbox requests on join. */
+    public void deliverMailboxBuffer(Player player) {
+        List<TpRequest> requests = mailboxArrivals.remove(player.getUniqueId());
+        if (requests == null || requests.isEmpty()) {
+            return;
+        }
+        long now = System.currentTimeMillis();
+        for (TpRequest request : requests) {
+            if (request.status != TpRequest.Status.PENDING
+                    || answeredRequests.contains(request.id)
+                    || request.createdAt + config.tpa.requestExpirySeconds * 1000L < now) {
+                continue;
             }
-        });
+            if (trackIncoming(request)) {
+                showToTarget(request);
+            }
+        }
     }
 
     /** Registers a request for its target; false when it is already tracked. */

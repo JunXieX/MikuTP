@@ -4,6 +4,7 @@ import com.mikumc.mikutp.paper.service.CooldownManager;
 import com.mikumc.mikutp.paper.service.HomeService;
 import com.mikumc.mikutp.paper.service.ProfileService;
 import com.mikumc.mikutp.paper.service.RequestService;
+import com.mikumc.mikutp.paper.service.SyncCoordinator;
 import com.mikumc.mikutp.paper.service.TeleportService;
 import org.bukkit.entity.Player;
 import org.bukkit.event.EventHandler;
@@ -23,15 +24,17 @@ public final class PlayerLifecycle implements Listener {
     private final RequestService requestService;
     private final TeleportService teleports;
     private final CooldownManager cooldowns;
+    private final SyncCoordinator coordinator;
 
     public PlayerLifecycle(ProfileService profiles, HomeService homeService,
                            RequestService requestService, TeleportService teleports,
-                           CooldownManager cooldowns) {
+                           CooldownManager cooldowns, SyncCoordinator coordinator) {
         this.profiles = profiles;
         this.homeService = homeService;
         this.requestService = requestService;
         this.teleports = teleports;
         this.cooldowns = cooldowns;
+        this.coordinator = coordinator;
     }
 
     @EventHandler(priority = EventPriority.MONITOR)
@@ -41,7 +44,8 @@ public final class PlayerLifecycle implements Listener {
         cooldowns.setBypass(id, player.hasPermission("mikutp.bypass.cooldown"));
         profiles.onJoin(player);
         homeService.onJoin(player);
-        requestService.deliverMailbox(id);
+        coordinator.onPlayerJoin();
+        requestService.deliverMailboxBuffer(player);
         teleports.applyPending(id);
     }
 
@@ -52,6 +56,7 @@ public final class PlayerLifecycle implements Listener {
         profiles.onQuit(id);
         homeService.onQuit(id);
         requestService.onQuit(id);
+        coordinator.onPlayerQuit();
         teleports.warmups().drop(id);
         cooldowns.clear(id);
     }

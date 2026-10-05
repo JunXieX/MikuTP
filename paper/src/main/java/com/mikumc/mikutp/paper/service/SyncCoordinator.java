@@ -4,25 +4,20 @@ import com.mikumc.mikutp.common.config.MikuTPConfig;
 import com.mikumc.mikutp.common.data.Database;
 import com.mikumc.mikutp.common.sync.SyncBus;
 import com.mikumc.mikutp.common.sync.SyncEvent;
-import io.papermc.paper.threadedregions.scheduler.ScheduledTask;
-import org.bukkit.Bukkit;
-import org.bukkit.entity.Player;
 import org.bukkit.plugin.java.JavaPlugin;
 
-import java.util.HashMap;
-import java.util.Map;
-import java.util.UUID;
-import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
+
 /**
- * Wires the sync bus to the services: routes incoming events to their owners,
- * publishes heartbeats and answers resync requests by dumping local state.
+ * Wires the sync bus to the services: routes incoming events to their owners
+ * and triggers full-state resyncs so backends that missed events (proxy
+ * restarts, empty-server gaps) re-converge.
  */
 public final class SyncCoordinator {
 
     private static final long DUMP_GUARD_MS = 30_000;
 
     private final JavaPlugin plugin;
-    private final Tasks tasks;
     private final MikuTPConfig config;
     private final Database database;
     private final SyncBus syncBus;
@@ -32,13 +27,12 @@ public final class SyncCoordinator {
     private final RequestService requestService;
     private final String serverId;
     private volatile long lastDump = 0;
-    private ScheduledTask heartbeatTask;
+    private final AtomicInteger activePlayers = new AtomicInteger();
 
-    public SyncCoordinator(JavaPlugin plugin, Tasks tasks, MikuTPConfig config, Database database,
+    public SyncCoordinator(JavaPlugin plugin, MikuTPConfig config, Database database,
                            SyncBus syncBus, HomeService homeService, ProfileService profileService,
                            TeleportService teleports, RequestService requestService) {
         this.plugin = plugin;
-        this.tasks = tasks;
         this.config = config;
         this.database = database;
         this.syncBus = syncBus;
@@ -52,17 +46,11 @@ public final class SyncCoordinator {
     public void start() {
         syncBus.start(this::onEvent);
         if (syncBus.crossServer()) {
-            // Ask the network for a full state dump so a fresh or long-offline
-            // backend converges, then keep presence fresh.
             publishResync();
-            heartbeatTask = tasks.asyncRepeat(this::heartbeat, 5, 5, TimeUnit.SECONDS);
         }
     }
 
     public void shutdown() {
-        if (heartbeatTask != null) {
-            heartbeatTask.cancel();
-        }
     }
 
     /** /mtp resync: asks every backend to re-publish its full local state. */
@@ -72,23 +60,24 @@ public final class SyncCoordinator {
         }
     }
 
+    /** Called on join: the first player after a quiet period triggers a resync. */
+    public void onPlayerJoin() {
+        if (syncBus.crossServer() && activePlayers.incrementAndGet() == 1) {
+            publishResync();
+        }
+    }
+
+    public void onPlayerQuit() {
+        activePlayers.decrementAndGet();
+    }
+
     private void publishResync() {
         SyncEvent event = SyncEvent.create(SyncEvent.Type.RESYNC_REQUEST, serverId);
         syncBus.publish(event);
     }
 
-    private void heartbeat() {
-        if (Bukkit.getOnlinePlayers().isEmpty()) {
-            return;
-        }
-        Map<UUID, String> presence = new HashMap<>();
-        for (Player player : Bukkit.getOnlinePlayers()) {
-            presence.put(player.getUniqueId(), serverId);
-        }
-        syncBus.presencePutAll(presence, 15);
-    }
-
-    private void onEvent(SyncEvent event) {
+    /** Routes one sync event to the owning service. */
+    public void onEvent(SyncEvent event) {
         if (event.type == null) {
             return;
         }
@@ -109,7 +98,7 @@ public final class SyncCoordinator {
             return;
         }
         lastDump = now;
-        tasks.async(() -> {
+        plugin.getServer().getAsyncScheduler().runNow(plugin, task -> {
             try {
                 for (var home : database.listAllHomes()) {
                     SyncEvent event = SyncEvent.create(SyncEvent.Type.HOME_SET, serverId);

@@ -35,6 +35,8 @@ public final class TeleportService {
     private final ProfileService profiles;
     private final CooldownManager cooldowns;
     private final SyncBus syncBus;
+    /** Pending teleports pushed by the proxy, applied on the player's join. */
+    private final java.util.Map<UUID, PendingTeleport> arriving = new java.util.concurrent.ConcurrentHashMap<>();
     private final String serverId;
 
     public TeleportService(JavaPlugin plugin, Tasks tasks, MikuTPConfig config, Database database,
@@ -95,61 +97,64 @@ public final class TeleportService {
         });
     }
 
-    /** Applies a cross-server handoff for a player who just arrived on this server. */
+    /** Buffers a pending-teleport payload pushed by the proxy for a joining player. */
+    public void bufferArrival(Player player, String payload) {
+        PendingTeleport pending;
+        try {
+            pending = ConfigIO.gson().fromJson(payload, PendingTeleport.class);
+        } catch (Exception e) {
+            plugin.getSLF4JLogger().warn("Malformed pending teleport payload", e);
+            return;
+        }
+        if (pending == null || pending.position == null) {
+            return;
+        }
+        arriving.put(player.getUniqueId(), pending);
+    }
+
+    /** Consumes a buffered cross-server handoff for a player who just arrived. */
     public void applyPending(UUID playerUuid) {
-        tasks.async(() -> {
-            String json = syncBus.pendingTake(playerUuid.toString());
-            if (json == null) {
-                return;
-            }
-            PendingTeleport pending;
-            try {
-                pending = ConfigIO.gson().fromJson(json, PendingTeleport.class);
-            } catch (Exception e) {
-                plugin.getSLF4JLogger().warn("Malformed pending teleport payload", e);
-                return;
-            }
-            if (pending == null || pending.position == null) {
-                return;
-            }
-            String destServer = pending.position.server;
-            if (destServer != null && !destServer.isBlank() && !destServer.equals(serverId)) {
-                return;
-            }
-            if (pending.anchorUuid != null && !pending.anchorUuid.isBlank()) {
-                UUID anchorId = parseUuid(pending.anchorUuid);
-                Player anchor = anchorId == null ? null : Bukkit.getPlayer(anchorId);
-                if (anchor != null) {
-                    // Teleport to the anchor's live position, read on their region thread.
-                    tasks.entity(anchor, () -> {
-                        Player stable = Bukkit.getPlayer(anchorId);
-                        if (stable == null) {
-                            fallbackPendingArrival(playerUuid, pending);
-                            return;
-                        }
-                        Location live = stable.getLocation().clone();
-                        playerTeleportAsync(playerUuid, live, pending.source.name().toLowerCase());
-                    });
-                    return;
-                }
-                if (pending.position.world == null || pending.position.world.isBlank()) {
-                    // Anchor gone and no stored position to fall back on.
-                    Player arriving = Bukkit.getPlayer(playerUuid);
-                    if (arriving != null) {
-                        messages.send(arriving, "admin.target-left");
+        PendingTeleport pending = arriving.remove(playerUuid);
+        if (pending == null || pending.position == null) {
+            return;
+        }
+        String destServer = pending.position.server;
+        if (destServer != null && !destServer.isBlank() && !destServer.equals(serverId)) {
+            return;
+        }
+        if (pending.anchorUuid != null && !pending.anchorUuid.isBlank()) {
+            UUID anchorId = parseUuid(pending.anchorUuid);
+            Player anchor = anchorId == null ? null : Bukkit.getPlayer(anchorId);
+            if (anchor != null) {
+                // Teleport to the anchor's live position, read on their region thread.
+                tasks.entity(anchor, () -> {
+                    Player stable = Bukkit.getPlayer(anchorId);
+                    if (stable == null) {
+                        fallbackPendingArrival(playerUuid, pending);
+                        return;
                     }
-                    return;
-                }
-            }
-            World world = Bukkit.getWorld(pending.position.world);
-            if (world == null) {
-                plugin.getSLF4JLogger().warn("Pending teleport targets unknown world {}", pending.position.world);
+                    Location live = stable.getLocation().clone();
+                    playerTeleportAsync(playerUuid, live, pending.source.name().toLowerCase());
+                });
                 return;
             }
-            Location target = new Location(world, pending.position.x, pending.position.y,
-                    pending.position.z, pending.position.yaw, pending.position.pitch);
-            playerTeleportAsync(playerUuid, target, pending.source.name().toLowerCase());
-        });
+            if (pending.position.world == null || pending.position.world.isBlank()) {
+                // Anchor gone and no stored position to fall back on.
+                Player arrivingPlayer = Bukkit.getPlayer(playerUuid);
+                if (arrivingPlayer != null) {
+                    messages.send(arrivingPlayer, "admin.target-left");
+                }
+                return;
+            }
+        }
+        World world = Bukkit.getWorld(pending.position.world);
+        if (world == null) {
+            plugin.getSLF4JLogger().warn("Pending teleport targets unknown world {}", pending.position.world);
+            return;
+        }
+        Location target = new Location(world, pending.position.x, pending.position.y,
+                pending.position.z, pending.position.yaw, pending.position.pitch);
+        playerTeleportAsync(playerUuid, target, pending.source.name().toLowerCase());
     }
 
     /**
@@ -315,8 +320,7 @@ public final class TeleportService {
                     PendingTeleport pending = new PendingTeleport(admin.getUniqueId().toString(),
                             new Position(null, "", 0, 0, 0, 0f, 0f), PendingTeleport.Source.ADMIN,
                             System.currentTimeMillis(), record.uuid().toString());
-                    syncBus.pendingPut(admin.getUniqueId().toString(),
-                            ConfigIO.gson().toJson(pending), PENDING_TTL_SECONDS);
+                    syncBus.pendingStore(admin.getUniqueId(), pending, PENDING_TTL_SECONDS);
                     tasks.entity(admin, () -> network.connectAnchor(admin,
                             record.uuid().toString(), admin.getUniqueId().toString()));
                 } catch (Exception e) {
@@ -413,7 +417,7 @@ public final class TeleportService {
                 PendingTeleport pending = new PendingTeleport(victim.toString(), here,
                         PendingTeleport.Source.ADMIN, System.currentTimeMillis(),
                         admin.getUniqueId().toString());
-                syncBus.pendingPut(victim.toString(), ConfigIO.gson().toJson(pending), PENDING_TTL_SECONDS);
+                syncBus.pendingStore(victim, pending, PENDING_TTL_SECONDS);
                 tasks.entity(stable, () -> network.connectAnchor(stable,
                         victim.toString(), stable.getUniqueId().toString()));
             } catch (Exception e) {
@@ -513,7 +517,7 @@ public final class TeleportService {
             try {
                 Position stamped = new Position(dest.server, dest.world, dest.x, dest.y, dest.z, dest.yaw, dest.pitch);
                 PendingTeleport pending = new PendingTeleport(uuid.toString(), stamped, source, System.currentTimeMillis());
-                syncBus.pendingPut(uuid.toString(), ConfigIO.gson().toJson(pending), PENDING_TTL_SECONDS);
+                syncBus.pendingStore(uuid, pending, PENDING_TTL_SECONDS);
                 tasks.entity(player, () -> {
                     network.connect(player, dest.server);
                     if (afterDispatch != null) {
@@ -550,7 +554,7 @@ public final class TeleportService {
                 try {
                     PendingTeleport pending = new PendingTeleport(playerToTeleport.toString(), here,
                             source, System.currentTimeMillis(), positionOwner.toString());
-                    syncBus.pendingPut(playerToTeleport.toString(), ConfigIO.gson().toJson(pending), PENDING_TTL_SECONDS);
+                    syncBus.pendingStore(playerToTeleport, pending, PENDING_TTL_SECONDS);
                     if (onSuccess != null) {
                         onSuccess.run();
                     }

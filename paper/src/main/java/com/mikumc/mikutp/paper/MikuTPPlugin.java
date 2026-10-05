@@ -5,8 +5,8 @@ import com.mikumc.mikutp.common.config.MikuTPConfig;
 import com.mikumc.mikutp.common.data.Database;
 import com.mikumc.mikutp.common.message.MessageBundle;
 import com.mikumc.mikutp.common.sync.LoopbackSyncBus;
-import com.mikumc.mikutp.common.sync.RedisSyncBus;
 import com.mikumc.mikutp.common.sync.SyncBus;
+import com.mikumc.mikutp.paper.service.VelocitySyncBus;
 import com.mikumc.mikutp.paper.command.CommandRegistry;
 import com.mikumc.mikutp.paper.dialog.ChatMenus;
 import com.mikumc.mikutp.paper.dialog.DialogFactory;
@@ -87,7 +87,9 @@ public final class MikuTPPlugin extends JavaPlugin {
         tasks = new Tasks(this);
         effects = new Effects(config.teleport.sounds);
         cooldowns = new CooldownManager(this::cooldownSeconds);
-        syncBus = buildSyncBus();
+        syncBus = config.sync.enabled()
+                ? new VelocitySyncBus(this, tasks)
+                : new LoopbackSyncBus();
         network = new NetworkService(this, tasks, messages);
         profiles = new ProfileService(this, tasks, database, syncBus, config.crossServer.serverId);
         teleports = new TeleportService(this, tasks, config, database, messages, effects,
@@ -96,14 +98,16 @@ public final class MikuTPPlugin extends JavaPlugin {
         homeService = new HomeService(this, tasks, config, database, messages, cooldowns, teleports, syncBus);
         warpService = new WarpService(this, tasks, config, database, messages, cooldowns, teleports);
         requestService = new RequestService(this, tasks, config, database, messages, effects, cooldowns,
-                teleports, profiles, syncBus);
+                teleports, profiles, network, syncBus);
         wildService = new WildService(this, tasks, config, messages, cooldowns, teleports);
-        coordinator = new SyncCoordinator(this, tasks, config, database, syncBus,
+        coordinator = new SyncCoordinator(this, config, database, syncBus,
                 homeService, profiles, teleports, requestService);
 
         dialogs = new DialogFactory(tasks, messages, () -> config.dialogs.listPageSize);
         chats = new ChatMenus(messages);
         requestService.setShowRequestHandler(this::showRequest);
+        network.setEventHandler(coordinator::onEvent);
+        network.setPendingHandler(teleports::bufferArrival);
         warpService.load();
         requestService.start();
         coordinator.start();
@@ -113,7 +117,7 @@ public final class MikuTPPlugin extends JavaPlugin {
                 this::infoLine, () -> config.dialogs.enabled, config).register();
 
         getServer().getPluginManager().registerEvents(
-                new PlayerLifecycle(profiles, homeService, requestService, teleports, cooldowns), this);
+                new PlayerLifecycle(profiles, homeService, requestService, teleports, cooldowns, coordinator), this);
         getServer().getPluginManager().registerEvents(
                 new WarmupGuard(teleports.warmups(), config), this);
 
@@ -124,7 +128,7 @@ public final class MikuTPPlugin extends JavaPlugin {
         }
 
         getSLF4JLogger().info("MikuTP ready: mode={}, server-id={}, storage=sqlite",
-                config.sync.enabled() ? "cross-server (redis)" : "local",
+                config.sync.enabled() ? "cross-server (velocity)" : "local",
                 config.crossServer.serverId);
     }
 
@@ -175,48 +179,6 @@ public final class MikuTPPlugin extends JavaPlugin {
         }
     }
 
-    private SyncBus buildSyncBus() {
-        if (!config.sync.enabled()) {
-            return new LoopbackSyncBus();
-        }
-        var redis = config.sync.redis;
-        try {
-            return new RedisSyncBus(redis.host, redis.port, redis.password, redis.database,
-                    redis.useSsl, config.crossServer.serverId, config.sync.streamMaxLength,
-                    new SyncBus.OutboxStore() {
-                        @Override
-                        public long append(String payload) {
-                            try {
-                                return database.addOutboxEvent(payload);
-                            } catch (Exception e) {
-                                throw new IllegalStateException(e);
-                            }
-                        }
-
-                        @Override
-                        public java.util.List<com.mikumc.mikutp.common.sync.SyncBus.OutboxRow> take(int max) {
-                            try {
-                                return database.takeOutboxEvents(max);
-                            } catch (Exception e) {
-                                throw new IllegalStateException(e);
-                            }
-                        }
-
-                        @Override
-                        public void remove(java.util.List<Long> seqs) {
-                            try {
-                                database.deleteOutboxEvents(seqs);
-                            } catch (Exception e) {
-                                throw new IllegalStateException(e);
-                            }
-                        }
-                    });
-        } catch (Exception e) {
-            getSLF4JLogger().error("Failed to connect to Redis, falling back to single-server mode", e);
-            return new LoopbackSyncBus();
-        }
-    }
-
     private void showRequest(com.mikumc.mikutp.common.data.TpRequest request) {
         Player target = request.targetUuid == null ? null
                 : Bukkit.getPlayer(UUID.fromString(request.targetUuid));
@@ -244,7 +206,7 @@ public final class MikuTPPlugin extends JavaPlugin {
     }
 
     private String infoLine() {
-        return (config.sync.enabled() ? "cross-server (redis)" : "local")
+        return (config.sync.enabled() ? "cross-server (velocity)" : "local")
                 + " | server=" + config.crossServer.serverId
                 + " | storage=sqlite"
                 + " | dialogs=" + (config.dialogs.enabled ? "on" : "off");

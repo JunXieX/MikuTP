@@ -16,7 +16,7 @@ public final class MikuTPConfig {
     /** Cross-server identity and request settings. */
     public CrossServer crossServer = new CrossServer();
 
-    /** Redis sync bus settings (cross-server mode). */
+    /** Cross-server sync settings. */
     public Sync sync = new Sync();
 
     /** Global teleport behaviour: warmup, cancel rules and cooldowns. */
@@ -110,30 +110,19 @@ public final class MikuTPConfig {
     public static final class CrossServer {
         /**
          * Identifier of this backend server; also the Redis consumer name and the
-         * origin tag on sync events. Must match the proxy server name when this
+         * origin tag on sync events. Should match the proxy server name when this
          * backend takes part in a network.
          */
         public String serverId = "server";
     }
 
     public static final class Sync {
-        /** NONE = single server (no Redis); REDIS = local SQLite plus the Redis sync bus. */
+        /** NONE = single server (no proxy messaging); VELOCITY = local SQLite plus the Velocity hub. */
         public String mode = "NONE";
-        public Redis redis = new Redis();
-        /** Approximate stream retention in entries; events are tiny, keep it generous. */
-        public long streamMaxLength = 500000;
         /** True when cross-server features are switched on. */
         public boolean enabled() {
-            return "REDIS".equalsIgnoreCase(mode);
+            return "VELOCITY".equalsIgnoreCase(mode);
         }
-    }
-
-    public static final class Redis {
-        public String host = "localhost";
-        public int port = 6379;
-        public String password = "";
-        public int database = 0;
-        public boolean useSsl = false;
     }
 
     public static final class Teleport {

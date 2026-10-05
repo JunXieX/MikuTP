@@ -19,8 +19,7 @@ public final class MikuTPLoader implements PluginLoader {
     /** Runtime libraries, resolved from Maven Central at load time. */
     public static final List<String> LIBRARIES = List.of(
             "org.xerial:sqlite-jdbc:3.46.1.3",
-            "com.zaxxer:HikariCP:6.2.1",
-            "redis.clients:jedis:5.1.0");
+            "com.zaxxer:HikariCP:6.2.1");
 
     @Override
     public void classloader(PluginClasspathBuilder classpath) {

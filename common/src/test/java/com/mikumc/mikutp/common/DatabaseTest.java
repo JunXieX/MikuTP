@@ -6,7 +6,6 @@ import com.mikumc.mikutp.common.data.IgnoreEntry;
 import com.mikumc.mikutp.common.data.PlayerProfile;
 import com.mikumc.mikutp.common.data.Position;
 import com.mikumc.mikutp.common.data.Warp;
-import com.mikumc.mikutp.common.sync.SyncBus;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -149,21 +148,5 @@ class DatabaseTest {
         assertTrue(database.isIgnored("tgt-uuid", "req-uuid", now + 999_999_999));
         assertTrue(database.clearIgnore("tgt-uuid", "req-uuid"));
         assertFalse(database.isIgnored("tgt-uuid", "req-uuid", now));
-    }
-
-    @Test
-    void outboxRoundTrip() throws Exception {
-        assertEquals(0, database.takeOutboxEvents(100).size());
-        database.addOutboxEvent("event-1");
-        database.addOutboxEvent("event-2");
-
-        List<SyncBus.OutboxRow> rows = database.takeOutboxEvents(10);
-        assertEquals(2, rows.size());
-        assertEquals("event-1", rows.get(0).payload());
-
-        database.deleteOutboxEvents(List.of(rows.get(0).seq()));
-        rows = database.takeOutboxEvents(10);
-        assertEquals(1, rows.size());
-        assertEquals("event-2", rows.get(0).payload());
     }
 }

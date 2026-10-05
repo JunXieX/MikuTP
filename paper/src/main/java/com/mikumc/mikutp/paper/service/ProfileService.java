@@ -48,17 +48,11 @@ public final class ProfileService {
             }
             publishProfile(uuid, player.getName(), System.currentTimeMillis(),
                     tpaEnabled.getOrDefault(uuid, true));
-            if (syncBus.crossServer()) {
-                syncBus.presencePut(uuid, serverId, 15);
-            }
         });
     }
 
     public void onQuit(UUID uuid) {
         tpaEnabled.remove(uuid);
-        if (syncBus.crossServer()) {
-            syncBus.presenceForget(uuid);
-        }
     }
 
     public boolean isTpaEnabled(UUID uuid) {

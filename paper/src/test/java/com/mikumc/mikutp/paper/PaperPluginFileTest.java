@@ -60,7 +60,6 @@ class PaperPluginFileTest {
     void loaderResolvesExpectedLibraries() {
         assertEquals(List.of(
                 "org.xerial:sqlite-jdbc:3.46.1.3",
-                "com.zaxxer:HikariCP:6.2.1",
-                "redis.clients:jedis:5.1.0"), MikuTPLoader.LIBRARIES);
+                "com.zaxxer:HikariCP:6.2.1"), MikuTPLoader.LIBRARIES);
     }
 }

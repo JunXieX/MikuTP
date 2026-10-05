@@ -1,7 +1,5 @@
 package com.mikumc.mikutp.common.data;
 
-import com.mikumc.mikutp.common.sync.SyncBus.OutboxRow;
-
 import java.sql.Connection;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
@@ -121,11 +119,6 @@ public final class Database implements AutoCloseable {
                   expires_at BIGINT NOT NULL,
                   created_at BIGINT NOT NULL,
                   PRIMARY KEY (blocker_uuid, blocked_uuid)
-                )""".formatted(prefix));
-        exec("""
-                CREATE TABLE IF NOT EXISTS %soutbox (
-                  seq INTEGER PRIMARY KEY AUTOINCREMENT,
-                  payload TEXT NOT NULL
                 )""".formatted(prefix));
         index("CREATE INDEX IF NOT EXISTS %sidx_homes_owner ON %shomes (owner_uuid)".formatted(prefix, prefix));
         index("CREATE INDEX IF NOT EXISTS %sidx_players_name ON %splayers (name COLLATE NOCASE)".formatted(prefix, prefix));
@@ -408,40 +401,6 @@ public final class Database implements AutoCloseable {
         return queryList("SELECT * FROM %signores".formatted(prefix),
                 rs -> new IgnoreEntry(rs.getString("blocker_uuid"), rs.getString("blocked_uuid"),
                         rs.getLong("expires_at"), rs.getLong("created_at")));
-    }
-
-    // ------------------------------------------------------------------ outbox (events waiting for the sync bus)
-
-    public long addOutboxEvent(String payload) throws SQLException {
-        try (Connection c = provider.acquire();
-             PreparedStatement ps = c.prepareStatement("INSERT INTO %soutbox (payload) VALUES (?)".formatted(prefix),
-                     Statement.RETURN_GENERATED_KEYS)) {
-            ps.setString(1, payload);
-            ps.executeUpdate();
-            try (ResultSet keys = ps.getGeneratedKeys()) {
-                return keys.next() ? keys.getLong(1) : -1L;
-            }
-        }
-    }
-
-    public List<OutboxRow> takeOutboxEvents(int max) throws SQLException {
-        return queryList("SELECT seq, payload FROM %soutbox ORDER BY seq LIMIT %d"
-                        .formatted(prefix, Math.max(1, max)),
-                rs -> new OutboxRow(rs.getLong("seq"), rs.getString("payload")));
-    }
-
-    public void deleteOutboxEvents(List<Long> seqs) throws SQLException {
-        if (seqs.isEmpty()) {
-            return;
-        }
-        try (Connection c = provider.acquire();
-             PreparedStatement ps = c.prepareStatement("DELETE FROM %soutbox WHERE seq = ?".formatted(prefix))) {
-            for (Long seq : seqs) {
-                ps.setLong(1, seq);
-                ps.addBatch();
-            }
-            ps.executeBatch();
-        }
     }
 
     // ------------------------------------------------------------------ plumbing
