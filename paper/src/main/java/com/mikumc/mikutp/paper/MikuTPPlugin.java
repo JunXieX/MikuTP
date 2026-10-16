@@ -110,7 +110,8 @@ public final class MikuTPPlugin extends JavaPlugin {
                     + "请在 config.yml 与代理端 MikuTP 配置里设置完全相同的 token。");
         }
 
-        dialogs = new DialogFactory(tasks, messages, () -> config.dialogs.listPageSize);
+        dialogs = new DialogFactory(tasks, messages, () -> config.dialogs.listPageSize,
+                () -> config.tpa.blockDurationMinutes);
         chats = new ChatMenus(messages);
         requestService.setShowRequestHandler(this::showRequest);
         network.setEventHandler(coordinator::onEvent);

@@ -39,8 +39,6 @@ public final class VelocitySyncBus implements SyncBus {
     private final String token;
     private final OnlinePlayers onlinePlayers;
     private final ConcurrentLinkedDeque<com.google.gson.JsonObject> outbound = new ConcurrentLinkedDeque<>();
-    private volatile Consumer<SyncEvent> applier = event -> {
-    };
     private volatile boolean running;
     private ScheduledTask flushTask;
 
@@ -51,9 +49,13 @@ public final class VelocitySyncBus implements SyncBus {
         this.onlinePlayers = onlinePlayers;
     }
 
+    /**
+     * Starts the flush loop. Incoming events never travel through this class:
+     * the proxy answers on the plugin channel and {@link NetworkService} hands
+     * them straight to the coordinator, so the applier argument is unused.
+     */
     @Override
     public void start(Consumer<SyncEvent> applier) {
-        this.applier = applier;
         running = true;
         flushTask = tasks.asyncRepeat(this::flush, FLUSH_INTERVAL_MS, FLUSH_INTERVAL_MS, TimeUnit.MILLISECONDS);
     }

@@ -5,56 +5,13 @@ public final class TpRequest {
 
     public enum Type {
         /** Target is asked to accept the requester travelling to them. */
-        GO(0),
+        GO,
         /** Target is asked to accept travelling to the requester. */
-        COME(1);
-
-        private final int id;
-
-        Type(int id) {
-            this.id = id;
-        }
-
-        public int id() {
-            return id;
-        }
-
-        public static Type byId(int id) {
-            for (Type t : values()) {
-                if (t.id == id) {
-                    return t;
-                }
-            }
-            return GO;
-        }
+        COME
     }
 
     public enum Status {
-        PENDING(0),
-        ACCEPTED(1),
-        DENIED(2),
-        BLOCKED(3),
-        EXPIRED(4),
-        COMPLETED(5);
-
-        private final int id;
-
-        Status(int id) {
-            this.id = id;
-        }
-
-        public int id() {
-            return id;
-        }
-
-        public static Status byId(int id) {
-            for (Status s : values()) {
-                if (s.id == id) {
-                    return s;
-                }
-            }
-            return PENDING;
-        }
+        PENDING, ACCEPTED, DENIED, BLOCKED, EXPIRED, COMPLETED
     }
 
     public String id;

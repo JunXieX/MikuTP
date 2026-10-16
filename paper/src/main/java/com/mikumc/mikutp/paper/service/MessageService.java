@@ -50,10 +50,6 @@ public final class MessageService {
         parsedTemplates.clear();
     }
 
-    public String template(String key) {
-        return bundle.raw(key);
-    }
-
     /** Renders a message key with {@code key, value, key, value...} placeholders. */
     public Component render(CommandSender sender, String key, String... pairs) {
         String template = bundle.raw(key);

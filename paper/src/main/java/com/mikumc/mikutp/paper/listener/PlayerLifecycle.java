@@ -50,7 +50,7 @@ public final class PlayerLifecycle implements Listener {
         profiles.onJoin(player);
         homeService.onJoin(player);
         coordinator.onPlayerJoin();
-        requestService.deliverMailboxBuffer(player);
+        requestService.redeliverPending(player);
         teleports.applyPending(id);
     }
 

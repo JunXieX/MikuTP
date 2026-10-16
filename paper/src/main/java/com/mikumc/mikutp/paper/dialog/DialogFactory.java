@@ -36,11 +36,14 @@ public final class DialogFactory {
     private final Tasks tasks;
     private final MessageService messages;
     private final java.util.function.IntSupplier pageSize;
+    private final java.util.function.IntSupplier blockDurationMinutes;
 
-    public DialogFactory(Tasks tasks, MessageService messages, java.util.function.IntSupplier pageSize) {
+    public DialogFactory(Tasks tasks, MessageService messages, java.util.function.IntSupplier pageSize,
+                         java.util.function.IntSupplier blockDurationMinutes) {
         this.tasks = tasks;
         this.messages = messages;
         this.pageSize = () -> Math.max(4, pageSize.getAsInt());
+        this.blockDurationMinutes = blockDurationMinutes;
     }
 
     // ------------------------------------------------------------------ tpa
@@ -80,7 +83,8 @@ public final class DialogFactory {
                         () -> tasks.entity(target, () -> requestService.respond(target, request.id, RequestService.Response.ACCEPT))),
                 actionButton(messages.render(target, "dialog.request.deny"), 300,
                         () -> tasks.entity(target, () -> requestService.respond(target, request.id, RequestService.Response.DENY))),
-                actionButton(messages.render(target, "dialog.request.block"), 300,
+                actionButton(messages.render(target, "dialog.request.block",
+                                "minutes", String.valueOf(blockDurationMinutes.getAsInt())), 300,
                         () -> tasks.entity(target, () -> requestService.respond(target, request.id, RequestService.Response.BLOCK))));
         Dialog dialog = Dialog.create(b -> b.empty()
                 .base(DialogBase.builder(title)

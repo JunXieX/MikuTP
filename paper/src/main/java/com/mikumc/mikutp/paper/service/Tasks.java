@@ -38,10 +38,6 @@ public final class Tasks {
         player.getScheduler().run(plugin, task -> run.run(), null);
     }
 
-    public void entityDelayed(Player player, Runnable run, long delayTicks) {
-        player.getScheduler().runDelayed(plugin, task -> run.run(), null, delayTicks);
-    }
-
     /** Runs once per tick on the player's region thread until the consumer cancels it. */
     public ScheduledTask entityRepeat(Player player, Consumer<ScheduledTask> run, long initialDelayTicks, long periodTicks) {
         return player.getScheduler().runAtFixedRate(plugin, run, null, initialDelayTicks, periodTicks);
@@ -69,9 +65,5 @@ public final class Tasks {
      * list) may be touched on Folia. */
     public void global(Runnable run) {
         Bukkit.getGlobalRegionScheduler().run(plugin, task -> run.run());
-    }
-
-    public Plugin plugin() {
-        return plugin;
     }
 }

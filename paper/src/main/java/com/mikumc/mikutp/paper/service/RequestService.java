@@ -74,9 +74,6 @@ public final class RequestService {
     private final BoundedIdSet answeredRequests = new BoundedIdSet();
     private final BoundedIdSet deliveredEvents = new BoundedIdSet();
     private final BoundedIdSet handledEvents = new BoundedIdSet();
-    /** Mailbox payloads pushed by the proxy for a joining player. */
-    private final Map<UUID, List<TpRequest>> mailboxArrivals = new ConcurrentHashMap<>();
-    private volatile long lastDump = 0;
     private ScheduledTask sweepTask;
 
     public RequestService(JavaPlugin plugin, Tasks tasks, MikuTPConfig config, Database database,
@@ -113,11 +110,12 @@ public final class RequestService {
 
     public void onQuit(UUID player) {
         lastIncoming.remove(player);
-        mailboxArrivals.remove(player);
-        // Only this player's own bookkeeping is dropped. Their pending incoming
-        // requests must survive: the proxy redelivers them from the mailbox on
-        // rejoin, and the requester's outgoing entry is what lets a later
-        // TP_CANCEL purge that copy.
+        // Drop only this player's own bookkeeping. The requester-side entries
+        // must be left alone: a target logging off does not end the request, and
+        // wiping the requester's outgoing entry here would break the later
+        // TP_CANCEL that purges the target's mailbox copy. The quitting player's
+        // incoming requests are safe to drop locally because the proxy mailbox
+        // redelivers them on rejoin.
         incoming.remove(player);
         outgoingRequests.remove(player);
     }
@@ -523,30 +521,25 @@ public final class RequestService {
         }
     }
 
-    /** Buffers mailbox payloads the proxy pushed for a joining player. */
-    public void bufferMailbox(UUID targetId, List<TpRequest> requests) {
-        if (requests.isEmpty()) {
-            return;
-        }
-        mailboxArrivals.computeIfAbsent(targetId, k -> new ArrayList<>()).addAll(requests);
-    }
-
-    /** Applies buffered mailbox requests on join. */
-    public void deliverMailboxBuffer(Player player) {
-        List<TpRequest> requests = mailboxArrivals.remove(player.getUniqueId());
-        if (requests == null || requests.isEmpty()) {
+    /**
+     * Re-renders the player's still-pending incoming requests on join. The
+     * proxy's mailbox can push a request before the backend's join handler has
+     * registered the player, in which case it is tracked but never displayed;
+     * this is what actually surfaces it.
+     */
+    public void redeliverPending(Player player) {
+        Map<String, TpRequest> mine = incoming.get(player.getUniqueId());
+        if (mine == null || mine.isEmpty()) {
             return;
         }
         long now = System.currentTimeMillis();
-        for (TpRequest request : requests) {
+        for (TpRequest request : new ArrayList<>(mine.values())) {
             if (request.status != TpRequest.Status.PENDING
                     || answeredRequests.contains(request.id)
                     || request.createdAt + config.tpa.requestExpirySeconds * 1000L < now) {
                 continue;
             }
-            if (trackIncoming(request)) {
-                showToTarget(request);
-            }
+            showToTarget(request);
         }
     }
 
