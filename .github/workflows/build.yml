@@ -6,8 +6,9 @@ on:
     tags: [ 'v*' ]
   workflow_dispatch:
 
+# Least privilege by default: only the release job needs to write.
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   build:
@@ -21,6 +22,17 @@ jobs:
       - uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '9.8.0'
+      - name: Verify versions agree
+        run: |
+          # 版本号有两处声明：根 build.gradle.kts 与 Velocity 插件注解。
+          # 二者必须一致，否则代理端显示的版本会与实际发布版本脱节。
+          GRADLE_VER="$(grep -oP 'version\s*=\s*"\K[^"]+' build.gradle.kts | head -1)"
+          PROXY_VER="$(grep -oP 'String VERSION\s*=\s*"\K[^"]+' velocity/src/main/java/com/mikumc/mikutp/velocity/MikuTPVelocity.java | head -1)"
+          echo "gradle=$GRADLE_VER proxy=$PROXY_VER"
+          if [ "$GRADLE_VER" != "$PROXY_VER" ]; then
+            echo "::error::版本号不一致：build.gradle.kts=$GRADLE_VER, MikuTPVelocity.VERSION=$PROXY_VER"
+            exit 1
+          fi
       - run: gradle build --no-daemon
       - uses: actions/upload-artifact@v4
         with:
@@ -29,8 +41,20 @@ jobs:
             paper/build/libs/*.jar
             velocity/build/libs/*.jar
           if-no-files-found: error
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: jar-${{ github.sha }}
+          path: dist
       - name: Resolve release info
-        if: startsWith(github.ref, 'refs/tags/')
         id: rel
         run: |
           VER="${GITHUB_REF_NAME#v}"
@@ -41,13 +65,16 @@ jobs:
             0) echo "prerelease=false" >> "$GITHUB_OUTPUT" ;;
             *) echo "prerelease=true"  >> "$GITHUB_OUTPUT" ;;
           esac
+          # 更新日志取自被打标签的提交正文（发版提交即日志），保留原有换行。
+          git log -1 --format=%B > release-body.md
+          if [ ! -s release-body.md ]; then
+            echo "该版本未提供更新日志，请检查发版提交的正文。" > release-body.md
+          fi
       - name: Publish Release
-        if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v3
         with:
           name: ${{ steps.rel.outputs.title }}
           files: |
-            paper/build/libs/*.jar
-            velocity/build/libs/*.jar
+            dist/**/*.jar
           prerelease: ${{ steps.rel.outputs.prerelease }}
-          generate_release_notes: true
+          body_path: release-body.md

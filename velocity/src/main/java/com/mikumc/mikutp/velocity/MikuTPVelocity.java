@@ -57,10 +57,16 @@ import java.util.concurrent.ConcurrentHashMap;
  * {@code plugins/mikutp/config.properties}; without a token the hub refuses
  * backend traffic so a modified client can never drive it.
  */
-@Plugin(id = "mikutp", name = "MikuTP", version = "1.4.0",
+@Plugin(id = "mikutp", name = "MikuTP", version = MikuTPVelocity.VERSION,
         description = "Cross-server teleport hub for MikuTP backends. MikuMC original plugin by JunXieX, group 1105054380.",
         authors = {"JunXieX"})
 public final class MikuTPVelocity {
+
+    /**
+     * Must equal the Gradle {@code version} in the root build script; the CI
+     * "Verify versions agree" step fails the build when the two drift apart.
+     */
+    public static final String VERSION = "1.5.0";
 
     private static final MinecraftChannelIdentifier CHANNEL =
             MinecraftChannelIdentifier.create("mikumc", "mikutp");
@@ -103,7 +109,25 @@ public final class MikuTPVelocity {
     public void onInit(ProxyInitializeEvent event) {
         loadConfig();
         server.getChannelRegistrar().register(CHANNEL);
+        // Expired mailboxes and handoffs are normally drained on the player's
+        // next join; a player who never returns would otherwise leave their
+        // entries in memory forever.
+        server.getScheduler().buildTask(this, this::sweepExpired)
+                .repeat(60, java.util.concurrent.TimeUnit.SECONDS).schedule();
         logger.info("MikuTP hub ready on channel {}", CHANNEL.getId());
+    }
+
+    /** Drops expired entries so long-lived proxies do not accumulate state. */
+    private void sweepExpired() {
+        long now = System.currentTimeMillis();
+        pendingEntries.entrySet().removeIf(entry -> entry.getValue().expiry() <= now);
+        mailboxes.entrySet().removeIf(entry -> {
+            List<MailboxEntry> mailbox = entry.getValue();
+            synchronized (mailbox) {
+                mailbox.removeIf(m -> m.expiry() <= now);
+                return mailbox.isEmpty();
+            }
+        });
     }
 
     /** Reads (and creates a documented template for) {@code plugins/mikutp/config.properties}. */
