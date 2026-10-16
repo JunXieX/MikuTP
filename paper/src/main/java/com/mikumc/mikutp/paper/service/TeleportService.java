@@ -35,13 +35,15 @@ public final class TeleportService {
     private final ProfileService profiles;
     private final CooldownManager cooldowns;
     private final SyncBus syncBus;
+    private final OnlinePlayers onlinePlayers;
     /** Pending teleports pushed by the proxy, applied on the player's join. */
     private final java.util.Map<UUID, PendingTeleport> arriving = new java.util.concurrent.ConcurrentHashMap<>();
     private final String serverId;
 
     public TeleportService(JavaPlugin plugin, Tasks tasks, MikuTPConfig config, Database database,
                            MessageService messages, Effects effects, WarmupManager warmups, NetworkService network,
-                           ProfileService profiles, CooldownManager cooldowns, SyncBus syncBus) {
+                           ProfileService profiles, CooldownManager cooldowns, SyncBus syncBus,
+                           OnlinePlayers onlinePlayers) {
         this.plugin = plugin;
         this.tasks = tasks;
         this.config = config;
@@ -53,6 +55,7 @@ public final class TeleportService {
         this.profiles = profiles;
         this.cooldowns = cooldowns;
         this.syncBus = syncBus;
+        this.onlinePlayers = onlinePlayers;
         this.serverId = config.crossServer.serverId;
     }
 
@@ -116,6 +119,12 @@ public final class TeleportService {
         if (player.isOnline()) {
             tasks.entity(player, () -> applyPending(id));
         }
+    }
+
+    /** Drops any buffered handoff for a departing player so the map cannot grow
+     * when a player disconnects between delivery and application. */
+    public void forgetArrival(UUID player) {
+        arriving.remove(player);
     }
 
     /** A buffered handoff is only useful while it is fresh. */
@@ -328,13 +337,15 @@ public final class TeleportService {
             }
             tasks.async(() -> {
                 try {
-                    // The arrival server resolves the target's live position via the anchor.
+                    // The admin travels: their handoff carries the target's uuid as
+                    // the anchor, and the connect request must move the admin, not
+                    // the target (moving the wrong side would bring the target over).
                     PendingTeleport pending = new PendingTeleport(admin.getUniqueId().toString(),
                             new Position(null, "", 0, 0, 0, 0f, 0f), PendingTeleport.Source.ADMIN,
                             System.currentTimeMillis(), record.uuid().toString());
                     syncBus.pendingStore(admin.getUniqueId(), pending, PENDING_TTL_SECONDS);
                     tasks.entity(admin, () -> network.connectAnchor(admin,
-                            record.uuid().toString(), admin.getUniqueId().toString()));
+                            admin.getUniqueId().toString(), record.uuid().toString()));
                 } catch (Exception e) {
                     plugin.getSLF4JLogger().warn("Admin goto dispatch failed", e);
                     messages.send(admin, "common.teleport-failed");
@@ -381,8 +392,10 @@ public final class TeleportService {
                 messages.send(admin, "common.cross-disabled");
                 return;
             }
+            // Reads the plugin's own registry: the online-player view may only be
+            // iterated on the global region thread on Folia.
             int count = 0;
-            for (Player victim : Bukkit.getOnlinePlayers()) {
+            for (Player victim : onlinePlayers.snapshot()) {
                 if (victim.getUniqueId().equals(admin.getUniqueId())) {
                     continue;
                 }

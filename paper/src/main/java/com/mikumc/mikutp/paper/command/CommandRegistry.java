@@ -6,6 +6,7 @@ import com.mikumc.mikutp.paper.dialog.DialogFactory;
 import com.mikumc.mikutp.paper.service.CooldownManager;
 import com.mikumc.mikutp.paper.service.HomeService;
 import com.mikumc.mikutp.paper.service.MessageService;
+import com.mikumc.mikutp.paper.service.OnlinePlayers;
 import com.mikumc.mikutp.paper.service.RequestService;
 import com.mikumc.mikutp.paper.service.TeleportService;
 import com.mikumc.mikutp.paper.service.WarpService;
@@ -16,7 +17,6 @@ import com.mojang.brigadier.tree.LiteralCommandNode;
 import io.papermc.paper.command.brigadier.CommandSourceStack;
 import io.papermc.paper.command.brigadier.Commands;
 import io.papermc.paper.plugin.lifecycle.event.types.LifecycleEvents;
-import org.bukkit.Bukkit;
 import org.bukkit.command.CommandSender;
 import org.bukkit.entity.Player;
 import org.bukkit.plugin.java.JavaPlugin;
@@ -43,6 +43,7 @@ public final class CommandRegistry {
     private final TeleportService teleports;
     private final DialogFactory dialogs;
     private final ChatMenus chats;
+    private final OnlinePlayers onlinePlayers;
     private final Runnable reloadAction;
     private final Runnable resyncAction;
     private final java.util.function.Supplier<String> infoSupplier;
@@ -52,7 +53,8 @@ public final class CommandRegistry {
     public CommandRegistry(JavaPlugin plugin, MessageService messages, CooldownManager cooldowns,
                            HomeService homeService, WarpService warpService, RequestService requestService,
                            WildService wildService, TeleportService teleports, DialogFactory dialogs,
-                           ChatMenus chats, Runnable reloadAction, Runnable resyncAction,
+                           ChatMenus chats, OnlinePlayers onlinePlayers,
+                           Runnable reloadAction, Runnable resyncAction,
                            java.util.function.Supplier<String> infoSupplier,
                            java.util.function.BooleanSupplier dialogsEnabledSupplier,
                            MikuTPConfig config) {
@@ -66,6 +68,7 @@ public final class CommandRegistry {
         this.teleports = teleports;
         this.dialogs = dialogs;
         this.chats = chats;
+        this.onlinePlayers = onlinePlayers;
         this.reloadAction = reloadAction;
         this.resyncAction = resyncAction;
         this.infoSupplier = infoSupplier;
@@ -239,7 +242,7 @@ public final class CommandRegistry {
                     }
                 },
                 (player, name) -> requestService.send(player, name, false),
-                player -> Bukkit.getOnlinePlayers().stream().map(Player::getName).toList());
+                player -> onlinePlayerNames());
     }
 
     private LiteralCommandNode<CommandSourceStack> tpahere() {
@@ -252,7 +255,7 @@ public final class CommandRegistry {
                     }
                 },
                 (player, name) -> requestService.send(player, name, true),
-                player -> Bukkit.getOnlinePlayers().stream().map(Player::getName).toList());
+                player -> onlinePlayerNames());
     }
 
     private LiteralCommandNode<CommandSourceStack> tpaccept() {
@@ -378,11 +381,17 @@ public final class CommandRegistry {
 
     private com.mojang.brigadier.suggestion.SuggestionProvider<CommandSourceStack> onlinePlayerSuggestions() {
         return (ctx, builder) -> {
-            for (Player online : Bukkit.getOnlinePlayers()) {
+            for (Player online : onlinePlayers.snapshot()) {
                 builder.suggest(online.getName());
             }
             return builder.buildFuture();
         };
+    }
+
+    /** Online names from the plugin registry: the Bukkit player view may only be
+     * iterated on the global region thread under Folia. */
+    private List<String> onlinePlayerNames() {
+        return onlinePlayers.snapshot().stream().map(Player::getName).toList();
     }
 
     private LiteralCommandNode<CommandSourceStack> historyCommand(String name, String permission,

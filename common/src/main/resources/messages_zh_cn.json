@@ -91,7 +91,7 @@
   "dialog.request.body-come": "对方邀请你前往 TA 身边。接受后你将被传送过去。",
   "dialog.request.accept": "✔ 接受",
   "dialog.request.deny": "✘ 拒绝",
-  "dialog.request.block": "屏蔽 10 分钟",
+  "dialog.request.block": "屏蔽 <minutes> 分钟",
   "dialog.list.title-homes": "你的家",
   "dialog.list.title-warps": "服务器地标",
   "dialog.list.title-delhome": "选择要删除的家",

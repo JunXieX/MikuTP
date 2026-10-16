@@ -18,6 +18,7 @@ import com.mikumc.mikutp.paper.service.Effects;
 import com.mikumc.mikutp.paper.service.HomeService;
 import com.mikumc.mikutp.paper.service.MessageService;
 import com.mikumc.mikutp.paper.service.NetworkService;
+import com.mikumc.mikutp.paper.service.OnlinePlayers;
 import com.mikumc.mikutp.paper.service.ProfileService;
 import com.mikumc.mikutp.paper.service.RequestService;
 import com.mikumc.mikutp.paper.service.StorageFactory;
@@ -48,6 +49,7 @@ public final class MikuTPPlugin extends JavaPlugin {
     private Database database;
     private Tasks tasks;
     private SyncBus syncBus;
+    private OnlinePlayers onlinePlayers;
     private NetworkService network;
     private ProfileService profiles;
     private TeleportService teleports;
@@ -87,14 +89,15 @@ public final class MikuTPPlugin extends JavaPlugin {
         tasks = new Tasks(this);
         effects = new Effects(config.teleport.sounds);
         cooldowns = new CooldownManager(this::cooldownSeconds);
+        onlinePlayers = new OnlinePlayers();
         syncBus = config.sync.enabled()
-                ? new VelocitySyncBus(this, tasks, config.sync.token)
+                ? new VelocitySyncBus(this, tasks, config.sync.token, onlinePlayers)
                 : new LoopbackSyncBus();
         network = new NetworkService(this, tasks, messages, config);
         profiles = new ProfileService(this, tasks, database, syncBus, config.crossServer.serverId);
         teleports = new TeleportService(this, tasks, config, database, messages, effects,
                 new WarmupManager(tasks, messages, effects, () -> config.teleport.warmupSeconds),
-                network, profiles, cooldowns, syncBus);
+                network, profiles, cooldowns, syncBus, onlinePlayers);
         homeService = new HomeService(this, tasks, config, database, messages, cooldowns, teleports, syncBus);
         warpService = new WarpService(this, tasks, config, database, messages, cooldowns, teleports);
         requestService = new RequestService(this, tasks, config, database, messages, effects, cooldowns,
@@ -108,7 +111,8 @@ public final class MikuTPPlugin extends JavaPlugin {
                     + "请在 config.yml 与代理端 MikuTP 配置里设置完全相同的 token。");
         }
 
-        dialogs = new DialogFactory(tasks, messages, () -> config.dialogs.listPageSize);
+        dialogs = new DialogFactory(tasks, messages, () -> config.dialogs.listPageSize,
+                () -> config.tpa.blockDurationMinutes);
         chats = new ChatMenus(messages);
         requestService.setShowRequestHandler(this::showRequest);
         network.setEventHandler(coordinator::onEvent);
@@ -118,13 +122,21 @@ public final class MikuTPPlugin extends JavaPlugin {
         coordinator.start();
 
         new CommandRegistry(this, messages, cooldowns, homeService, warpService, requestService,
-                wildService, teleports, dialogs, chats, this::reloadAll, coordinator::resync,
+                wildService, teleports, dialogs, chats, onlinePlayers, this::reloadAll, coordinator::resync,
                 this::infoLine, () -> config.dialogs.enabled, config).register();
 
         getServer().getPluginManager().registerEvents(
-                new PlayerLifecycle(profiles, homeService, requestService, teleports, cooldowns, coordinator), this);
+                new PlayerLifecycle(profiles, homeService, requestService, teleports, cooldowns, coordinator,
+                        onlinePlayers), this);
         getServer().getPluginManager().registerEvents(
                 new WarmupGuard(teleports.warmups(), config), this);
+        // A /reload or late enable finds players already online; seed the registry
+        // from the global region thread, which is allowed to read the player view.
+        tasks.global(() -> {
+            for (Player player : Bukkit.getOnlinePlayers()) {
+                onlinePlayers.add(player);
+            }
+        });
 
         if (papiAvailable) {
             expansion = new MikuTPExpansion(this, homeService, warpService, profiles, cooldowns,

@@ -38,13 +38,19 @@ public final class Tasks {
         player.getScheduler().run(plugin, task -> run.run(), null);
     }
 
-    public void entityDelayed(Player player, Runnable run, long delayTicks) {
-        player.getScheduler().runDelayed(plugin, task -> run.run(), null, delayTicks);
-    }
-
     /** Runs once per tick on the player's region thread until the consumer cancels it. */
     public ScheduledTask entityRepeat(Player player, Consumer<ScheduledTask> run, long initialDelayTicks, long periodTicks) {
         return player.getScheduler().runAtFixedRate(plugin, run, null, initialDelayTicks, periodTicks);
+    }
+
+    /**
+     * Like {@link #entityRepeat}, but {@code retired} runs when the entity is
+     * removed before the task could fire, so callers can clean up their own
+     * bookkeeping. Returns null when the scheduler is already retired.
+     */
+    public ScheduledTask entityRepeat(Player player, Consumer<ScheduledTask> run, Runnable retired,
+                                      long initialDelayTicks, long periodTicks) {
+        return player.getScheduler().runAtFixedRate(plugin, run, retired, initialDelayTicks, periodTicks);
     }
 
     public void region(Location location, Runnable run) {
@@ -55,7 +61,9 @@ public final class Tasks {
         Bukkit.getRegionScheduler().run(plugin, world, chunkX, chunkZ, task -> run.run());
     }
 
-    public Plugin plugin() {
-        return plugin;
+    /** Runs on the global region thread: the one place global state (the player
+     * list) may be touched on Folia. */
+    public void global(Runnable run) {
+        Bukkit.getGlobalRegionScheduler().run(plugin, task -> run.run());
     }
 }

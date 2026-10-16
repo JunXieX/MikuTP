@@ -57,15 +57,24 @@ import java.util.concurrent.ConcurrentHashMap;
  * {@code plugins/mikutp/config.properties}; without a token the hub refuses
  * backend traffic so a modified client can never drive it.
  */
-@Plugin(id = "mikutp", name = "MikuTP", version = "1.4.0",
+@Plugin(id = "mikutp", name = "MikuTP", version = MikuTPVelocity.VERSION,
         description = "Cross-server teleport hub for MikuTP backends. MikuMC original plugin by JunXieX, group 1105054380.",
         authors = {"JunXieX"})
 public final class MikuTPVelocity {
+
+    /**
+     * Must equal the Gradle {@code version} in the root build script; the CI
+     * "Verify versions agree" step fails the build when the two drift apart.
+     */
+    public static final String VERSION = "1.5.0";
 
     private static final MinecraftChannelIdentifier CHANNEL =
             MinecraftChannelIdentifier.create("mikumc", "mikutp");
     private static final Gson GSON = new Gson();
     private static final int MAX_EVENTS_PER_BATCH = 64;
+    /** Cap per-server backlog: a server that stays empty must not grow the queue
+     * without bound. Older events are shed — the activation resync re-converges. */
+    private static final int MAX_QUEUED_EVENTS = 4096;
     private static final long MAILBOX_TTL_MS = 120_000;
     private static final long PENDING_TTL_MS = 300_000;
     private static final String CONFIG_FILE = "config.properties";
@@ -79,7 +88,7 @@ public final class MikuTPVelocity {
     /** Request mailboxes for offline players, delivered on their next join. */
     private final Map<UUID, List<MailboxEntry>> mailboxes = new ConcurrentHashMap<>();
     /** Events queued for servers that currently have no players. */
-    private final Map<String, List<String>> outbound = new ConcurrentHashMap<>();
+    private final Map<String, java.util.ArrayDeque<String>> outbound = new ConcurrentHashMap<>();
     private volatile String token = "";
     private volatile boolean warnedRejected = false;
 
@@ -100,7 +109,25 @@ public final class MikuTPVelocity {
     public void onInit(ProxyInitializeEvent event) {
         loadConfig();
         server.getChannelRegistrar().register(CHANNEL);
+        // Expired mailboxes and handoffs are normally drained on the player's
+        // next join; a player who never returns would otherwise leave their
+        // entries in memory forever.
+        server.getScheduler().buildTask(this, this::sweepExpired)
+                .repeat(60, java.util.concurrent.TimeUnit.SECONDS).schedule();
         logger.info("MikuTP hub ready on channel {}", CHANNEL.getId());
+    }
+
+    /** Drops expired entries so long-lived proxies do not accumulate state. */
+    private void sweepExpired() {
+        long now = System.currentTimeMillis();
+        pendingEntries.entrySet().removeIf(entry -> entry.getValue().expiry() <= now);
+        mailboxes.entrySet().removeIf(entry -> {
+            List<MailboxEntry> mailbox = entry.getValue();
+            synchronized (mailbox) {
+                mailbox.removeIf(m -> m.expiry() <= now);
+                return mailbox.isEmpty();
+            }
+        });
     }
 
     /** Reads (and creates a documented template for) {@code plugins/mikutp/config.properties}. */
@@ -296,16 +323,19 @@ public final class MikuTPVelocity {
 
     private void enqueue(RegisteredServer target, SyncEvent event) {
         String name = target.getServerInfo().getName();
-        List<String> queue = outbound.computeIfAbsent(name, n -> new ArrayList<>());
+        java.util.ArrayDeque<String> queue = outbound.computeIfAbsent(name, n -> new java.util.ArrayDeque<>());
         synchronized (queue) {
-            queue.add(GSON.toJson(event));
+            queue.addLast(GSON.toJson(event));
+            while (queue.size() > MAX_QUEUED_EVENTS) {
+                queue.pollFirst();
+            }
         }
         tryFlush(target);
     }
 
     private void tryFlush(RegisteredServer target) {
         String name = target.getServerInfo().getName();
-        List<String> queue = outbound.get(name);
+        java.util.ArrayDeque<String> queue = outbound.get(name);
         if (queue == null || queue.isEmpty()) {
             return;
         }
@@ -323,11 +353,11 @@ public final class MikuTPVelocity {
         }
     }
 
-    private List<SyncEvent> takeBatch(List<String> queue) {
+    private List<SyncEvent> takeBatch(java.util.ArrayDeque<String> queue) {
         List<SyncEvent> batch = new ArrayList<>();
         synchronized (queue) {
             while (!queue.isEmpty() && batch.size() < MAX_EVENTS_PER_BATCH) {
-                String json = queue.remove(0);
+                String json = queue.pollFirst();
                 try {
                     SyncEvent event = GSON.fromJson(json, SyncEvent.class);
                     if (event != null && event.type != null) {
@@ -366,20 +396,14 @@ public final class MikuTPVelocity {
 
     /** Flushes the events queued for a server that just became non-empty. */
     private void flushServerQueues(String serverName, ServerConnection connection) {
-        List<String> queue = outbound.remove(serverName);
-        if (queue == null || queue.isEmpty()) {
+        // Never remove the queue from the map: enqueue may already hold a
+        // reference to this list, and detaching it would orphan that event.
+        // Queues are therefore permanent and bounded by the server count.
+        java.util.ArrayDeque<String> queue = outbound.get(serverName);
+        if (queue == null) {
             return;
         }
-        List<SyncEvent> batch = new ArrayList<>();
-        for (String json : queue) {
-            try {
-                SyncEvent event = GSON.fromJson(json, SyncEvent.class);
-                if (event != null && event.type != null) {
-                    batch.add(event);
-                }
-            } catch (Exception ignored) {
-            }
-        }
+        List<SyncEvent> batch = takeBatch(queue);
         if (!batch.isEmpty()) {
             sendEvents(connection, batch);
         }

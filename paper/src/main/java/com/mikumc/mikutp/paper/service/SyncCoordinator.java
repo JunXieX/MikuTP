@@ -88,7 +88,9 @@ public final class SyncCoordinator {
 
     /** Called on join: the first player after a quiet period triggers a resync. */
     public void onPlayerJoin() {
-        if (syncBus.crossServer() && activePlayers.incrementAndGet() == 1) {
+        // Increment unconditionally so the counter stays symmetric with
+        // onPlayerQuit; only the resync itself depends on cross-server mode.
+        if (activePlayers.incrementAndGet() == 1 && syncBus.crossServer()) {
             publishResync();
         }
     }

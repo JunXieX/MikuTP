@@ -6,7 +6,6 @@ import com.mikumc.mikutp.common.net.ProxyMessages;
 import com.mikumc.mikutp.common.sync.SyncBus;
 import com.mikumc.mikutp.common.sync.SyncEvent;
 import io.papermc.paper.threadedregions.scheduler.ScheduledTask;
-import org.bukkit.Bukkit;
 import org.bukkit.entity.Player;
 import org.bukkit.plugin.java.JavaPlugin;
 
@@ -38,21 +37,28 @@ public final class VelocitySyncBus implements SyncBus {
     private final JavaPlugin plugin;
     private final Tasks tasks;
     private final String token;
+    private final OnlinePlayers onlinePlayers;
     private final ConcurrentLinkedDeque<com.google.gson.JsonObject> outbound = new ConcurrentLinkedDeque<>();
-    private volatile Consumer<SyncEvent> applier = event -> {
-    };
+    /** Mirrors {@code outbound.size()}: ConcurrentLinkedDeque#size() is O(n) and
+     * this runs on every publish, so the depth check must not traverse the queue. */
+    private final java.util.concurrent.atomic.AtomicInteger queuedOps = new java.util.concurrent.atomic.AtomicInteger();
     private volatile boolean running;
     private ScheduledTask flushTask;
 
-    public VelocitySyncBus(JavaPlugin plugin, Tasks tasks, String token) {
+    public VelocitySyncBus(JavaPlugin plugin, Tasks tasks, String token, OnlinePlayers onlinePlayers) {
         this.plugin = plugin;
         this.tasks = tasks;
         this.token = token;
+        this.onlinePlayers = onlinePlayers;
     }
 
+    /**
+     * Starts the flush loop. Incoming events never travel through this class:
+     * the proxy answers on the plugin channel and {@link NetworkService} hands
+     * them straight to the coordinator, so the applier argument is unused.
+     */
     @Override
     public void start(Consumer<SyncEvent> applier) {
-        this.applier = applier;
         running = true;
         flushTask = tasks.asyncRepeat(this::flush, FLUSH_INTERVAL_MS, FLUSH_INTERVAL_MS, TimeUnit.MILLISECONDS);
     }
@@ -85,10 +91,17 @@ public final class VelocitySyncBus implements SyncBus {
 
     // ------------------------------------------------------------------ internals
 
+    /** Bounded by MAX_QUEUED_BATCHES*MAX_OPS_PER_BATCH ops; the oldest are shed
+     * when the queue is full (the activation resync re-converges state). */
+    private static final int MAX_QUEUED_OPS = MAX_QUEUED_BATCHES * MAX_OPS_PER_BATCH;
+
     private void enqueue(com.google.gson.JsonObject op) {
         outbound.addLast(op);
-        while (outbound.size() > MAX_QUEUED_BATCHES * MAX_OPS_PER_BATCH) {
-            outbound.pollFirst();
+        int depth = queuedOps.incrementAndGet();
+        // Over budget: shed the oldest ops. The activation resync re-converges
+        // state, so a dropped event is not a permanent divergence.
+        while (depth > MAX_QUEUED_OPS && outbound.pollFirst() != null) {
+            depth = queuedOps.decrementAndGet();
         }
     }
 
@@ -103,6 +116,7 @@ public final class VelocitySyncBus implements SyncBus {
             if (op == null) {
                 break;
             }
+            queuedOps.decrementAndGet();
             ops.add(op);
         }
         if (ops.isEmpty()) {
@@ -113,13 +127,16 @@ public final class VelocitySyncBus implements SyncBus {
     }
 
     /** Picks any online player as the carrier; without one the ops go back to
-     * the front of the queue and ride along with the next activation resync. */
+     * the front of the queue and ride along with the next activation resync.
+     * The lookup uses the plugin's own registry: this runs on the async flush
+     * thread, where Folia does not allow iterating Bukkit's player view. */
     private void send(String batchJson, List<com.google.gson.JsonObject> ops) {
-        Player carrier = pickCarrier();
+        Player carrier = onlinePlayers.any();
         if (carrier == null) {
             for (int i = ops.size() - 1; i >= 0; i--) {
                 outbound.addFirst(ops.get(i));
             }
+            queuedOps.addAndGet(ops.size());
             return;
         }
         tasks.entity(carrier, () -> {
@@ -128,12 +145,5 @@ public final class VelocitySyncBus implements SyncBus {
                         batchJson.getBytes(java.nio.charset.StandardCharsets.UTF_8));
             }
         });
-    }
-
-    private static Player pickCarrier() {
-        for (Player player : Bukkit.getOnlinePlayers()) {
-            return player;
-        }
-        return null;
     }
 }
