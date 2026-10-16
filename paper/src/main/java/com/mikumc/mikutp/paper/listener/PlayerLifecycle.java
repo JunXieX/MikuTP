@@ -2,6 +2,7 @@ package com.mikumc.mikutp.paper.listener;
 
 import com.mikumc.mikutp.paper.service.CooldownManager;
 import com.mikumc.mikutp.paper.service.HomeService;
+import com.mikumc.mikutp.paper.service.OnlinePlayers;
 import com.mikumc.mikutp.paper.service.ProfileService;
 import com.mikumc.mikutp.paper.service.RequestService;
 import com.mikumc.mikutp.paper.service.SyncCoordinator;
@@ -25,22 +26,26 @@ public final class PlayerLifecycle implements Listener {
     private final TeleportService teleports;
     private final CooldownManager cooldowns;
     private final SyncCoordinator coordinator;
+    private final OnlinePlayers onlinePlayers;
 
     public PlayerLifecycle(ProfileService profiles, HomeService homeService,
                            RequestService requestService, TeleportService teleports,
-                           CooldownManager cooldowns, SyncCoordinator coordinator) {
+                           CooldownManager cooldowns, SyncCoordinator coordinator,
+                           OnlinePlayers onlinePlayers) {
         this.profiles = profiles;
         this.homeService = homeService;
         this.requestService = requestService;
         this.teleports = teleports;
         this.cooldowns = cooldowns;
         this.coordinator = coordinator;
+        this.onlinePlayers = onlinePlayers;
     }
 
     @EventHandler(priority = EventPriority.MONITOR)
     public void onJoin(PlayerJoinEvent event) {
         Player player = event.getPlayer();
         UUID id = player.getUniqueId();
+        onlinePlayers.add(player);
         cooldowns.setBypass(id, player.hasPermission("mikutp.bypass.cooldown"));
         profiles.onJoin(player);
         homeService.onJoin(player);
@@ -51,13 +56,18 @@ public final class PlayerLifecycle implements Listener {
 
     @EventHandler(priority = EventPriority.MONITOR)
     public void onQuit(PlayerQuitEvent event) {
-        UUID id = event.getPlayer().getUniqueId();
-        teleports.recordLogout(event.getPlayer());
+        Player player = event.getPlayer();
+        UUID id = player.getUniqueId();
+        // Capture the logout position while the entity is still valid; the
+        // PlayerQuitEvent MONITOR stage is the last point where that holds.
+        teleports.recordLogout(player);
+        onlinePlayers.remove(id);
         profiles.onQuit(id);
         homeService.onQuit(id);
         requestService.onQuit(id);
         coordinator.onPlayerQuit();
         teleports.warmups().drop(id);
+        teleports.forgetArrival(id);
         cooldowns.clear(id);
     }
 

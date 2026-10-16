@@ -44,15 +44,16 @@ public final class WarmupManager {
             onComplete.run();
             return;
         }
-        drop(player.getUniqueId());
+        UUID id = player.getUniqueId();
+        drop(id);
         Active a = new Active();
-        active.put(player.getUniqueId(), a);
+        active.put(id, a);
         long finishAt = System.currentTimeMillis() + seconds * 1000L;
         a.task = tasks.entityRepeat(player, task -> {
             long remaining = finishAt - System.currentTimeMillis();
             if (remaining <= 0) {
                 task.cancel();
-                if (active.remove(player.getUniqueId()) != null) {
+                if (active.remove(id, a)) {
                     onComplete.run();
                 }
                 return;
@@ -60,7 +61,12 @@ public final class WarmupManager {
             long left = (remaining + 999) / 1000;
             messages.actionBar(player, "common.warmup.countdown", "seconds", String.valueOf(left));
             effects.warmupTick(player);
-        }, 1L, 20L);
+        }, () -> active.remove(id, a), 1L, 20L);
+        // The scheduler is retired only when the entity was already gone: the
+        // countdown can never run, so its entry must not linger in the map.
+        if (a.task == null) {
+            active.remove(id, a);
+        }
     }
 
     /** Cancels a pending teleport and tells the player why. */

@@ -114,34 +114,38 @@ public final class HomeService {
         // Names are identifiers: store and match them lowercase so `Base` and
         // `base` can never diverge between cache and database.
         String wanted = name.toLowerCase(java.util.Locale.ROOT);
-        int maxHomes = limit(player);
-        Location loc = player.getLocation().clone();
         UUID id = player.getUniqueId();
-        tasks.async(() -> {
-            synchronized (lockFor(id)) {
-                try {
-                    List<Home> current = new ArrayList<>(homes(id));
-                    boolean exists = current.stream().anyMatch(h -> h.name.equalsIgnoreCase(wanted));
-                    if (!exists && current.size() >= maxHomes) {
-                        messages.send(player, "home.limit-reached", "limit", String.valueOf(maxHomes));
-                        return;
-                    }
-                    // Pre-lowercase rows from older versions: remove case variants first.
-                    for (Home existing : current) {
-                        if (!existing.name.equals(wanted) && existing.name.equalsIgnoreCase(wanted)) {
-                            database.deleteHome(id.toString(), existing.name);
+        // Both the position and the permission-derived limit are per-entity state:
+        // read them on the player's own thread, never on the command thread.
+        tasks.entity(player, () -> {
+            int maxHomes = limit(player);
+            Location loc = player.getLocation().clone();
+            tasks.async(() -> {
+                synchronized (lockFor(id)) {
+                    try {
+                        List<Home> current = new ArrayList<>(homes(id));
+                        boolean exists = current.stream().anyMatch(h -> h.name.equalsIgnoreCase(wanted));
+                        if (!exists && current.size() >= maxHomes) {
+                            messages.send(player, "home.limit-reached", "limit", String.valueOf(maxHomes));
+                            return;
                         }
+                        // Pre-lowercase rows from older versions: remove case variants first.
+                        for (Home existing : current) {
+                            if (!existing.name.equals(wanted) && existing.name.equalsIgnoreCase(wanted)) {
+                                database.deleteHome(id.toString(), existing.name);
+                            }
+                        }
+                        Home home = new Home(id.toString(), wanted, positionOf(loc), System.currentTimeMillis());
+                        database.saveHome(home);
+                        cache.put(id, sort(replace(current, home)));
+                        messages.send(player, "home.set", "name", wanted);
+                        publishHomeSet(home);
+                    } catch (Exception e) {
+                        plugin.getSLF4JLogger().warn("Failed to save home", e);
+                        messages.send(player, "common.teleport-failed");
                     }
-                    Home home = new Home(id.toString(), wanted, positionOf(loc), System.currentTimeMillis());
-                    database.saveHome(home);
-                    cache.put(id, sort(replace(current, home)));
-                    messages.send(player, "home.set", "name", wanted);
-                    publishHomeSet(home);
-                } catch (Exception e) {
-                    plugin.getSLF4JLogger().warn("Failed to save home", e);
-                    messages.send(player, "common.teleport-failed");
                 }
-            }
+            });
         });
     }
 

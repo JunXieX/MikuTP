@@ -68,25 +68,28 @@ public final class WarpService {
         }
         // Lowercase, like homes: identifiers must never diverge on case.
         String wanted = name.toLowerCase(java.util.Locale.ROOT);
-        Location loc = player.getLocation().clone();
-        tasks.async(() -> {
-            synchronized (mutationLock) {
-                try {
-                    for (Warp existing : warps) {
-                        if (!existing.name.equals(wanted) && existing.name.equalsIgnoreCase(wanted)) {
-                            database.deleteWarp(existing.name);
+        // The position is entity state: capture it on the player's own thread.
+        tasks.entity(player, () -> {
+            Location loc = player.getLocation().clone();
+            tasks.async(() -> {
+                synchronized (mutationLock) {
+                    try {
+                        for (Warp existing : warps) {
+                            if (!existing.name.equals(wanted) && existing.name.equalsIgnoreCase(wanted)) {
+                                database.deleteWarp(existing.name);
+                            }
                         }
+                        Position position = new Position(serverId, loc.getWorld() == null ? "world" : loc.getWorld().getName(),
+                                loc.getX(), loc.getY(), loc.getZ(), loc.getYaw(), loc.getPitch());
+                        Warp warp = new Warp(wanted, position, System.currentTimeMillis());
+                        database.saveWarp(warp);
+                        warps = sorted(replace(warps, warp));
+                        messages.send(player, "warp.set", "name", wanted);
+                    } catch (Exception e) {
+                        plugin.getSLF4JLogger().warn("Failed to save warp", e);
                     }
-                    Position position = new Position(serverId, loc.getWorld() == null ? "world" : loc.getWorld().getName(),
-                            loc.getX(), loc.getY(), loc.getZ(), loc.getYaw(), loc.getPitch());
-                    Warp warp = new Warp(wanted, position, System.currentTimeMillis());
-                    database.saveWarp(warp);
-                    warps = sorted(replace(warps, warp));
-                    messages.send(player, "warp.set", "name", wanted);
-                } catch (Exception e) {
-                    plugin.getSLF4JLogger().warn("Failed to save warp", e);
                 }
-            }
+            });
         });
     }
 

@@ -6,7 +6,6 @@ import com.mikumc.mikutp.common.net.ProxyMessages;
 import com.mikumc.mikutp.common.sync.SyncBus;
 import com.mikumc.mikutp.common.sync.SyncEvent;
 import io.papermc.paper.threadedregions.scheduler.ScheduledTask;
-import org.bukkit.Bukkit;
 import org.bukkit.entity.Player;
 import org.bukkit.plugin.java.JavaPlugin;
 
@@ -38,16 +37,18 @@ public final class VelocitySyncBus implements SyncBus {
     private final JavaPlugin plugin;
     private final Tasks tasks;
     private final String token;
+    private final OnlinePlayers onlinePlayers;
     private final ConcurrentLinkedDeque<com.google.gson.JsonObject> outbound = new ConcurrentLinkedDeque<>();
     private volatile Consumer<SyncEvent> applier = event -> {
     };
     private volatile boolean running;
     private ScheduledTask flushTask;
 
-    public VelocitySyncBus(JavaPlugin plugin, Tasks tasks, String token) {
+    public VelocitySyncBus(JavaPlugin plugin, Tasks tasks, String token, OnlinePlayers onlinePlayers) {
         this.plugin = plugin;
         this.tasks = tasks;
         this.token = token;
+        this.onlinePlayers = onlinePlayers;
     }
 
     @Override
@@ -113,9 +114,11 @@ public final class VelocitySyncBus implements SyncBus {
     }
 
     /** Picks any online player as the carrier; without one the ops go back to
-     * the front of the queue and ride along with the next activation resync. */
+     * the front of the queue and ride along with the next activation resync.
+     * The lookup uses the plugin's own registry: this runs on the async flush
+     * thread, where Folia does not allow iterating Bukkit's player view. */
     private void send(String batchJson, List<com.google.gson.JsonObject> ops) {
-        Player carrier = pickCarrier();
+        Player carrier = onlinePlayers.any();
         if (carrier == null) {
             for (int i = ops.size() - 1; i >= 0; i--) {
                 outbound.addFirst(ops.get(i));
@@ -128,12 +131,5 @@ public final class VelocitySyncBus implements SyncBus {
                         batchJson.getBytes(java.nio.charset.StandardCharsets.UTF_8));
             }
         });
-    }
-
-    private static Player pickCarrier() {
-        for (Player player : Bukkit.getOnlinePlayers()) {
-            return player;
-        }
-        return null;
     }
 }
