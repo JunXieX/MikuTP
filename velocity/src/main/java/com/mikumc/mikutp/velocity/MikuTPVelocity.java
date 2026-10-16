@@ -375,7 +375,7 @@ public final class MikuTPVelocity {
         // Never remove the queue from the map: enqueue may already hold a
         // reference to this list, and detaching it would orphan that event.
         // Queues are therefore permanent and bounded by the server count.
-        List<String> queue = outbound.get(serverName);
+        java.util.ArrayDeque<String> queue = outbound.get(serverName);
         if (queue == null) {
             return;
         }
