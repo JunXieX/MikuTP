@@ -242,7 +242,7 @@ public final class CommandRegistry {
                     }
                 },
                 (player, name) -> requestService.send(player, name, false),
-                player -> onlinePlayerNames()));
+                player -> onlinePlayerNames());
     }
 
     private LiteralCommandNode<CommandSourceStack> tpahere() {
@@ -255,7 +255,7 @@ public final class CommandRegistry {
                     }
                 },
                 (player, name) -> requestService.send(player, name, true),
-                player -> onlinePlayerNames()));
+                player -> onlinePlayerNames());
     }
 
     private LiteralCommandNode<CommandSourceStack> tpaccept() {
