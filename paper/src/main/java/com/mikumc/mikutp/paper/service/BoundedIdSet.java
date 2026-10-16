@@ -25,13 +25,10 @@ final class BoundedIdSet {
 
     boolean add(String id) {
         synchronized (order) {
-            if (seen.contains(id)) {
+            if (order.putIfAbsent(id, Boolean.TRUE) != null) {
                 return false;
             }
-            Boolean previous = order.put(id, Boolean.TRUE);
-            if (previous == null) {
-                seen.add(id);
-            }
+            seen.add(id);
             while (order.size() > MAX_SIZE) {
                 String oldest = order.keySet().iterator().next();
                 order.remove(oldest);

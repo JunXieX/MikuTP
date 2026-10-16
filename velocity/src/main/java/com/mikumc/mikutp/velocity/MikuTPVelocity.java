@@ -66,6 +66,9 @@ public final class MikuTPVelocity {
             MinecraftChannelIdentifier.create("mikumc", "mikutp");
     private static final Gson GSON = new Gson();
     private static final int MAX_EVENTS_PER_BATCH = 64;
+    /** Cap per-server backlog: a server that stays empty must not grow the queue
+     * without bound. Older events are shed — the activation resync re-converges. */
+    private static final int MAX_QUEUED_EVENTS = 4096;
     private static final long MAILBOX_TTL_MS = 120_000;
     private static final long PENDING_TTL_MS = 300_000;
     private static final String CONFIG_FILE = "config.properties";
@@ -79,7 +82,7 @@ public final class MikuTPVelocity {
     /** Request mailboxes for offline players, delivered on their next join. */
     private final Map<UUID, List<MailboxEntry>> mailboxes = new ConcurrentHashMap<>();
     /** Events queued for servers that currently have no players. */
-    private final Map<String, List<String>> outbound = new ConcurrentHashMap<>();
+    private final Map<String, java.util.ArrayDeque<String>> outbound = new ConcurrentHashMap<>();
     private volatile String token = "";
     private volatile boolean warnedRejected = false;
 
@@ -296,16 +299,19 @@ public final class MikuTPVelocity {
 
     private void enqueue(RegisteredServer target, SyncEvent event) {
         String name = target.getServerInfo().getName();
-        List<String> queue = outbound.computeIfAbsent(name, n -> new ArrayList<>());
+        java.util.ArrayDeque<String> queue = outbound.computeIfAbsent(name, n -> new java.util.ArrayDeque<>());
         synchronized (queue) {
-            queue.add(GSON.toJson(event));
+            queue.addLast(GSON.toJson(event));
+            while (queue.size() > MAX_QUEUED_EVENTS) {
+                queue.pollFirst();
+            }
         }
         tryFlush(target);
     }
 
     private void tryFlush(RegisteredServer target) {
         String name = target.getServerInfo().getName();
-        List<String> queue = outbound.get(name);
+        java.util.ArrayDeque<String> queue = outbound.get(name);
         if (queue == null || queue.isEmpty()) {
             return;
         }
@@ -323,11 +329,11 @@ public final class MikuTPVelocity {
         }
     }
 
-    private List<SyncEvent> takeBatch(List<String> queue) {
+    private List<SyncEvent> takeBatch(java.util.ArrayDeque<String> queue) {
         List<SyncEvent> batch = new ArrayList<>();
         synchronized (queue) {
             while (!queue.isEmpty() && batch.size() < MAX_EVENTS_PER_BATCH) {
-                String json = queue.remove(0);
+                String json = queue.pollFirst();
                 try {
                     SyncEvent event = GSON.fromJson(json, SyncEvent.class);
                     if (event != null && event.type != null) {

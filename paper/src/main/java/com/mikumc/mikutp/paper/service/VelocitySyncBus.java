@@ -39,6 +39,9 @@ public final class VelocitySyncBus implements SyncBus {
     private final String token;
     private final OnlinePlayers onlinePlayers;
     private final ConcurrentLinkedDeque<com.google.gson.JsonObject> outbound = new ConcurrentLinkedDeque<>();
+    /** Mirrors {@code outbound.size()}: ConcurrentLinkedDeque#size() is O(n) and
+     * this runs on every publish, so the depth check must not traverse the queue. */
+    private final java.util.concurrent.atomic.AtomicInteger queuedOps = new java.util.concurrent.atomic.AtomicInteger();
     private volatile boolean running;
     private ScheduledTask flushTask;
 
@@ -88,10 +91,17 @@ public final class VelocitySyncBus implements SyncBus {
 
     // ------------------------------------------------------------------ internals
 
+    /** Bounded by MAX_QUEUED_BATCHES*MAX_OPS_PER_BATCH ops; the oldest are shed
+     * when the queue is full (the activation resync re-converges state). */
+    private static final int MAX_QUEUED_OPS = MAX_QUEUED_BATCHES * MAX_OPS_PER_BATCH;
+
     private void enqueue(com.google.gson.JsonObject op) {
         outbound.addLast(op);
-        while (outbound.size() > MAX_QUEUED_BATCHES * MAX_OPS_PER_BATCH) {
-            outbound.pollFirst();
+        int depth = queuedOps.incrementAndGet();
+        // Over budget: shed the oldest ops. The activation resync re-converges
+        // state, so a dropped event is not a permanent divergence.
+        while (depth > MAX_QUEUED_OPS && outbound.pollFirst() != null) {
+            depth = queuedOps.decrementAndGet();
         }
     }
 
@@ -106,6 +116,7 @@ public final class VelocitySyncBus implements SyncBus {
             if (op == null) {
                 break;
             }
+            queuedOps.decrementAndGet();
             ops.add(op);
         }
         if (ops.isEmpty()) {
@@ -125,6 +136,7 @@ public final class VelocitySyncBus implements SyncBus {
             for (int i = ops.size() - 1; i >= 0; i--) {
                 outbound.addFirst(ops.get(i));
             }
+            queuedOps.addAndGet(ops.size());
             return;
         }
         tasks.entity(carrier, () -> {
