@@ -18,6 +18,7 @@ import com.mikumc.mikutp.paper.service.Effects;
 import com.mikumc.mikutp.paper.service.HomeService;
 import com.mikumc.mikutp.paper.service.MessageService;
 import com.mikumc.mikutp.paper.service.NetworkService;
+import com.mikumc.mikutp.paper.service.OnlinePlayers;
 import com.mikumc.mikutp.paper.service.ProfileService;
 import com.mikumc.mikutp.paper.service.RequestService;
 import com.mikumc.mikutp.paper.service.StorageFactory;
