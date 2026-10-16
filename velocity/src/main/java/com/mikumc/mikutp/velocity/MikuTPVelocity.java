@@ -366,20 +366,14 @@ public final class MikuTPVelocity {
 
     /** Flushes the events queued for a server that just became non-empty. */
     private void flushServerQueues(String serverName, ServerConnection connection) {
-        List<String> queue = outbound.remove(serverName);
-        if (queue == null || queue.isEmpty()) {
+        // Never remove the queue from the map: enqueue may already hold a
+        // reference to this list, and detaching it would orphan that event.
+        // Queues are therefore permanent and bounded by the server count.
+        List<String> queue = outbound.get(serverName);
+        if (queue == null) {
             return;
         }
-        List<SyncEvent> batch = new ArrayList<>();
-        for (String json : queue) {
-            try {
-                SyncEvent event = GSON.fromJson(json, SyncEvent.class);
-                if (event != null && event.type != null) {
-                    batch.add(event);
-                }
-            } catch (Exception ignored) {
-            }
-        }
+        List<SyncEvent> batch = takeBatch(queue);
         if (!batch.isEmpty()) {
             sendEvents(connection, batch);
         }

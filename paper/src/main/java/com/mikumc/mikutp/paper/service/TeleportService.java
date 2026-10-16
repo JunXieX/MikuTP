@@ -337,13 +337,15 @@ public final class TeleportService {
             }
             tasks.async(() -> {
                 try {
-                    // The arrival server resolves the target's live position via the anchor.
+                    // The admin travels: their handoff carries the target's uuid as
+                    // the anchor, and the connect request must move the admin, not
+                    // the target (moving the wrong side would bring the target over).
                     PendingTeleport pending = new PendingTeleport(admin.getUniqueId().toString(),
                             new Position(null, "", 0, 0, 0, 0f, 0f), PendingTeleport.Source.ADMIN,
                             System.currentTimeMillis(), record.uuid().toString());
                     syncBus.pendingStore(admin.getUniqueId(), pending, PENDING_TTL_SECONDS);
                     tasks.entity(admin, () -> network.connectAnchor(admin,
-                            record.uuid().toString(), admin.getUniqueId().toString()));
+                            admin.getUniqueId().toString(), record.uuid().toString()));
                 } catch (Exception e) {
                     plugin.getSLF4JLogger().warn("Admin goto dispatch failed", e);
                     messages.send(admin, "common.teleport-failed");

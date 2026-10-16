@@ -71,9 +71,9 @@ public final class RequestService {
     private final Map<UUID, TpRequest> outgoingRequests = new ConcurrentHashMap<>();
     private final Map<UUID, String> lastIncoming = new ConcurrentHashMap<>();
     /** Request ids that were already answered; replayed TP_NEW events must not re-open them. */
-    private final java.util.Set<String> answeredRequests = ConcurrentHashMap.newKeySet();
-    private final java.util.Set<String> deliveredEvents = ConcurrentHashMap.newKeySet();
-    private final java.util.Set<String> handledEvents = ConcurrentHashMap.newKeySet();
+    private final BoundedIdSet answeredRequests = new BoundedIdSet();
+    private final BoundedIdSet deliveredEvents = new BoundedIdSet();
+    private final BoundedIdSet handledEvents = new BoundedIdSet();
     /** Mailbox payloads pushed by the proxy for a joining player. */
     private final Map<UUID, List<TpRequest>> mailboxArrivals = new ConcurrentHashMap<>();
     private volatile long lastDump = 0;
@@ -114,12 +114,11 @@ public final class RequestService {
     public void onQuit(UUID player) {
         lastIncoming.remove(player);
         mailboxArrivals.remove(player);
-        Map<String, TpRequest> mine = incoming.remove(player);
-        if (mine != null) {
-            for (TpRequest request : mine.values()) {
-                outgoingRequests.remove(UUID.fromString(request.requesterUuid));
-            }
-        }
+        // Only this player's own bookkeeping is dropped. Their pending incoming
+        // requests must survive: the proxy redelivers them from the mailbox on
+        // rejoin, and the requester's outgoing entry is what lets a later
+        // TP_CANCEL purge that copy.
+        incoming.remove(player);
         outgoingRequests.remove(player);
     }
 
@@ -214,11 +213,15 @@ public final class RequestService {
         if (revoked == null) {
             return;
         }
-        answeredRequests.add(revoked.id);
-        prune(answeredRequests);
+        markAnswered(revoked.id);
         SyncEvent event = SyncEvent.create(SyncEvent.Type.TP_CANCEL, serverId);
         event.request = revoked;
         syncBus.publish(event);
+    }
+
+    /** Records a request id as final so a replayed TP_NEW cannot re-open it. */
+    private void markAnswered(String requestId) {
+        answeredRequests.add(requestId);
     }
 
     /** The requester's previous outgoing request is being replaced. */
@@ -246,6 +249,10 @@ public final class RequestService {
                 messages.send(target, "tpa.no-pending");
                 return;
             }
+            // Once answered, the request must never be re-delivered: the proxy can
+            // replay TP_NEW (mailbox redelivery, fan-out retry) to a backend that
+            // missed it the first time.
+            markAnswered(request.id);
             outgoingRequests.remove(UUID.fromString(request.requesterUuid));
             respondCommon(target, request, response);
         });
@@ -481,6 +488,11 @@ public final class RequestService {
             if (found.isEmpty()) {
                 continue;
             }
+            // Mark them final: a mailbox redelivery of the revoked TP_NEW must not
+            // re-open a request the requester already withdrew.
+            for (TpRequest request : found) {
+                markAnswered(request.id);
+            }
             Player target = Bukkit.getPlayer(entry.getKey());
             if (target == null) {
                 continue;
@@ -497,7 +509,6 @@ public final class RequestService {
         if (request == null || request.targetUuid == null) {
             return;
         }
-        prune(deliveredEvents);
         if (!deliveredEvents.add(event.id)) {
             return;
         }
@@ -570,7 +581,6 @@ public final class RequestService {
         if (request == null) {
             return;
         }
-        prune(handledEvents);
         if (!handledEvents.add(event.id)) {
             return;
         }
@@ -621,7 +631,6 @@ public final class RequestService {
         if (request == null) {
             return;
         }
-        prune(handledEvents);
         if (!handledEvents.add(event.id)) {
             return;
         }
@@ -667,10 +676,13 @@ public final class RequestService {
         long now = System.currentTimeMillis();
         long expiryMs = config.tpa.requestExpirySeconds * 1000L;
         for (Map.Entry<UUID, Map<String, TpRequest>> entry : incoming.entrySet()) {
-            entry.getValue().values().removeIf(request -> {
+            UUID targetId = entry.getKey();
+            Map<String, TpRequest> mine = entry.getValue();
+            mine.values().removeIf(request -> {
                 if (request.createdAt + expiryMs >= now) {
                     return false;
                 }
+                markAnswered(request.id);
                 outgoingRequests.remove(UUID.fromString(request.requesterUuid));
                 Player requester = Bukkit.getPlayer(UUID.fromString(request.requesterUuid));
                 if (requester != null) {
@@ -678,12 +690,17 @@ public final class RequestService {
                             "player", request.targetName));
                 }
                 // Close the dialog the target left open.
-                Player target = Bukkit.getPlayer(entry.getKey());
+                Player target = Bukkit.getPlayer(targetId);
                 if (target != null) {
                     tasks.entity(target, target::closeDialog);
                 }
                 return true;
             });
+            // An empty inner map is dead weight: every expired request would
+            // otherwise leave one entry behind per target forever.
+            if (mine.isEmpty()) {
+                incoming.remove(targetId, mine);
+            }
         }
     }
 
@@ -692,12 +709,6 @@ public final class RequestService {
             return database.isIgnored(blocker.toString(), blocked.toString(), System.currentTimeMillis());
         } catch (Exception e) {
             return false;
-        }
-    }
-
-    private static void prune(java.util.Set<String> set) {
-        if (set.size() > 512) {
-            set.clear();
         }
     }
 }
