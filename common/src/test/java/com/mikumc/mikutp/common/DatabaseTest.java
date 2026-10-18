@@ -26,7 +26,10 @@ class DatabaseTest {
 
         PooledSqlite() {
             com.zaxxer.hikari.HikariConfig config = new com.zaxxer.hikari.HikariConfig();
-            config.setJdbcUrl("jdbc:sqlite::memory:");
+            // A bare ":memory:" gives every connection its own private database,
+            // so a pooled test would silently run against an empty schema. The
+            // shared-cache URI keeps all connections on one in-memory database.
+            config.setJdbcUrl("jdbc:sqlite:file:mikutp-test?mode=memory&cache=shared");
             config.setMaximumPoolSize(1);
             this.dataSource = new com.zaxxer.hikari.HikariDataSource(config);
         }
