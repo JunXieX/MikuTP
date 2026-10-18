@@ -138,6 +138,12 @@ public final class WildService {
                     .exceptionally(ex -> {
                         // Chunk load failed (world unloaded mid-search, etc.): count it
                         // as a spent attempt and carry on.
+                        if (!player.isOnline()) {
+                            // The search is pointless once the player left; stop the
+                            // retry chain instead of spinning until attempts run out.
+                            cooldowns.clear(player.getUniqueId(), CooldownManager.Kind.WILD);
+                            return null;
+                        }
                         if (attempts.decrementAndGet() > 0) {
                             tasks.asyncDelayed(() -> attempt(player, world, centerX, centerZ,
                                     minRadius, maxRadius, attempts), 100);
@@ -161,6 +167,9 @@ public final class WildService {
     private void evaluate(Player player, World world, int x, int z,
                           double centerX, double centerZ, long minRadius, long maxRadius, AtomicInteger attempts) {
         if (!player.isOnline()) {
+            // Abandon the search and refund the cooldown: the player cannot use
+            // it, and leaving it burning would punish them on their next login.
+            cooldowns.clear(player.getUniqueId(), CooldownManager.Kind.WILD);
             return;
         }
         int y = world.getHighestBlockYAt(x, z);

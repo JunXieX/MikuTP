@@ -59,12 +59,12 @@ public final class WarpService {
     private void reload(boolean force) {
         tasks.async(() -> {
             try {
-                List<Warp> loadedWarps = sorted(database.listWarps(serverId));
                 synchronized (mutationLock) {
-                    // A /setwarp that won the race already wrote a newer list;
-                    // publishing the older snapshot would silently drop it.
+                    // Read inside the lock: a /setwarp that commits between the
+                    // query and this assignment would otherwise be overwritten by
+                    // the older snapshot the query already captured.
                     if (force || !loaded) {
-                        warps = loadedWarps;
+                        warps = sorted(database.listWarps(serverId));
                         loaded = true;
                     }
                 }

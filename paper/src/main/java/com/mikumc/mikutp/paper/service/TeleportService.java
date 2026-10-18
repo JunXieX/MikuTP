@@ -575,11 +575,16 @@ public final class TeleportService {
                                      PendingTeleport.Source source, Runnable onSuccess) {
         Player owner = Bukkit.getPlayer(positionOwner);
         if (owner == null) {
+            // The anchor left before the position could be captured. The caller
+            // uses onSuccess to announce the acceptance, so still run it: silence
+            // here would leave the requester waiting for an answer that never comes.
+            runQuietly(onSuccess);
             return;
         }
         tasks.entity(owner, () -> {
             Player stable = Bukkit.getPlayer(positionOwner);
             if (stable == null) {
+                runQuietly(onSuccess);
                 return;
             }
             Position here = positionOf(stable.getLocation());
@@ -588,14 +593,25 @@ public final class TeleportService {
                     PendingTeleport pending = new PendingTeleport(playerToTeleport.toString(), here,
                             source, System.currentTimeMillis(), positionOwner.toString());
                     syncBus.pendingStore(playerToTeleport, pending, PENDING_TTL_SECONDS);
-                    if (onSuccess != null) {
-                        onSuccess.run();
-                    }
+                    runQuietly(onSuccess);
                 } catch (Exception e) {
                     plugin.getSLF4JLogger().warn("Failed to stash cross-server destination", e);
+                    runQuietly(onSuccess);
                 }
             });
         });
+    }
+
+    /** Runs a callback, containing any failure so it cannot break the caller. */
+    private void runQuietly(Runnable action) {
+        if (action == null) {
+            return;
+        }
+        try {
+            action.run();
+        } catch (Exception e) {
+            plugin.getSLF4JLogger().warn("Teleport callback failed", e);
+        }
     }
 
     private static UUID parseUuid(String value) {

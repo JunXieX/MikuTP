@@ -68,7 +68,7 @@ public final class HomeService {
         loadAsync(id);
     }
 
-    /** Reads the player's homes and publishes them unless a path already did. */
+    /** Reads the player's homes and publishes them unless a mutation already did. */
     private void loadAsync(UUID id) {
         tasks.async(() -> {
             try {
@@ -79,10 +79,16 @@ public final class HomeService {
                 if (onlinePlayers.byId(id) == null) {
                     return;
                 }
-                // A mutation that raced this load already wrote a complete list
-                // into the cache; keep that one and mark it loaded.
-                cache.putIfAbsent(id, loaded);
-                loadedPlayers.add(id);
+                synchronized (lockFor(id)) {
+                    // Take the lock the mutation paths use: without it a /sethome
+                    // that committed after this read started could be overwritten
+                    // by this older snapshot.
+                    if (loadedPlayers.contains(id)) {
+                        return;
+                    }
+                    cache.put(id, loaded);
+                    loadedPlayers.add(id);
+                }
             } catch (Exception e) {
                 plugin.getSLF4JLogger().warn("Failed to load homes", e);
             }
