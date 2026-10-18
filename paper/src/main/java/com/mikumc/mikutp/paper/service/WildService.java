@@ -40,16 +40,23 @@ public final class WildService {
     private final MessageService messages;
     private final CooldownManager cooldowns;
     private final TeleportService teleports;
+    private final OnlinePlayers onlinePlayers;
     private final Map<String, java.util.Optional<Tag<Biome>>> tagCache = new ConcurrentHashMap<>();
 
     public WildService(JavaPlugin plugin, Tasks tasks, MikuTPConfig config, MessageService messages,
-                       CooldownManager cooldowns, TeleportService teleports) {
+                       CooldownManager cooldowns, TeleportService teleports, OnlinePlayers onlinePlayers) {
         this.plugin = plugin;
         this.tasks = tasks;
         this.config = config;
         this.messages = messages;
         this.cooldowns = cooldowns;
         this.teleports = teleports;
+        this.onlinePlayers = onlinePlayers;
+    }
+
+    /** Online check that does not touch entity state from a foreign thread. */
+    private boolean online(Player player) {
+        return onlinePlayers.byId(player.getUniqueId()) != null;
     }
 
     public void start(Player player) {
@@ -124,7 +131,7 @@ public final class WildService {
     private void attempt(Player player, World world, double centerX, double centerZ,
                          long minRadius, long maxRadius, AtomicInteger attempts) {
         tasks.async(() -> {
-            if (!player.isOnline()) {
+            if (!online(player)) {
                 return;
             }
             ThreadLocalRandom random = ThreadLocalRandom.current();
@@ -140,7 +147,7 @@ public final class WildService {
                     .exceptionally(ex -> {
                         // Chunk load failed (world unloaded mid-search, etc.): count it
                         // as a spent attempt and carry on.
-                        if (!player.isOnline()) {
+                        if (!online(player)) {
                             // The search is pointless once the player left; stop the
                             // retry chain instead of spinning until attempts run out.
                             cooldowns.clear(player.getUniqueId(), CooldownManager.Kind.WILD);
@@ -168,7 +175,7 @@ public final class WildService {
     /** Runs on the region thread that owns the candidate chunk. */
     private void evaluate(Player player, World world, int x, int z,
                           double centerX, double centerZ, long minRadius, long maxRadius, AtomicInteger attempts) {
-        if (!player.isOnline()) {
+        if (!online(player)) {
             // Abandon the search and refund the cooldown: the player cannot use
             // it, and leaving it burning would punish them on their next login.
             cooldowns.clear(player.getUniqueId(), CooldownManager.Kind.WILD);

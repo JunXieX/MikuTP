@@ -371,7 +371,7 @@ public final class RequestService {
                     String label = request.type == TpRequest.Type.GO
                             ? request.targetName : request.requesterName;
                     messages.send(requester, "tpa.accepted-requester", "player", request.targetName);
-                    if (mover.isOnline()) {
+                    if (onlinePlayers.byId(mover.getUniqueId()) != null) {
                         teleports.sendLocalTo(mover, anchor, label, true);
                     }
                 }

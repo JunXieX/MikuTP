@@ -103,7 +103,7 @@ public final class MikuTPPlugin extends JavaPlugin {
         warpService = new WarpService(this, tasks, config, database, messages, cooldowns, teleports);
         requestService = new RequestService(this, tasks, config, database, messages, effects, cooldowns,
                 teleports, profiles, network, syncBus, onlinePlayers);
-        wildService = new WildService(this, tasks, config, messages, cooldowns, teleports);
+        wildService = new WildService(this, tasks, config, messages, cooldowns, teleports, onlinePlayers);
         coordinator = new SyncCoordinator(this, tasks, config, database, syncBus,
                 homeService, profiles, teleports, requestService);
 

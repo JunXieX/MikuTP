@@ -123,7 +123,9 @@ public final class TeleportService {
         arriving.put(id, pending);
         // The proxy can deliver this after PlayerJoinEvent already ran; applying
         // right away keeps the handoff from waiting for the player's next login.
-        if (player.isOnline()) {
+        // The online check goes through the registry: this runs on the plugin
+        // message thread, not the player's region thread.
+        if (onlinePlayers.byId(id) != null) {
             tasks.entity(player, () -> applyPending(id));
         }
     }
