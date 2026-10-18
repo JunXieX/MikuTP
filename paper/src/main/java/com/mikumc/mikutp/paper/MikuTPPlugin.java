@@ -94,14 +94,15 @@ public final class MikuTPPlugin extends JavaPlugin {
                 ? new VelocitySyncBus(this, tasks, config.sync.token, onlinePlayers)
                 : new LoopbackSyncBus();
         network = new NetworkService(this, tasks, messages, config);
-        profiles = new ProfileService(this, tasks, database, syncBus, config.crossServer.serverId);
+        profiles = new ProfileService(this, tasks, database, syncBus, onlinePlayers, config.crossServer.serverId);
         teleports = new TeleportService(this, tasks, config, database, messages, effects,
                 new WarmupManager(tasks, messages, effects, () -> config.teleport.warmupSeconds),
                 network, profiles, cooldowns, syncBus, onlinePlayers);
-        homeService = new HomeService(this, tasks, config, database, messages, cooldowns, teleports, syncBus);
+        homeService = new HomeService(this, tasks, config, database, messages, cooldowns, teleports,
+                syncBus, onlinePlayers);
         warpService = new WarpService(this, tasks, config, database, messages, cooldowns, teleports);
         requestService = new RequestService(this, tasks, config, database, messages, effects, cooldowns,
-                teleports, profiles, network, syncBus);
+                teleports, profiles, network, syncBus, onlinePlayers);
         wildService = new WildService(this, tasks, config, messages, cooldowns, teleports);
         coordinator = new SyncCoordinator(this, tasks, config, database, syncBus,
                 homeService, profiles, teleports, requestService);

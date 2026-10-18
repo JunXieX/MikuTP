@@ -30,8 +30,11 @@ public final class HomeService {
     private final CooldownManager cooldowns;
     private final TeleportService teleports;
     private final SyncBus syncBus;
+    private final OnlinePlayers onlinePlayers;
     private final String serverId;
     private final Map<UUID, List<Home>> cache = new ConcurrentHashMap<>();
+    /** Players whose cache entry came from a full database read. */
+    private final java.util.Set<UUID> loadedPlayers = java.util.concurrent.ConcurrentHashMap.newKeySet();
     /** Home limits captured on the join thread; PlaceholderAPI reads these off-thread. */
     private final Map<UUID, Integer> limitCache = new ConcurrentHashMap<>();
     /** Striped monitors: two /sethome in flight must not both pass the limit check. */
@@ -39,7 +42,7 @@ public final class HomeService {
 
     public HomeService(JavaPlugin plugin, Tasks tasks, MikuTPConfig config, Database database,
                        MessageService messages, CooldownManager cooldowns, TeleportService teleports,
-                       SyncBus syncBus) {
+                       SyncBus syncBus, OnlinePlayers onlinePlayers) {
         this.plugin = plugin;
         this.tasks = tasks;
         this.config = config;
@@ -48,6 +51,7 @@ public final class HomeService {
         this.cooldowns = cooldowns;
         this.teleports = teleports;
         this.syncBus = syncBus;
+        this.onlinePlayers = onlinePlayers;
         this.serverId = config.crossServer.serverId;
         for (int i = 0; i < locks.length; i++) {
             locks[i] = new Object();
@@ -59,10 +63,21 @@ public final class HomeService {
     }
 
     public void onJoin(Player player) {
-        tasks.entity(player, () -> limitCache.put(player.getUniqueId(), computeLimit(player)));
+        UUID id = player.getUniqueId();
+        tasks.entity(player, () -> limitCache.put(id, computeLimit(player)));
         tasks.async(() -> {
             try {
-                cache.put(player.getUniqueId(), database.listHomes(player.getUniqueId().toString()));
+                List<Home> loaded = sort(database.listHomes(id.toString()));
+                // The player may have left while this read was in flight; writing
+                // the cache anyway would resurrect an entry for an offline player
+                // that onQuit already purged, leaking one list per such quit.
+                if (onlinePlayers.byId(id) == null) {
+                    return;
+                }
+                // A mutation that raced this load already wrote a complete list
+                // into the cache; keep that one and mark it loaded.
+                cache.putIfAbsent(id, loaded);
+                loadedPlayers.add(id);
             } catch (Exception e) {
                 plugin.getSLF4JLogger().warn("Failed to load homes", e);
             }
@@ -72,6 +87,24 @@ public final class HomeService {
     public void onQuit(UUID player) {
         cache.remove(player);
         limitCache.remove(player);
+        loadedPlayers.remove(player);
+    }
+
+    /**
+     * Authoritative home list for a player, loading it synchronously when the
+     * join-time load has not completed yet. Callers hold the player's lock, so
+     * a mutation can never observe a half-populated cache: an empty list would
+     * otherwise let /sethome exceed the limit and drop the existing homes.
+     */
+    private List<Home> homesForMutation(UUID player) throws java.sql.SQLException {
+        List<Home> cached = cache.get(player);
+        if (cached != null && loadedPlayers.contains(player)) {
+            return cached;
+        }
+        List<Home> loaded = sort(database.listHomes(player.toString()));
+        cache.put(player, loaded);
+        loadedPlayers.add(player);
+        return loaded;
     }
 
     /** Cached limit for off-thread consumers (PlaceholderAPI). */
@@ -123,7 +156,7 @@ public final class HomeService {
             tasks.async(() -> {
                 synchronized (lockFor(id)) {
                     try {
-                        List<Home> current = new ArrayList<>(homes(id));
+                        List<Home> current = new ArrayList<>(homesForMutation(id));
                         boolean exists = current.stream().anyMatch(h -> h.name.equalsIgnoreCase(wanted));
                         if (!exists && current.size() >= maxHomes) {
                             messages.send(player, "home.limit-reached", "limit", String.valueOf(maxHomes));

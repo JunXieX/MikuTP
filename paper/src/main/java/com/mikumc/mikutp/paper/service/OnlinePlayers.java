@@ -38,6 +38,25 @@ public final class OnlinePlayers {
         return null;
     }
 
+    /**
+     * Player with this id, or null. Safe from any thread: a plain map lookup.
+     * Bukkit's own lookups iterate the live player list, which Folia confines
+     * to the thread owning that region.
+     */
+    public Player byId(UUID player) {
+        return players.get(player);
+    }
+
+    /** Case-insensitive name lookup over this registry; safe from any thread. */
+    public Player byName(String name) {
+        for (Player player : players.values()) {
+            if (player.getName().equalsIgnoreCase(name)) {
+                return player;
+            }
+        }
+        return null;
+    }
+
     /** Snapshot of the tracked players; safe to iterate from any thread. */
     public List<Player> snapshot() {
         return new ArrayList<>(players.values());

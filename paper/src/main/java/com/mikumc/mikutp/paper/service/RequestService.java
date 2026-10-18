@@ -15,6 +15,7 @@ import org.bukkit.plugin.java.JavaPlugin;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
@@ -60,6 +61,7 @@ public final class RequestService {
     private final ProfileService profiles;
     private final NetworkService network;
     private final SyncBus syncBus;
+    private final OnlinePlayers onlinePlayers;
     private final String serverId;
 
     /** Renders an incoming request to its target (dialog or clickable chat). */
@@ -74,12 +76,14 @@ public final class RequestService {
     private final BoundedIdSet answeredRequests = new BoundedIdSet();
     private final BoundedIdSet deliveredEvents = new BoundedIdSet();
     private final BoundedIdSet handledEvents = new BoundedIdSet();
+    /** Requests tracked while their target was not resolvable to a player yet. */
+    private final Set<String> awaitingShow = ConcurrentHashMap.newKeySet();
     private ScheduledTask sweepTask;
 
     public RequestService(JavaPlugin plugin, Tasks tasks, MikuTPConfig config, Database database,
                           MessageService messages, Effects effects, CooldownManager cooldowns,
                           TeleportService teleports, ProfileService profiles, NetworkService network,
-                          SyncBus syncBus) {
+                          SyncBus syncBus, OnlinePlayers onlinePlayers) {
         this.plugin = plugin;
         this.tasks = tasks;
         this.config = config;
@@ -91,6 +95,7 @@ public final class RequestService {
         this.profiles = profiles;
         this.network = network;
         this.syncBus = syncBus;
+        this.onlinePlayers = onlinePlayers;
         this.serverId = config.crossServer.serverId;
     }
 
@@ -116,7 +121,12 @@ public final class RequestService {
         // TP_CANCEL that purges the target's mailbox copy. The quitting player's
         // incoming requests are safe to drop locally because the proxy mailbox
         // redelivers them on rejoin.
-        incoming.remove(player);
+        Map<String, TpRequest> mine = incoming.remove(player);
+        if (mine != null) {
+            // Deferred-show marks only make sense while the request is tracked;
+            // leaving them behind would grow the set for players who never return.
+            mine.keySet().forEach(awaitingShow::remove);
+        }
         outgoingRequests.remove(player);
     }
 
@@ -134,7 +144,8 @@ public final class RequestService {
             return;
         }
         tasks.async(() -> {
-            Player local = Bukkit.getPlayerExact(targetName);
+            // Registry lookup, not Bukkit's: this runs off the region thread.
+            Player local = onlinePlayers.byName(targetName);
             if (local != null) {
                 validateAndSend(requester, local.getUniqueId(), local.getName(), here);
                 return;
@@ -220,6 +231,8 @@ public final class RequestService {
     /** Records a request id as final so a replayed TP_NEW cannot re-open it. */
     private void markAnswered(String requestId) {
         answeredRequests.add(requestId);
+        // A final request can never be shown later; drop the deferred-show mark.
+        awaitingShow.remove(requestId);
     }
 
     /** The requester's previous outgoing request is being replaced. */
@@ -522,10 +535,11 @@ public final class RequestService {
     }
 
     /**
-     * Re-renders the player's still-pending incoming requests on join. The
-     * proxy's mailbox can push a request before the backend's join handler has
-     * registered the player, in which case it is tracked but never displayed;
-     * this is what actually surfaces it.
+     * Re-renders requests that were tracked while their target could not be
+     * resolved to a player yet (the proxy can push a mailbox entry before the
+     * join handler or the player object is visible). Only those requests are
+     * re-shown: re-rendering everything that is still pending would pop a
+     * second dialog for requests the target already saw.
      */
     public void redeliverPending(Player player) {
         Map<String, TpRequest> mine = incoming.get(player.getUniqueId());
@@ -534,11 +548,16 @@ public final class RequestService {
         }
         long now = System.currentTimeMillis();
         for (TpRequest request : new ArrayList<>(mine.values())) {
+            if (!awaitingShow.contains(request.id)) {
+                continue;
+            }
             if (request.status != TpRequest.Status.PENDING
                     || answeredRequests.contains(request.id)
                     || request.createdAt + config.tpa.requestExpirySeconds * 1000L < now) {
+                awaitingShow.remove(request.id);
                 continue;
             }
+            awaitingShow.remove(request.id);
             showToTarget(request);
         }
     }
@@ -558,6 +577,9 @@ public final class RequestService {
     private void showToTarget(TpRequest request) {
         Player target = Bukkit.getPlayer(UUID.fromString(request.targetUuid));
         if (target == null) {
+            // Tracked but not displayable yet: remember it so the join handler
+            // can surface it once the player exists.
+            awaitingShow.add(request.id);
             return;
         }
         tasks.entity(target, () -> {

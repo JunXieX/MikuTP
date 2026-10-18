@@ -3,7 +3,6 @@ package com.mikumc.mikutp.paper.service;
 import com.mikumc.mikutp.common.data.Database;
 import com.mikumc.mikutp.common.sync.SyncBus;
 import com.mikumc.mikutp.common.sync.SyncEvent;
-import org.bukkit.Bukkit;
 import org.bukkit.entity.Player;
 import org.bukkit.plugin.java.JavaPlugin;
 
@@ -24,14 +23,17 @@ public final class ProfileService {
     private final Tasks tasks;
     private final Database database;
     private final SyncBus syncBus;
+    private final OnlinePlayers onlinePlayers;
     private final String serverId;
     private final Map<UUID, Boolean> tpaEnabled = new ConcurrentHashMap<>();
 
-    public ProfileService(JavaPlugin plugin, Tasks tasks, Database database, SyncBus syncBus, String serverId) {
+    public ProfileService(JavaPlugin plugin, Tasks tasks, Database database, SyncBus syncBus,
+                          OnlinePlayers onlinePlayers, String serverId) {
         this.plugin = plugin;
         this.tasks = tasks;
         this.database = database;
         this.syncBus = syncBus;
+        this.onlinePlayers = onlinePlayers;
         this.serverId = serverId;
     }
 
@@ -61,6 +63,10 @@ public final class ProfileService {
 
     public void setTpaEnabled(UUID uuid, boolean enabled) {
         tpaEnabled.put(uuid, enabled);
+        // Resolve the name on the caller's thread: this async task must not read
+        // Bukkit's player view, which Folia confines to the owning region thread.
+        Player online = onlinePlayers.byId(uuid);
+        String name = online == null ? null : online.getName();
         tasks.async(() -> {
             try {
                 database.setTpaEnabled(uuid.toString(), enabled);
@@ -68,7 +74,6 @@ public final class ProfileService {
                 plugin.getSLF4JLogger().warn("Failed to persist tpa toggle", e);
                 return;
             }
-            String name = Bukkit.getPlayer(uuid) == null ? null : Bukkit.getPlayer(uuid).getName();
             publishProfile(uuid, name, System.currentTimeMillis(), enabled);
         });
     }
@@ -94,7 +99,9 @@ public final class ProfileService {
         tx.upsertPlayer(event.playerUuid, event.playerName, event.lastOnline);
         tx.setTpaEnabled(event.playerUuid, event.tpaEnabled);
         UUID uuid = parseUuid(event.playerUuid);
-        if (uuid != null && Bukkit.getPlayer(uuid) != null) {
+        // Only mirror the flag for players this backend hosts; touching Bukkit's
+        // player view from the sync applier thread is not allowed on Folia.
+        if (uuid != null && onlinePlayers.byId(uuid) != null) {
             tpaEnabled.put(uuid, event.tpaEnabled);
         }
     }
@@ -109,7 +116,10 @@ public final class ProfileService {
 
     /** Online players resolve locally; everyone else through the local replicated database. */
     public CompletableFuture<Optional<PlayerRecord>> resolve(String name) {
-        Player online = Bukkit.getPlayerExact(name);
+        // Uses the plugin registry rather than Bukkit's name lookup: callers run
+        // this from async threads, where scanning the server player list is
+        // undefined on Folia.
+        Player online = onlinePlayers.byName(name);
         if (online != null) {
             return CompletableFuture.completedFuture(Optional.of(
                     new PlayerRecord(online.getUniqueId(), online.getName(), true)));
