@@ -82,8 +82,10 @@ public final class HomeService {
                 synchronized (lockFor(id)) {
                     // Take the lock the mutation paths use: without it a /sethome
                     // that committed after this read started could be overwritten
-                    // by this older snapshot.
-                    if (loadedPlayers.contains(id)) {
+                    // by this older snapshot. Re-check presence under the lock too:
+                    // onQuit purges under the same lock, so a quit that landed after
+                    // the check above must not be undone by this write.
+                    if (loadedPlayers.contains(id) || onlinePlayers.byId(id) == null) {
                         return;
                     }
                     cache.put(id, loaded);
@@ -96,9 +98,14 @@ public final class HomeService {
     }
 
     public void onQuit(UUID player) {
-        cache.remove(player);
-        limitCache.remove(player);
-        loadedPlayers.remove(player);
+        // Take the same stripe the load uses: a read that is already past its
+        // online check must not write a cache entry for the departing player
+        // after this purge.
+        synchronized (lockFor(player)) {
+            cache.remove(player);
+            limitCache.remove(player);
+            loadedPlayers.remove(player);
+        }
     }
 
     /**
@@ -275,7 +282,14 @@ public final class HomeService {
             // Merge into an already-loaded list only. Creating one here from a
             // single replicated home would mark the player as loaded and hide
             // every local home that the join-time read has not fetched yet.
-            cache.computeIfPresent(owner, (k, list) -> sort(replace(list, home)));
+            // The stripe lock is required: without it this read-modify-write can
+            // interleave with /sethome's own list replacement and drop a home.
+            synchronized (lockFor(owner)) {
+                List<Home> current = cache.get(owner);
+                if (current != null) {
+                    cache.put(owner, sort(replace(current, home)));
+                }
+            }
         }
     }
 
@@ -286,8 +300,13 @@ public final class HomeService {
         tx.deleteHome(event.ownerUuid, event.homeName);
         UUID owner = parseUuid(event.ownerUuid);
         if (owner != null) {
-            cache.computeIfPresent(owner, (k, list) -> sort(list.stream()
-                    .filter(h -> !h.name.equalsIgnoreCase(event.homeName)).toList()));
+            synchronized (lockFor(owner)) {
+                List<Home> current = cache.get(owner);
+                if (current != null) {
+                    cache.put(owner, sort(current.stream()
+                            .filter(h -> !h.name.equalsIgnoreCase(event.homeName)).toList()));
+                }
+            }
         }
     }
 
@@ -301,7 +320,9 @@ public final class HomeService {
 
     public void go(Player player, String name) {
         UUID id = player.getUniqueId();
-        long remaining = cooldowns.remaining(id, CooldownManager.Kind.HOME);
+        // Check and burn in one step: two /home commands arriving together would
+        // otherwise both pass a separate remaining() check and teleport twice.
+        long remaining = cooldowns.tryConsume(id, CooldownManager.Kind.HOME);
         if (remaining > 0) {
             messages.send(player, "common.cooldown", "seconds", String.valueOf(remaining));
             return;
@@ -310,17 +331,17 @@ public final class HomeService {
             Home home = find(homes(id), name);
             if (home == null) {
                 try {
-                    home = database.getHome(id.toString(), name).orElse(null);
+                    home = database.getHome(id.toString(), name.toLowerCase(java.util.Locale.ROOT)).orElse(null);
                 } catch (Exception e) {
                     plugin.getSLF4JLogger().warn("Failed to read home", e);
                 }
             }
             if (home == null) {
+                // Nothing was teleported: give the cooldown back.
+                cooldowns.clear(id, CooldownManager.Kind.HOME);
                 messages.send(player, "home.not-found", "name", name);
                 return;
             }
-            // Only burn the cooldown on a real, reachable home.
-            cooldowns.apply(id, CooldownManager.Kind.HOME);
             messages.send(player, "home.going", "name", home.name);
             teleports.send(player, home.position, PendingTeleport.Source.HOME, home.name, null);
         });

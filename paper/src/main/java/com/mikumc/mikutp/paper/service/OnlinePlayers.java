@@ -14,16 +14,21 @@ import java.util.concurrent.ConcurrentHashMap;
  * of {@code Bukkit.getOnlinePlayers()} undefined outside self-contained
  * main-thread uses.
  *
- * <p>Entries are maintained by the lifecycle listener, which runs on the
- * player's own region thread, so this map is the only place the plugin reads
- * "who is online" from an arbitrary thread.
+ * <p>Entries (player object plus name) are maintained by the lifecycle listener,
+ * which runs on the player's own region thread. Reading a {@link Player}'s name
+ * is entity state access like any other, so names are captured at registration
+ * time and served from this map — a lookup here never calls into a Player.
  */
 public final class OnlinePlayers {
 
-    private final Map<UUID, Player> players = new ConcurrentHashMap<>();
+    /** Player reference plus the name captured on their region thread. */
+    private record Entry(Player player, String name) {
+    }
+
+    private final Map<UUID, Entry> players = new ConcurrentHashMap<>();
 
     public void add(Player player) {
-        players.put(player.getUniqueId(), player);
+        players.put(player.getUniqueId(), new Entry(player, player.getName()));
     }
 
     public void remove(UUID player) {
@@ -32,8 +37,8 @@ public final class OnlinePlayers {
 
     /** Any tracked player, or null when nobody is online. */
     public Player any() {
-        for (Player player : players.values()) {
-            return player;
+        for (Entry entry : players.values()) {
+            return entry.player();
         }
         return null;
     }
@@ -44,14 +49,24 @@ public final class OnlinePlayers {
      * to the thread owning that region.
      */
     public Player byId(UUID player) {
-        return players.get(player);
+        Entry entry = players.get(player);
+        return entry == null ? null : entry.player();
+    }
+
+    /** Name captured when the player joined, or null when they are offline. */
+    public String nameOf(UUID player) {
+        Entry entry = players.get(player);
+        return entry == null ? null : entry.name();
     }
 
     /** Case-insensitive name lookup over this registry; safe from any thread. */
     public Player byName(String name) {
-        for (Player player : players.values()) {
-            if (player.getName().equalsIgnoreCase(name)) {
-                return player;
+        if (name == null) {
+            return null;
+        }
+        for (Entry entry : players.values()) {
+            if (entry.name().equalsIgnoreCase(name)) {
+                return entry.player();
             }
         }
         return null;
@@ -59,6 +74,20 @@ public final class OnlinePlayers {
 
     /** Snapshot of the tracked players; safe to iterate from any thread. */
     public List<Player> snapshot() {
-        return new ArrayList<>(players.values());
+        List<Player> out = new ArrayList<>(players.size());
+        for (Entry entry : players.values()) {
+            out.add(entry.player());
+        }
+        return out;
+    }
+
+    /** Names captured at join time; used by command suggestions, which run off
+     * the players' region threads. */
+    public List<String> names() {
+        List<String> out = new ArrayList<>(players.size());
+        for (Entry entry : players.values()) {
+            out.add(entry.name());
+        }
+        return out;
     }
 }

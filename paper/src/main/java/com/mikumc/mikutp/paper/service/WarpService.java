@@ -175,7 +175,9 @@ public final class WarpService {
             return;
         }
         UUID id = player.getUniqueId();
-        long remaining = cooldowns.remaining(id, CooldownManager.Kind.WARP);
+        // Atomic check-and-burn: a separate remaining() check lets two racing
+        // commands both through.
+        long remaining = cooldowns.tryConsume(id, CooldownManager.Kind.WARP);
         if (remaining > 0) {
             messages.send(player, "common.cooldown", "seconds", String.valueOf(remaining));
             return;
@@ -188,15 +190,16 @@ public final class WarpService {
                 }
             } catch (Exception e) {
                 plugin.getSLF4JLogger().warn("Failed to read warps", e);
+                cooldowns.clear(id, CooldownManager.Kind.WARP);
                 messages.send(player, "warp.not-found", "name", name);
                 return;
             }
             if (warp == null) {
+                // Nothing was teleported: give the cooldown back.
+                cooldowns.clear(id, CooldownManager.Kind.WARP);
                 messages.send(player, "warp.not-found", "name", name);
                 return;
             }
-            // Only burn the cooldown once a real warp was found.
-            cooldowns.apply(id, CooldownManager.Kind.WARP);
             messages.send(player, "warp.going", "name", warp.name);
             teleports.send(player, warp.position, PendingTeleport.Source.WARP, warp.name, null);
         });

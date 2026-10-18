@@ -26,6 +26,9 @@ public final class ProfileService {
     private final OnlinePlayers onlinePlayers;
     private final String serverId;
     private final Map<UUID, Boolean> tpaEnabled = new ConcurrentHashMap<>();
+    /** Last profile timestamp applied per player; replicated events can arrive
+     * out of order, and an older snapshot must not roll back a newer toggle. */
+    private final Map<UUID, Long> lastProfileVersion = new ConcurrentHashMap<>();
 
     public ProfileService(JavaPlugin plugin, Tasks tasks, Database database, SyncBus syncBus,
                           OnlinePlayers onlinePlayers, String serverId) {
@@ -61,6 +64,7 @@ public final class ProfileService {
 
     public void onQuit(UUID uuid) {
         tpaEnabled.remove(uuid);
+        lastProfileVersion.remove(uuid);
     }
 
     public boolean isTpaEnabled(UUID uuid) {
@@ -71,8 +75,11 @@ public final class ProfileService {
         tpaEnabled.put(uuid, enabled);
         // Resolve the name on the caller's thread: this async task must not read
         // Bukkit's player view, which Folia confines to the owning region thread.
-        Player online = onlinePlayers.byId(uuid);
-        String name = online == null ? null : online.getName();
+        String name = onlinePlayers.nameOf(uuid);
+        long stamped = System.currentTimeMillis();
+        // The local toggle is newer than anything replicated so far; recording the
+        // stamp makes an in-flight snapshot produced before the flip get ignored.
+        lastProfileVersion.merge(uuid, stamped, Math::max);
         tasks.async(() -> {
             try {
                 database.setTpaEnabled(uuid.toString(), enabled);
@@ -80,7 +87,7 @@ public final class ProfileService {
                 plugin.getSLF4JLogger().warn("Failed to persist tpa toggle", e);
                 return;
             }
-            publishProfile(uuid, name, System.currentTimeMillis(), enabled);
+            publishProfile(uuid, name, stamped, enabled);
         });
     }
 
@@ -103,8 +110,13 @@ public final class ProfileService {
             return;
         }
         tx.upsertPlayer(event.playerUuid, event.playerName, event.lastOnline);
-        tx.setTpaEnabled(event.playerUuid, event.tpaEnabled);
         UUID uuid = parseUuid(event.playerUuid);
+        if (uuid != null && lastProfileVersion.merge(uuid, event.lastOnline, Math::max) > event.lastOnline) {
+            // A newer profile for this player was already applied (or produced
+            // here): replaying this older snapshot would roll the toggle back.
+            return;
+        }
+        tx.setTpaEnabled(event.playerUuid, event.tpaEnabled);
         // Only mirror the flag for players this backend hosts; touching Bukkit's
         // player view from the sync applier thread is not allowed on Folia.
         if (uuid != null && onlinePlayers.byId(uuid) != null) {
@@ -127,8 +139,9 @@ public final class ProfileService {
         // undefined on Folia.
         Player online = onlinePlayers.byName(name);
         if (online != null) {
+            String resolved = onlinePlayers.nameOf(online.getUniqueId());
             return CompletableFuture.completedFuture(Optional.of(
-                    new PlayerRecord(online.getUniqueId(), online.getName(), true)));
+                    new PlayerRecord(online.getUniqueId(), resolved == null ? name : resolved, true)));
         }
         CompletableFuture<Optional<PlayerRecord>> future = new CompletableFuture<>();
         tasks.async(() -> {

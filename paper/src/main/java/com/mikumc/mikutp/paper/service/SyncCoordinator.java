@@ -42,7 +42,10 @@ public final class SyncCoordinator {
     private final RequestService requestService;
     private final String serverId;
     private final Queue<PendingWrite> pendingWrites = new ConcurrentLinkedQueue<>();
-    private volatile long lastDump = 0;
+    /** Guard stamp for {@link #dumpSelf()}; CAS so concurrent resync requests
+     * cannot both pass the check and publish two full dumps. */
+    private final java.util.concurrent.atomic.AtomicLong lastDump =
+            new java.util.concurrent.atomic.AtomicLong(0L);
     private final AtomicInteger activePlayers = new AtomicInteger();
     private ScheduledTask flushTask;
 
@@ -169,10 +172,13 @@ public final class SyncCoordinator {
     /** Publishes this server's full local state; rate-limited to tame event storms. */
     private void dumpSelf() {
         long now = System.currentTimeMillis();
-        if (now - lastDump < DUMP_GUARD_MS) {
+        long previous = lastDump.get();
+        if (now - previous < DUMP_GUARD_MS) {
             return;
         }
-        lastDump = now;
+        if (!lastDump.compareAndSet(previous, now)) {
+            return; // another thread just claimed this window
+        }
         tasks.async(() -> {
             try {
                 for (var home : database.listAllHomes()) {

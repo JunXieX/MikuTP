@@ -58,7 +58,9 @@ public final class WildService {
             return;
         }
         UUID id = player.getUniqueId();
-        long remaining = cooldowns.remaining(id, CooldownManager.Kind.WILD);
+        // Atomic check-and-burn, same as /home and /warp: a separate remaining()
+        // check would let two /rtp commands in flight both start a search.
+        long remaining = cooldowns.tryConsume(id, CooldownManager.Kind.WILD);
         if (remaining > 0) {
             messages.send(player, "common.cooldown", "seconds", String.valueOf(remaining));
             return;
@@ -66,6 +68,7 @@ public final class WildService {
         tasks.entity(player, () -> {
             World world = resolveWorld(player);
             if (world == null) {
+                cooldowns.clear(id, CooldownManager.Kind.WILD);
                 messages.send(player, "wild.failed");
                 return;
             }
@@ -81,7 +84,6 @@ public final class WildService {
             }
             long maxRadius = effectiveMaxRadius(world);
             long minRadius = Math.min(Math.max(0, config.wild.minRadius), maxRadius);
-            cooldowns.apply(id, CooldownManager.Kind.WILD);
             messages.send(player, "wild.searching");
             AtomicInteger attempts = new AtomicInteger(Math.max(1, config.wild.maxAttempts));
             attempt(player, world, centerX, centerZ, minRadius, maxRadius, attempts);

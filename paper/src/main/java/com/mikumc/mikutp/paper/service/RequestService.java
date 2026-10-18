@@ -8,7 +8,6 @@ import com.mikumc.mikutp.common.data.TpRequest;
 import com.mikumc.mikutp.common.sync.SyncBus;
 import com.mikumc.mikutp.common.sync.SyncEvent;
 import io.papermc.paper.threadedregions.scheduler.ScheduledTask;
-import org.bukkit.Bukkit;
 import org.bukkit.entity.Player;
 import org.bukkit.plugin.java.JavaPlugin;
 
@@ -115,19 +114,25 @@ public final class RequestService {
 
     public void onQuit(UUID player) {
         lastIncoming.remove(player);
-        // Drop only this player's own bookkeeping. The requester-side entries
-        // must be left alone: a target logging off does not end the request, and
-        // wiping the requester's outgoing entry here would break the later
-        // TP_CANCEL that purges the target's mailbox copy. The quitting player's
-        // incoming requests are safe to drop locally because the proxy mailbox
-        // redelivers them on rejoin.
+        // The quitting player's incoming requests are dropped locally: the proxy
+        // mailbox redelivers unanswered requests on rejoin.
         Map<String, TpRequest> mine = incoming.remove(player);
         if (mine != null) {
             // Deferred-show marks only make sense while the request is tracked;
             // leaving them behind would grow the set for players who never return.
             mine.keySet().forEach(awaitingShow::remove);
         }
-        outgoingRequests.remove(player);
+        // The requester's own outgoing entry is dropped too, but the request it
+        // referred to may still be live on the target's backend. Publish a cancel
+        // first, otherwise the target keeps a dialog that can teleport a player
+        // who is no longer waiting for it.
+        TpRequest revoked = outgoingRequests.remove(player);
+        if (revoked != null) {
+            markAnswered(revoked.id);
+            SyncEvent event = SyncEvent.create(SyncEvent.Type.TP_CANCEL, serverId);
+            event.request = revoked;
+            syncBus.publish(event);
+        }
     }
 
     // ------------------------------------------------------------------ sending
@@ -137,17 +142,11 @@ public final class RequestService {
         if (featureDisabled(requester)) {
             return;
         }
-        UUID id = requester.getUniqueId();
-        long remaining = cooldowns.remaining(id, CooldownManager.Kind.TPA);
-        if (remaining > 0) {
-            messages.send(requester, "common.cooldown", "seconds", String.valueOf(remaining));
-            return;
-        }
         tasks.async(() -> {
             // Registry lookup, not Bukkit's: this runs off the region thread.
             Player local = onlinePlayers.byName(targetName);
             if (local != null) {
-                validateAndSend(requester, local.getUniqueId(), local.getName(), here);
+                validateAndSend(requester, local.getUniqueId(), onlinePlayers.nameOf(local.getUniqueId()), here);
                 return;
             }
             profiles.resolve(targetName).thenAccept(opt -> {
@@ -179,7 +178,7 @@ public final class RequestService {
             messages.send(requester, "tpa.blocked-requester", "player", targetName);
             return;
         }
-        boolean onlineHere = Bukkit.getPlayer(targetId) != null;
+        boolean onlineHere = onlinePlayers.byId(targetId) != null;
         if (!onlineHere && !syncBus.crossServer()) {
             messages.send(requester, "common.player-not-found", "player", targetName);
             return;
@@ -200,10 +199,14 @@ public final class RequestService {
     }
 
     private void proceed(Player requester, UUID targetId, String targetName, boolean here) {
-        // All checks passed: revoke the previous outgoing request (its target is
-        // notified and their dialog closed), then burn the cooldown and send.
+        // All checks passed: burn the cooldown atomically (two /tpa in flight must
+        // not both pass), then revoke the previous outgoing request and send.
+        long remaining = cooldowns.tryConsume(requester.getUniqueId(), CooldownManager.Kind.TPA);
+        if (remaining > 0) {
+            messages.send(requester, "common.cooldown", "seconds", String.valueOf(remaining));
+            return;
+        }
         cancelOutgoing(requester);
-        cooldowns.apply(requester.getUniqueId(), CooldownManager.Kind.TPA);
         TpRequest request = newRequest(requester, targetId, targetName, here);
         outgoingRequests.put(requester.getUniqueId(), request);
         publishRequest(request);
@@ -269,9 +272,11 @@ public final class RequestService {
 
     private TpRequest newRequest(Player requester, UUID targetId, String targetName, boolean here) {
         long now = System.currentTimeMillis();
+        String requesterName = onlinePlayers.nameOf(requester.getUniqueId());
         return new TpRequest(java.util.UUID.randomUUID().toString(),
                 here ? TpRequest.Type.COME : TpRequest.Type.GO,
-                requester.getUniqueId().toString(), requester.getName(), serverId,
+                requester.getUniqueId().toString(),
+                requesterName == null ? "" : requesterName, serverId,
                 targetId.toString(), targetName, TpRequest.Status.PENDING, now, now);
     }
 
@@ -292,7 +297,18 @@ public final class RequestService {
             clearOutgoing(request.requesterUuid, request.id);
             // Keep the "latest" pointer off a request that no longer exists.
             lastIncoming.remove(target.getUniqueId(), request.id);
-            respondCommon(target, request, response);
+            if (response == Response.BLOCK) {
+                // A blocking answer also writes an ignore entry: database work
+                // belongs on this async thread, not the target's region thread.
+                UUID blocker = parseUuid(request.targetUuid);
+                UUID blocked = parseUuid(request.requesterUuid);
+                if (blocker != null && blocked != null) {
+                    storeIgnore(blocker, blocked, config.tpa.blockDurationMinutes);
+                }
+            }
+            // Feedback (sound + messages) touches the target's entity state, so it
+            // runs on the target's own thread.
+            tasks.entity(target, () -> respondCommon(target, request, response));
         });
     }
 
@@ -331,6 +347,9 @@ public final class RequestService {
         });
     }
 
+    /** Shows the answer to the target and hands the accepted teleport off.
+     * Runs on the target's entity thread: it plays sounds and reads the
+     * requester's live position. */
     private void respondCommon(Player target, TpRequest request, Response response) {
         effects.click(target);
         switch (response) {
@@ -339,20 +358,21 @@ public final class RequestService {
             case BLOCK -> messages.send(target, "tpa.blocked-target", "player", request.requesterName,
                     "minutes", String.valueOf(config.tpa.blockDurationMinutes));
         }
-        if (response == Response.BLOCK) {
-            storeIgnore(UUID.fromString(request.targetUuid), UUID.fromString(request.requesterUuid),
-                    config.tpa.blockDurationMinutes);
-        }
-        Player requester = Bukkit.getPlayer(UUID.fromString(request.requesterUuid));
+        UUID requesterId = parseUuid(request.requesterUuid);
+        Player requester = requesterId == null ? null : onlinePlayers.byId(requesterId);
         if (requester != null) {
             // Both parties are on this server: teleport locally, no bus event needed.
             switch (response) {
                 case ACCEPT -> {
                     Player mover = request.type == TpRequest.Type.GO ? requester : target;
                     Player anchor = request.type == TpRequest.Type.GO ? target : requester;
+                    // The label names the destination: the target for GO, the
+                    // requester for COME.
+                    String label = request.type == TpRequest.Type.GO
+                            ? request.targetName : request.requesterName;
                     messages.send(requester, "tpa.accepted-requester", "player", request.targetName);
                     if (mover.isOnline()) {
-                        teleports.sendLocalTo(mover, anchor, anchor.getName(), true);
+                        teleports.sendLocalTo(mover, anchor, label, true);
                     }
                 }
                 case DENY -> messages.send(requester, "tpa.denied-requester", "player", request.targetName);
@@ -366,7 +386,7 @@ public final class RequestService {
         if (response == Response.ACCEPT && request.type == TpRequest.Type.GO) {
             // The requester travels here; stash our position for their arrival and
             // only announce the acceptance once the payload is durably stored.
-            teleports.stashPendingTeleport(UUID.fromString(request.requesterUuid),
+            teleports.stashPendingTeleport(requesterId,
                     target.getUniqueId(), PendingTeleport.Source.TPA,
                     () -> publishResponded(request, response));
             return;
@@ -501,6 +521,16 @@ public final class RequestService {
 
     /** Entry point for request events arriving over the sync bus. */
     public void onSyncEvent(SyncEvent event) {
+        if (event.type == null) {
+            return;
+        }
+        // TP_RESPONDED / TP_READY dedupe on the event id; without one they could be
+        // applied an unbounded number of times. TP_CANCEL and TP_NEW carry their
+        // own request id and are idempotent, so they do not need the event id.
+        if (event.id == null
+                && (event.type == SyncEvent.Type.TP_RESPONDED || event.type == SyncEvent.Type.TP_READY)) {
+            return;
+        }
         switch (event.type) {
             case TP_NEW -> deliverRemote(event);
             case TP_RESPONDED -> processResponse(event);
@@ -547,7 +577,7 @@ public final class RequestService {
                 markAnswered(request.id);
                 lastIncoming.remove(entry.getKey(), request.id);
             }
-            Player target = Bukkit.getPlayer(entry.getKey());
+            Player target = onlinePlayers.byId(entry.getKey());
             if (target == null) {
                 continue;
             }
@@ -560,10 +590,10 @@ public final class RequestService {
 
     private void deliverRemote(SyncEvent event) {
         TpRequest request = event.request;
-        if (request == null || request.targetUuid == null) {
+        if (request == null || request.id == null || request.targetUuid == null) {
             return;
         }
-        if (!deliveredEvents.add(event.id)) {
+        if (event.id != null && !deliveredEvents.add(event.id)) {
             return;
         }
         long now = System.currentTimeMillis();
@@ -607,25 +637,36 @@ public final class RequestService {
 
     /** Registers a request for its target; false when it is already tracked. */
     private boolean trackIncoming(TpRequest request) {
-        UUID targetId = UUID.fromString(request.targetUuid);
-        Map<String, TpRequest> mine = incoming.computeIfAbsent(targetId, k -> new ConcurrentHashMap<>());
-        if (mine.containsKey(request.id)) {
+        UUID targetId = parseUuid(request.targetUuid);
+        if (targetId == null) {
             return false;
         }
-        mine.put(request.id, request);
-        // "Latest" must mean the newest request, not the last one delivered:
-        // events can arrive out of order, and /tpaccept without arguments would
-        // otherwise answer an older request than the player just received.
-        lastIncoming.merge(targetId, request.id, (current, incomingId) -> {
-            TpRequest currentRequest = mine.get(current);
-            return currentRequest == null || currentRequest.createdAt <= request.createdAt
-                    ? incomingId : current;
+        boolean[] added = {false};
+        // compute(), not computeIfAbsent + put: the sweep detaches empty inner
+        // maps through the same key, so both paths must serialise or a request
+        // could be inserted into a map that was just removed from the outer map.
+        incoming.compute(targetId, (key, current) -> {
+            Map<String, TpRequest> mine = current == null ? new ConcurrentHashMap<>() : current;
+            if (mine.putIfAbsent(request.id, request) != null) {
+                return mine;
+            }
+            added[0] = true;
+            // "Latest" must mean the newest request, not the last one delivered:
+            // events can arrive out of order, and /tpaccept without arguments
+            // would otherwise answer an older request than the player just got.
+            lastIncoming.merge(targetId, request.id, (currentId, incomingId) -> {
+                TpRequest currentRequest = mine.get(currentId);
+                return currentRequest == null || currentRequest.createdAt <= request.createdAt
+                        ? incomingId : currentId;
+            });
+            return mine;
         });
-        return true;
+        return added[0];
     }
 
     private void showToTarget(TpRequest request) {
-        Player target = Bukkit.getPlayer(UUID.fromString(request.targetUuid));
+        UUID targetId = parseUuid(request.targetUuid);
+        Player target = targetId == null ? null : onlinePlayers.byId(targetId);
         if (target == null) {
             // Tracked but not displayable yet: remember it so the join handler
             // can surface it once the player exists.
@@ -649,40 +690,45 @@ public final class RequestService {
         if (!handledEvents.add(event.id)) {
             return;
         }
-        Player requester = Bukkit.getPlayer(UUID.fromString(request.requesterUuid));
+        UUID requesterId = parseUuid(request.requesterUuid);
+        Player requester = requesterId == null ? null : onlinePlayers.byId(requesterId);
         if (requester == null) {
             return;
         }
         clearOutgoing(request.requesterUuid, request.id);
+        Response parsed;
+        try {
+            parsed = Response.valueOf(event.response);
+        } catch (IllegalArgumentException | NullPointerException e) {
+            return;
+        }
         tasks.entity(requester, () -> {
-            Response response;
-            try {
-                response = Response.valueOf(event.response);
-            } catch (IllegalArgumentException e) {
-                return;
-            }
-            switch (response) {
+            switch (parsed) {
                 case ACCEPT -> {
                     messages.send(requester, "tpa.accepted-requester", "player", request.targetName);
                     if (request.type == TpRequest.Type.GO) {
                         // Prefer a direct teleport when the acceptor is on this server
                         // (covers players who switched servers while the event was in flight).
-                        Player anchor = Bukkit.getPlayer(UUID.fromString(request.targetUuid));
+                        UUID anchorId = parseUuid(request.targetUuid);
+                        Player anchor = anchorId == null ? null : onlinePlayers.byId(anchorId);
                         if (anchor != null) {
-                            teleports.sendLocalTo(requester, anchor, anchor.getName(), true);
+                            teleports.sendLocalTo(requester, anchor, request.targetName, true);
                         } else {
                             teleports.dispatchToAnchor(requester, request.targetUuid, null);
                         }
                     } else {
                         // Come-here: the target travels. Stash our live position for the
                         // arriving target and only give the go-ahead once it is stored.
-                        teleports.stashPendingTeleport(UUID.fromString(request.targetUuid),
-                                requester.getUniqueId(), PendingTeleport.Source.TPA_HERE,
-                                () -> {
-                                    SyncEvent ready = SyncEvent.create(SyncEvent.Type.TP_READY, serverId);
-                                    ready.request = request;
-                                    syncBus.publish(ready);
-                                });
+                        UUID moverId = parseUuid(request.targetUuid);
+                        if (moverId != null) {
+                            teleports.stashPendingTeleport(moverId, requesterId,
+                                    PendingTeleport.Source.TPA_HERE,
+                                    () -> {
+                                        SyncEvent ready = SyncEvent.create(SyncEvent.Type.TP_READY, serverId);
+                                        ready.request = request;
+                                        syncBus.publish(ready);
+                                    });
+                        }
                     }
                 }
                 case DENY -> messages.send(requester, "tpa.denied-requester", "player", request.targetName);
@@ -699,15 +745,17 @@ public final class RequestService {
         if (!handledEvents.add(event.id)) {
             return;
         }
-        Player mover = Bukkit.getPlayer(UUID.fromString(request.targetUuid));
+        UUID moverId = parseUuid(request.targetUuid);
+        Player mover = moverId == null ? null : onlinePlayers.byId(moverId);
         if (mover == null) {
             return;
         }
         clearOutgoing(request.targetUuid, request.id);
+        UUID anchorId = parseUuid(request.requesterUuid);
         messages.send(mover, "tpa.accepted-requester", "player", request.requesterName);
-        Player anchor = Bukkit.getPlayer(UUID.fromString(request.requesterUuid));
+        Player anchor = anchorId == null ? null : onlinePlayers.byId(anchorId);
         if (anchor != null) {
-            teleports.sendLocalTo(mover, anchor, anchor.getName(), true);
+            teleports.sendLocalTo(mover, anchor, request.requesterName, true);
         } else {
             teleports.dispatchToAnchor(mover, request.requesterUuid, null);
         }
@@ -749,22 +797,35 @@ public final class RequestService {
                 }
                 markAnswered(request.id);
                 clearOutgoing(request.requesterUuid, request.id);
-                Player requester = Bukkit.getPlayer(UUID.fromString(request.requesterUuid));
+                UUID requesterId = parseUuid(request.requesterUuid);
+                Player requester = requesterId == null ? null : onlinePlayers.byId(requesterId);
                 if (requester != null) {
                     tasks.entity(requester, () -> messages.send(requester, "tpa.expired-requester",
                             "player", request.targetName));
                 }
                 // Close the dialog the target left open.
-                Player target = Bukkit.getPlayer(targetId);
+                Player target = onlinePlayers.byId(targetId);
                 if (target != null) {
                     tasks.entity(target, target::closeDialog);
                 }
                 return true;
             });
-            // An empty inner map is dead weight: every expired request would
-            // otherwise leave one entry behind per target forever.
-            if (mine.isEmpty()) {
-                incoming.remove(targetId, mine);
+            // Drop the inner map only when it is still the one we swept and is
+            // still empty. Both tests run inside compute(), so a request that
+            // trackIncoming adds concurrently (same instance, after removeIf)
+            // keeps the entry alive instead of being detached with it.
+            boolean[] dropped = {false};
+            incoming.compute(targetId, (key, current) -> {
+                if (current == null) {
+                    return null;
+                }
+                if (current == mine && current.isEmpty()) {
+                    dropped[0] = true;
+                    return null;
+                }
+                return current;
+            });
+            if (dropped[0]) {
                 // lastIncoming must not keep pointing at a request that no longer
                 // exists: /tpaccept would then answer a dead id forever.
                 lastIncoming.remove(targetId);

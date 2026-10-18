@@ -78,7 +78,7 @@ public final class TeleportService {
      */
     public void sendLocalTo(Player mover, Player anchor, String label, boolean warmup) {
         tasks.entity(anchor, () -> {
-            Player stable = Bukkit.getPlayer(anchor.getUniqueId());
+            Player stable = onlinePlayers.byId(anchor.getUniqueId());
             if (stable == null) {
                 return;
             }
@@ -109,7 +109,14 @@ public final class TeleportService {
             plugin.getSLF4JLogger().warn("Malformed pending teleport payload", e);
             return;
         }
-        if (pending == null || pending.position == null || expired(pending)) {
+        // A payload missing its source cannot be labelled, and one missing its
+        // world cannot be applied: drop both instead of failing later on the
+        // player's join thread.
+        if (pending == null || pending.position == null || pending.position.world == null
+                || pending.position.world.isBlank() || pending.source == null) {
+            return;
+        }
+        if (expired(pending)) {
             return;
         }
         UUID id = player.getUniqueId();
@@ -136,7 +143,14 @@ public final class TeleportService {
     /** Consumes a buffered cross-server handoff for a player who just arrived. */
     public void applyPending(UUID playerUuid) {
         PendingTeleport pending = arriving.get(playerUuid);
-        if (pending == null || pending.position == null) {
+        if (pending == null || pending.position == null || pending.source == null) {
+            return;
+        }
+        // Anchor-based handoffs (/otp) deliberately carry no world; every other
+        // source needs one, otherwise there is nothing to apply.
+        boolean hasAnchor = pending.anchorUuid != null && !pending.anchorUuid.isBlank();
+        boolean hasWorld = pending.position.world != null && !pending.position.world.isBlank();
+        if (!hasAnchor && !hasWorld) {
             return;
         }
         if (expired(pending)) {
@@ -153,11 +167,11 @@ public final class TeleportService {
         arriving.remove(playerUuid, pending);
         if (pending.anchorUuid != null && !pending.anchorUuid.isBlank()) {
             UUID anchorId = parseUuid(pending.anchorUuid);
-            Player anchor = anchorId == null ? null : Bukkit.getPlayer(anchorId);
+            Player anchor = anchorId == null ? null : onlinePlayers.byId(anchorId);
             if (anchor != null) {
                 // Teleport to the anchor's live position, read on their region thread.
                 tasks.entity(anchor, () -> {
-                    Player stable = Bukkit.getPlayer(anchorId);
+                    Player stable = onlinePlayers.byId(anchorId);
                     if (stable == null) {
                         fallbackPendingArrival(playerUuid, pending);
                         return;
@@ -169,9 +183,10 @@ public final class TeleportService {
             }
             if (pending.position.world == null || pending.position.world.isBlank()) {
                 // Anchor gone and no stored position to fall back on.
-                Player arrivingPlayer = Bukkit.getPlayer(playerUuid);
+                Player arrivingPlayer = onlinePlayers.byId(playerUuid);
                 if (arrivingPlayer != null) {
-                    messages.send(arrivingPlayer, "admin.target-left");
+                    tasks.entity(arrivingPlayer,
+                            () -> messages.send(arrivingPlayer, "admin.target-left"));
                 }
                 return;
             }
@@ -217,19 +232,28 @@ public final class TeleportService {
 
     private void goHistory(Player player, CooldownManager.Kind kind, String colPrefix, String emptyKey,
                            String goingKey, PendingTeleport.Source source) {
+        UUID id = player.getUniqueId();
+        // Check and burn atomically; the cooldown is refunded if there is
+        // nothing to return to.
+        long remaining = cooldowns.tryConsume(id, kind);
+        if (remaining > 0) {
+            messages.send(player, "common.cooldown", "seconds", String.valueOf(remaining));
+            return;
+        }
         tasks.async(() -> {
             Position back;
             try {
                 back = database.getPosition(player.getUniqueId().toString(), colPrefix).orElse(null);
             } catch (Exception e) {
                 plugin.getSLF4JLogger().warn("Failed to read back position", e);
+                cooldowns.clear(id, kind);
                 return;
             }
             if (back == null) {
+                cooldowns.clear(id, kind);
                 messages.send(player, emptyKey);
                 return;
             }
-            cooldowns.apply(player.getUniqueId(), kind);
             messages.send(player, goingKey);
             send(player, back, source, back.world, null);
         });
@@ -330,13 +354,13 @@ public final class TeleportService {
                 return;
             }
             if (record.local()) {
-                Player target = Bukkit.getPlayer(record.uuid());
+                Player target = onlinePlayers.byId(record.uuid());
                 if (target == null) {
                     messages.send(admin, "common.player-not-found", "player", targetName);
                     return;
                 }
-                messages.send(admin, "common.teleporting", "target", target.getName());
-                sendLocalTo(admin, target, target.getName(), false);
+                messages.send(admin, "common.teleporting", "target", record.name());
+                sendLocalTo(admin, target, record.name(), false);
                 return;
             }
             if (!syncBus.crossServer()) {
@@ -375,13 +399,14 @@ public final class TeleportService {
                 return;
             }
             if (record.local()) {
-                Player target = Bukkit.getPlayer(record.uuid());
+                Player target = onlinePlayers.byId(record.uuid());
                 if (target == null) {
                     messages.send(admin, "common.player-not-found", "player", targetName);
                     return;
                 }
-                messages.send(target, "admin.pulled-you", "player", admin.getName());
-                sendLocalTo(target, admin, admin.getName(), false);
+                String adminName = nameOf(admin);
+                messages.send(target, "admin.pulled-you", "player", adminName);
+                sendLocalTo(target, admin, adminName, false);
                 return;
             }
             if (!syncBus.crossServer()) {
@@ -403,12 +428,13 @@ public final class TeleportService {
             // Reads the plugin's own registry: the online-player view may only be
             // iterated on the global region thread on Folia.
             int count = 0;
+            String adminName = nameOf(admin);
             for (Player victim : onlinePlayers.snapshot()) {
                 if (victim.getUniqueId().equals(admin.getUniqueId())) {
                     continue;
                 }
-                messages.send(victim, "admin.pulled-you", "player", admin.getName());
-                sendLocalTo(victim, admin, admin.getName(), false);
+                messages.send(victim, "admin.pulled-you", "player", adminName);
+                sendLocalTo(victim, admin, adminName, false);
                 count++;
             }
             messages.send(admin, "admin.bring-all-done", "count", String.valueOf(count));
@@ -416,6 +442,7 @@ public final class TeleportService {
         }
         network.requestPlayerList(admin, serverName).thenAccept(uuids -> {
             int count = 0;
+            String adminName = nameOf(admin);
             for (String uuid : uuids) {
                 UUID victim;
                 try {
@@ -426,10 +453,10 @@ public final class TeleportService {
                 if (victim.equals(admin.getUniqueId())) {
                     continue;
                 }
-                Player local = Bukkit.getPlayer(victim);
+                Player local = onlinePlayers.byId(victim);
                 if (local != null) {
-                    messages.send(local, "admin.pulled-you", "player", admin.getName());
-                    sendLocalTo(local, admin, admin.getName(), false);
+                    messages.send(local, "admin.pulled-you", "player", adminName);
+                    sendLocalTo(local, admin, adminName, false);
                 } else {
                     adminBringRemote(admin, victim);
                 }
@@ -441,7 +468,7 @@ public final class TeleportService {
 
     private void adminBringRemote(Player admin, UUID victim) {
         tasks.entity(admin, () -> {
-            Player stable = Bukkit.getPlayer(admin.getUniqueId());
+            Player stable = onlinePlayers.byId(admin.getUniqueId());
             if (stable == null) {
                 return;
             }
@@ -515,7 +542,7 @@ public final class TeleportService {
     }
 
     private void playerTeleportAsync(UUID playerUuid, Location target, String label) {
-        Player player = Bukkit.getPlayer(playerUuid);
+        Player player = onlinePlayers.byId(playerUuid);
         if (player == null) {
             return;
         }
@@ -532,10 +559,10 @@ public final class TeleportService {
     /** Anchor-based arrival fallback: use the stored position, else tell the player it failed. */
     private void fallbackPendingArrival(UUID playerUuid, PendingTeleport pending) {
         World world = Bukkit.getWorld(pending.position.world);
-        Player arriving = Bukkit.getPlayer(playerUuid);
+        Player arriving = onlinePlayers.byId(playerUuid);
         if (world == null || arriving == null) {
             if (arriving != null) {
-                messages.send(arriving, "admin.target-left");
+                tasks.entity(arriving, () -> messages.send(arriving, "admin.target-left"));
             }
             return;
         }
@@ -573,7 +600,7 @@ public final class TeleportService {
     /** Same as above; {@code onSuccess} runs once the payload is durably stored. */
     public void stashPendingTeleport(UUID playerToTeleport, UUID positionOwner,
                                      PendingTeleport.Source source, Runnable onSuccess) {
-        Player owner = Bukkit.getPlayer(positionOwner);
+        Player owner = onlinePlayers.byId(positionOwner);
         if (owner == null) {
             // The anchor left before the position could be captured. The caller
             // uses onSuccess to announce the acceptance, so still run it: silence
@@ -582,7 +609,7 @@ public final class TeleportService {
             return;
         }
         tasks.entity(owner, () -> {
-            Player stable = Bukkit.getPlayer(positionOwner);
+            Player stable = onlinePlayers.byId(positionOwner);
             if (stable == null) {
                 runQuietly(onSuccess);
                 return;
@@ -620,6 +647,12 @@ public final class TeleportService {
         } catch (IllegalArgumentException e) {
             return null;
         }
+    }
+
+    /** Name captured at join time; never reads the Player from an arbitrary thread. */
+    private String nameOf(Player player) {
+        String name = onlinePlayers.nameOf(player.getUniqueId());
+        return name == null ? "" : name;
     }
 
     private Position positionOf(Location loc) {

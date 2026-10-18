@@ -40,6 +40,13 @@ public final class WarmupGuard implements Listener {
         }
         double threshold = Math.max(0, config.teleport.moveThresholdBlocks);
         double limit = threshold <= 0 ? EPSILON_SQUARED : threshold * threshold;
+        // Locations in different worlds cannot be measured: distanceSquared
+        // throws IllegalArgumentException. A world change during warmup is a
+        // real move (portal, /execute in, another plugin), so cancel.
+        if (from.getWorld() == null || to.getWorld() == null || !from.getWorld().equals(to.getWorld())) {
+            warmups.cancel(event.getPlayer(), "common.warmup.cancelled-move");
+            return;
+        }
         if (from.distanceSquared(to) >= limit) {
             warmups.cancel(event.getPlayer(), "common.warmup.cancelled-move");
         }

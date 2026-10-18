@@ -51,13 +51,31 @@ public final class CooldownManager {
         return (rest + 999L) / 1000L;
     }
 
-    public void apply(UUID player, Kind kind) {
+    /**
+     * Atomically checks and starts the cooldown for {@code kind}. Returns the
+     * seconds still remaining when it is active (nothing is consumed), or 0 when
+     * it was started now. Two commands racing through a separate
+     * {@link #remaining} check can therefore not both pass.
+     */
+    public long tryConsume(UUID player, Kind kind) {
+        if (bypass.contains(player)) {
+            return 0;
+        }
         int seconds = secondsFor.applyAsInt(kind);
         if (seconds <= 0) {
-            return;
+            return 0; // this action has no cooldown configured
         }
-        until.computeIfAbsent(player, k -> new ConcurrentHashMap<>())
-                .put(kind, System.currentTimeMillis() + seconds * 1000L);
+        long now = System.currentTimeMillis();
+        Map<Kind, Long> map = until.computeIfAbsent(player, k -> new ConcurrentHashMap<>());
+        long[] blocked = {0};
+        map.compute(kind, (k, end) -> {
+            if (end != null && end > now) {
+                blocked[0] = (end - now + 999L) / 1000L;
+                return end;
+            }
+            return now + seconds * 1000L;
+        });
+        return blocked[0];
     }
 
     /** Clears every cooldown and the cached bypass flag (called on quit). */

@@ -122,7 +122,7 @@ public final class MikuTPPlugin extends JavaPlugin {
         requestService.start();
         coordinator.start();
 
-        new CommandRegistry(this, messages, cooldowns, homeService, warpService, requestService,
+        new CommandRegistry(this, messages, homeService, warpService, requestService,
                 wildService, teleports, dialogs, chats, onlinePlayers, this::reloadAll, coordinator::resync,
                 this::infoLine, () -> config.dialogs.enabled, config).register();
 
@@ -235,8 +235,26 @@ public final class MikuTPPlugin extends JavaPlugin {
     }
 
     private void reloadAll() {
+        // Transport settings (mode, token, server id) are read once at startup by
+        // the sync bus, the network service and the storage layer. Remember them
+        // so a config edit cannot leave the running instance holding values that
+        // silently differ from what the file now claims.
+        String oldMode = String.valueOf(config.sync.mode);
+        String oldToken = String.valueOf(config.sync.token);
+        String oldServerId = String.valueOf(config.crossServer.serverId);
         try {
             loadConfiguration(false);
+            String newMode = String.valueOf(config.sync.mode);
+            String newToken = String.valueOf(config.sync.token);
+            String newServerId = String.valueOf(config.crossServer.serverId);
+            if (!oldMode.equalsIgnoreCase(newMode) || !oldToken.equals(newToken)
+                    || !oldServerId.equals(newServerId)) {
+                config.sync.mode = oldMode;
+                config.sync.token = oldToken;
+                config.crossServer.serverId = oldServerId;
+                getSLF4JLogger().warn("sync.mode / sync.token / cross-server server-id changed in config.yml; "
+                        + "these take effect only after a full server restart and were ignored for now.");
+            }
             effects.setEnabled(config.teleport.sounds);
             warpService.reload();
             getSLF4JLogger().info("MikuTP reloaded (sync mode, server-id and storage changes need a restart)");

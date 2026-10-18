@@ -3,7 +3,6 @@ package com.mikumc.mikutp.paper.command;
 import com.mikumc.mikutp.common.config.MikuTPConfig;
 import com.mikumc.mikutp.paper.dialog.ChatMenus;
 import com.mikumc.mikutp.paper.dialog.DialogFactory;
-import com.mikumc.mikutp.paper.service.CooldownManager;
 import com.mikumc.mikutp.paper.service.HomeService;
 import com.mikumc.mikutp.paper.service.MessageService;
 import com.mikumc.mikutp.paper.service.OnlinePlayers;
@@ -35,7 +34,6 @@ public final class CommandRegistry {
 
     private final JavaPlugin plugin;
     private final MessageService messages;
-    private final CooldownManager cooldowns;
     private final HomeService homeService;
     private final WarpService warpService;
     private final RequestService requestService;
@@ -50,7 +48,7 @@ public final class CommandRegistry {
     private final java.util.function.BooleanSupplier dialogsEnabledSupplier;
     private final MikuTPConfig config;
 
-    public CommandRegistry(JavaPlugin plugin, MessageService messages, CooldownManager cooldowns,
+    public CommandRegistry(JavaPlugin plugin, MessageService messages,
                            HomeService homeService, WarpService warpService, RequestService requestService,
                            WildService wildService, TeleportService teleports, DialogFactory dialogs,
                            ChatMenus chats, OnlinePlayers onlinePlayers,
@@ -60,7 +58,6 @@ public final class CommandRegistry {
                            MikuTPConfig config) {
         this.plugin = plugin;
         this.messages = messages;
-        this.cooldowns = cooldowns;
         this.homeService = homeService;
         this.warpService = warpService;
         this.requestService = requestService;
@@ -329,11 +326,11 @@ public final class CommandRegistry {
     }
 
     private LiteralCommandNode<CommandSourceStack> back() {
-        return historyCommand("back", "mikutp.back", CooldownManager.Kind.BACK, teleports::goBack);
+        return historyCommand("back", "mikutp.back", teleports::goBack);
     }
 
     private LiteralCommandNode<CommandSourceStack> dback() {
-        return historyCommand("dback", "mikutp.dback", CooldownManager.Kind.DBACK, teleports::goDeathBack);
+        return historyCommand("dback", "mikutp.dback", teleports::goDeathBack);
     }
 
     private LiteralCommandNode<CommandSourceStack> otp() {
@@ -381,8 +378,8 @@ public final class CommandRegistry {
 
     private com.mojang.brigadier.suggestion.SuggestionProvider<CommandSourceStack> onlinePlayerSuggestions() {
         return (ctx, builder) -> {
-            for (Player online : onlinePlayers.snapshot()) {
-                builder.suggest(online.getName());
+            for (String name : onlinePlayers.names()) {
+                builder.suggest(name);
             }
             return builder.buildFuture();
         };
@@ -391,24 +388,17 @@ public final class CommandRegistry {
     /** Online names from the plugin registry: the Bukkit player view may only be
      * iterated on the global region thread under Folia. */
     private List<String> onlinePlayerNames() {
-        return onlinePlayers.snapshot().stream().map(Player::getName).toList();
+        return onlinePlayers.names();
     }
 
     private LiteralCommandNode<CommandSourceStack> historyCommand(String name, String permission,
-                                                                  CooldownManager.Kind kind,
                                                                   java.util.function.Consumer<Player> handler) {
         return Commands.literal(name)
                 .requires(requiresPlayer(permission))
                 .executes(ctx -> {
-                    Player player = asPlayer(ctx.getSource());
-                    long remaining = cooldowns.remaining(player.getUniqueId(), kind);
-                    if (remaining > 0) {
-                        messages.send(player, "common.cooldown", "seconds", String.valueOf(remaining));
-                        return 1;
-                    }
-                    // The cooldown itself is applied by the service only after a
-                    // return position is actually found.
-                    handler.accept(player);
+                    // The service checks and burns the cooldown atomically, and
+                    // refunds it when there is no stored position to return to.
+                    handler.accept(asPlayer(ctx.getSource()));
                     return 1;
                 })
                 .build();

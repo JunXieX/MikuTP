@@ -427,13 +427,23 @@ public final class MikuTPVelocity {
     }
 
     private void deliverMailbox(UUID uuid, ServerConnection connection) {
-        List<MailboxEntry> mailbox = mailboxes.remove(uuid);
-        if (mailbox == null || mailbox.isEmpty()) {
+        List<MailboxEntry> mailbox = mailboxes.get(uuid);
+        if (mailbox == null) {
             return;
+        }
+        List<MailboxEntry> drained;
+        synchronized (mailbox) {
+            // Detach and copy under the same monitor: a concurrent mailboxAdd
+            // holds this monitor too, and it re-checks the map before inserting,
+            // so an entry can neither be added to a container we are discarding
+            // nor be dropped between the copy and the removal.
+            drained = new ArrayList<>(mailbox);
+            mailbox.clear();
+            mailboxes.remove(uuid, mailbox);
         }
         long now = System.currentTimeMillis();
         List<SyncEvent> events = new ArrayList<>();
-        for (MailboxEntry entry : mailbox) {
+        for (MailboxEntry entry : drained) {
             if (entry.expiry() <= now) {
                 continue;
             }
@@ -460,15 +470,27 @@ public final class MikuTPVelocity {
         if (targetUuid == null) {
             return;
         }
+        UUID target;
         try {
-            UUID target = UUID.fromString(targetUuid);
-            List<MailboxEntry> mailbox = mailboxes.computeIfAbsent(target, k -> new ArrayList<>());
-            long expiry = System.currentTimeMillis() + MAILBOX_TTL_MS;
-            synchronized (mailbox) {
-                mailbox.add(new MailboxEntry(GSON.toJson(event), expiry));
-                mailbox.removeIf(entry -> entry.expiry() <= System.currentTimeMillis());
-            }
+            target = UUID.fromString(targetUuid);
         } catch (IllegalArgumentException ignored) {
+            return;
+        }
+        String json = GSON.toJson(event);
+        long expiry = System.currentTimeMillis() + MAILBOX_TTL_MS;
+        while (true) {
+            List<MailboxEntry> mailbox = mailboxes.computeIfAbsent(target, k -> new ArrayList<>());
+            synchronized (mailbox) {
+                // delivery detaches the mailbox from the map under this monitor
+                // before draining it; re-check so the entry never lands in a
+                // list that is no longer reachable.
+                if (mailboxes.get(target) != mailbox) {
+                    continue;
+                }
+                mailbox.add(new MailboxEntry(json, expiry));
+                mailbox.removeIf(entry -> entry.expiry() <= System.currentTimeMillis());
+                return;
+            }
         }
     }
 
@@ -490,7 +512,7 @@ public final class MikuTPVelocity {
             mailbox.removeIf(entry -> entry.expiry() <= System.currentTimeMillis()
                     || isRequest(entry, requestId));
             if (mailbox.isEmpty()) {
-                mailboxes.remove(target);
+                mailboxes.remove(target, mailbox);
             }
         }
     }
