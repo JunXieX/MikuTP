@@ -43,4 +43,11 @@ final class BoundedIdSet {
             return order.containsKey(id);
         }
     }
+
+    /** Releases a claim that turned out to have nothing to act on. */
+    boolean remove(String id) {
+        synchronized (order) {
+            return order.remove(id) != null;
+        }
+    }
 }
