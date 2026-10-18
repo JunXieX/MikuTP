@@ -40,16 +40,22 @@ public final class ProfileService {
     /** Called on join: upserts the profile, replicates it and marks presence. */
     public void onJoin(Player player) {
         UUID uuid = player.getUniqueId();
+        // Read entity state here: this runs on the join thread, the async body below
+        // may not touch the Player on Folia.
+        String name = player.getName();
+        long now = System.currentTimeMillis();
         tasks.async(() -> {
             try {
-                database.upsertPlayer(uuid.toString(), player.getName(), System.currentTimeMillis());
-                database.getPlayer(uuid.toString()).ifPresent(p -> tpaEnabled.put(uuid, p.tpaEnabled));
+                database.upsertPlayer(uuid.toString(), name, now);
+                database.getPlayer(uuid.toString()).ifPresent(p ->
+                        // Do not clobber a toggle the player flipped while this read
+                        // was in flight.
+                        tpaEnabled.putIfAbsent(uuid, p.tpaEnabled));
             } catch (Exception e) {
-                plugin.getSLF4JLogger().warn("Failed to update profile for {}", player.getName(), e);
+                plugin.getSLF4JLogger().warn("Failed to update profile for {}", name, e);
                 return;
             }
-            publishProfile(uuid, player.getName(), System.currentTimeMillis(),
-                    tpaEnabled.getOrDefault(uuid, true));
+            publishProfile(uuid, name, now, tpaEnabled.getOrDefault(uuid, true));
         });
     }
 

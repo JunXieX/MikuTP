@@ -266,6 +266,9 @@ public final class HomeService {
         tx.saveHome(home);
         UUID owner = parseUuid(event.ownerUuid);
         if (owner != null) {
+            // Merge into an already-loaded list only. Creating one here from a
+            // single replicated home would mark the player as loaded and hide
+            // every local home that the join-time read has not fetched yet.
             cache.computeIfPresent(owner, (k, list) -> sort(replace(list, home)));
         }
     }

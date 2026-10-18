@@ -12,13 +12,15 @@ public final class Validate {
     }
 
     public static boolean validName(String pattern, String name) {
-        if (name == null || name.isBlank()) {
+        if (name == null || name.isBlank() || pattern == null || pattern.isBlank()) {
             return false;
         }
         try {
             return PATTERNS.computeIfAbsent(pattern, java.util.regex.Pattern::compile)
                     .matcher(name).matches();
         } catch (Exception e) {
+            // An invalid regex in config.yml must reject the input, not throw
+            // out of the command handler.
             return false;
         }
     }
