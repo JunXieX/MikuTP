@@ -260,6 +260,9 @@ public final class MikuTPPlugin extends JavaPlugin {
         String oldMode = String.valueOf(config.sync.mode);
         String oldToken = String.valueOf(config.sync.token);
         String oldServerId = String.valueOf(config.crossServer.serverId);
+        // Read once by the running services at startup; a reload cannot apply them.
+        String oldPrefix = String.valueOf(config.storage.tablePrefix);
+        String oldLanguage = String.valueOf(config.languageFile);
         tasks.async(() -> {
             try {
                 loadConfiguration(false);
@@ -272,6 +275,12 @@ public final class MikuTPPlugin extends JavaPlugin {
                     config.sync.token = oldToken;
                     config.crossServer.serverId = oldServerId;
                     getSLF4JLogger().warn("sync.mode / sync.token / cross-server server-id changed in config.yml; "
+                            + "these take effect only after a full server restart and were ignored for now.");
+                }
+                if (!oldPrefix.equals(config.storage.tablePrefix) || !oldLanguage.equals(config.languageFile)) {
+                    config.storage.tablePrefix = oldPrefix;
+                    config.languageFile = oldLanguage;
+                    getSLF4JLogger().warn("storage.table-prefix / language-file changed in config.yml; "
                             + "these take effect only after a full server restart and were ignored for now.");
                 }
                 effects.setEnabled(config.teleport.sounds);

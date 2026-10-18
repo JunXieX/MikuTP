@@ -28,6 +28,9 @@ import java.util.function.Consumer;
  */
 public final class NetworkService {
 
+    /** How long a proxy round-trip may take before the caller gets a default. */
+    private static final long REQUEST_TIMEOUT_MS = 5000;
+
     private final JavaPlugin plugin;
     private final Tasks tasks;
     private final MessageService messages;
@@ -176,7 +179,7 @@ public final class NetworkService {
             if (pending != null && !pending.isDone()) {
                 pending.complete(List.of());
             }
-        }, 5000);
+        }, REQUEST_TIMEOUT_MS);
         send(carrier, ProxyMessages.encodeListPlayers(id, serverName));
         return future;
     }
@@ -191,7 +194,7 @@ public final class NetworkService {
             if (pending != null && !pending.isDone()) {
                 pending.complete(null);
             }
-        }, 5000);
+        }, REQUEST_TIMEOUT_MS);
         send(carrier, ProxyMessages.encodeResolvePlayer(id, name));
         return future;
     }

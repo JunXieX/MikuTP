@@ -54,6 +54,8 @@ public final class PlayerLifecycle implements Listener {
         // are replayed first: they may be the acceptance the player is waiting for.
         requestService.replayDeferred(player);
         requestService.redeliverPending(player);
+        // Applying a buffered handoff moves the player; do it last so no dialog is
+        // opened only to be closed by the teleport a moment later.
         teleports.applyPending(id);
     }
 

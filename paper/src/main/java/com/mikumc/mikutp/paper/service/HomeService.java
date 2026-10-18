@@ -41,6 +41,12 @@ public final class HomeService {
     private final Object[] locks = new Object[64];
     /** Join generation per player; a load from an older generation is discarded. */
     private final Map<UUID, Long> sessions = new ConcurrentHashMap<>();
+    /** When each player was last seen leaving; their cache is pruned lazily. */
+    private final Map<UUID, Long> departedAt = new ConcurrentHashMap<>();
+    /** How long a departed player's cached list is kept before being pruned. */
+    private static final long DEPARTED_TTL_MS = 5 * 60 * 1000L;
+    /** Period of the lazy prune: no thread of its own, driven from onJoin. */
+    private volatile long lastPrune;
 
     public HomeService(JavaPlugin plugin, Tasks tasks, MikuTPConfig config, Database database,
                        MessageService messages, CooldownManager cooldowns, TeleportService teleports,
@@ -70,42 +76,77 @@ public final class HomeService {
         // still be running (a quit does not take the stripe, see onQuit), and
         // without this stamp it could write the old snapshot over the new session.
         long session = sessions.merge(id, 1L, Long::sum);
+        departedAt.remove(id);
         tasks.entity(player, () -> limitCache.put(id, computeLimit(player)));
         loadAsync(id, session);
+        pruneIfDue();
+    }
+
+    /** Runs the departed-cache prune at most once a minute, from the join thread. */
+    private void pruneIfDue() {
+        long now = System.currentTimeMillis();
+        if (now - lastPrune < 60_000L) {
+            return;
+        }
+        lastPrune = now;
+        tasks.async(this::pruneDeparted);
     }
 
     /** Reads the player's homes and publishes them unless a mutation already did. */
     private void loadAsync(UUID id, long session) {
-        tasks.async(() -> {
-            // The read happens under the same stripe the mutations use: a remote
-            // HOME_SET merged into the cache while this query was in flight would
-            // otherwise be overwritten by the older snapshot.
-            synchronized (lockFor(id)) {
-                if (loadedPlayers.contains(id) || onlinePlayers.byId(id) == null
-                        || sessions.getOrDefault(id, 0L) != session) {
-                    return;
-                }
-                try {
-                    List<Home> loaded = sort(database.listHomes(id.toString()));
-                    cache.put(id, loaded);
-                    loadedPlayers.add(id);
-                } catch (Exception e) {
-                    plugin.getSLF4JLogger().warn("Failed to load homes", e);
-                }
+        tasks.async(() -> loadFor(id, session));
+    }
+
+    private void loadFor(UUID id, long session) {
+        // The read happens under the same stripe the mutations use: a remote
+        // HOME_SET merged into the cache while this query was in flight would
+        // otherwise be overwritten by the older snapshot.
+        synchronized (lockFor(id)) {
+            if (loadedPlayers.contains(id) || sessions.getOrDefault(id, 0L) != session) {
+                return;
             }
-        });
+            try {
+                List<Home> loaded = sort(database.listHomes(id.toString()));
+                cache.put(id, loaded);
+                loadedPlayers.add(id);
+            } catch (Exception e) {
+                plugin.getSLF4JLogger().warn("Failed to load homes", e);
+            }
+        }
     }
 
     public void onQuit(UUID player) {
-        // Memory only: this runs on the player's region thread (Folia confines
-        // PlayerQuitEvent there), and the load path holds this stripe while it
-        // queries the single SQLite connection. Waiting for that lock here would
-        // stall the whole region. A load left over from this session is neutralised
-        // by the join stamp checked under the lock before every write.
-        cache.remove(player);
-        limitCache.remove(player);
-        loadedPlayers.remove(player);
+        // Only players leave, so a session stamp can be dropped safely. The cache
+        // is *not* dropped here: this runs on the player's region thread and must
+        // not wait for the stripe (a load may hold it while reading SQLite), and a
+        // concurrent replicated merge must not be lost either. Departed entries are
+        // pruned lazily by pruneDeparted().
         sessions.remove(player);
+        limitCache.remove(player);
+        departedAt.put(player, System.currentTimeMillis());
+    }
+
+    /** Drops cache entries of players who have been offline for a while. */
+    private void pruneDeparted() {
+        long cutoff = System.currentTimeMillis() - DEPARTED_TTL_MS;
+        departedAt.entrySet().removeIf(entry -> {
+            if (entry.getValue() > cutoff) {
+                return false;
+            }
+            UUID id = entry.getKey();
+            if (onlinePlayers.byId(id) != null) {
+                return false;
+            }
+            // Take the stripe before dropping so a merge landing right now is
+            // either applied before the drop or after the sweep, never lost in
+            // between.
+            synchronized (lockFor(id)) {
+                cache.remove(id);
+                loadedPlayers.remove(id);
+                sessions.remove(id);
+            }
+            return true;
+        });
     }
 
     /**
@@ -122,6 +163,11 @@ public final class HomeService {
         List<Home> loaded = sort(database.listHomes(player.toString()));
         cache.put(player, loaded);
         loadedPlayers.add(player);
+        // A read for a departed player must not leave an entry behind that the
+        // prune has already passed over.
+        if (onlinePlayers.byId(player) == null && sessions.getOrDefault(player, 0L) == 0L) {
+            departedAt.putIfAbsent(player, System.currentTimeMillis());
+        }
         return loaded;
     }
 

@@ -218,6 +218,9 @@ public final class SyncCoordinator {
         try {
             flushPendingWritesLocked();
         } finally {
+            // Never leave staged updates behind: an Error thrown mid-transaction
+            // would otherwise be replayed against the next batch's result.
+            stagedCacheUpdates.clear();
             flushing.set(false);
         }
     }
@@ -242,6 +245,7 @@ public final class SyncCoordinator {
             // The batch committed: publish its cache updates.
             runStagedCacheUpdates();
         } catch (Exception e) {
+            stagedCacheUpdates.clear();
             // One malformed event must not discard the whole batch: re-apply the
             // entries one by one so only the truly broken write is dropped.
             plugin.getSLF4JLogger().warn("Batched apply of {} replicated changes failed, retrying individually",

@@ -550,14 +550,8 @@ public final class TeleportService {
             messages.send(player, "common.teleport-failed");
             return;
         }
-        player.teleportAsync(target).thenAccept(ok -> tasks.entity(player, () -> {
-            if (Boolean.TRUE.equals(ok)) {
-                messages.send(player, "common.teleported", "target", label);
-                effects.teleport(player);
-            } else {
-                messages.send(player, "common.teleport-failed");
-            }
-        }));
+        UUID id = player.getUniqueId();
+        player.teleportAsync(target).thenAccept(ok -> reportTeleport(id, ok, label));
     }
 
     private void playerTeleportAsync(UUID playerUuid, Location target, String label) {
@@ -565,14 +559,36 @@ public final class TeleportService {
         if (player == null) {
             return;
         }
-        player.teleportAsync(target).thenAccept(ok -> tasks.entity(player, () -> {
+        player.teleportAsync(target).thenAccept(ok -> reportTeleport(playerUuid, ok, label));
+    }
+
+    /**
+     * Reports a finished teleport on the player's current thread. The completion
+     * callback runs after the entity may already have moved to another region
+     * (cross-world teleports do), so the player is looked up again from the
+     * registry instead of reusing the captured scheduler.
+     */
+    private void reportTeleport(UUID playerUuid, Boolean ok, String label) {
+        Player player = onlinePlayers.byId(playerUuid);
+        if (player == null) {
+            return;
+        }
+        tasks.entity(player, () -> {
             if (Boolean.TRUE.equals(ok)) {
                 messages.send(player, "common.teleported", "target", label);
                 effects.teleport(player);
             } else {
                 messages.send(player, "common.teleport-failed");
             }
-        }));
+        });
+    }
+
+    private void playerTeleportAsync(UUID playerUuid, Location target, String label) {
+        Player player = onlinePlayers.byId(playerUuid);
+        if (player == null) {
+            return;
+        }
+        player.teleportAsync(target).thenAccept(ok -> reportTeleport(playerUuid, ok, label));
     }
 
     /** Anchor-based arrival fallback: use the stored position, else tell the player it failed. */

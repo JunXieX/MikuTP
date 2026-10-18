@@ -334,8 +334,11 @@ public final class RequestService {
                 }
             }
             // Feedback (sound + messages) touches the target's entity state, so it
-            // runs on the target's own thread.
-            tasks.entity(target, () -> respondCommon(target, request, response));
+            // runs on the target's own thread. If the scheduler is already retired
+            // the answer would be lost silently, so publish it from here instead.
+            if (tasks.entity(target, () -> respondCommon(target, request, response)) == null) {
+                respondCommon(target, request, response);
+            }
         });
     }
 
@@ -768,13 +771,17 @@ public final class RequestService {
             awaitingShow.add(request.id);
             return;
         }
-        tasks.entity(target, () -> {
+        if (tasks.entity(target, () -> {
             Consumer<TpRequest> handler = showRequestHandler;
             if (handler != null) {
                 handler.accept(request);
             }
             effects.requestReceived(target);
-        });
+        }) == null) {
+            // The entity scheduler was already retired: the dialog was never shown,
+            // so defer it to the next join instead of leaving it silently tracked.
+            awaitingShow.add(request.id);
+        }
     }
 
     private void processResponse(SyncEvent event) {
@@ -962,12 +969,14 @@ public final class RequestService {
             if (request.createdAt + expiryMs >= now) {
                 continue;
             }
-            if (!outgoingRequests.remove(entry.getKey(), request)) {
+            // Claim before removing. Losing the claim means the target is answering
+            // right now: leave the entry in place so its response still finds the
+            // request, and let that path publish the outcome.
+            if (!claimedRequests.add(request.id)) {
                 continue;
             }
-            // An answer already being handled by the target wins: it will publish
-            // its own result, so do not tell the requester it expired.
-            if (!claimedRequests.add(request.id)) {
+            if (!outgoingRequests.remove(entry.getKey(), request)) {
+                // A newer request replaced this one; the stale id needs no notice.
                 continue;
             }
             markAnswered(request.id);

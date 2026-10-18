@@ -320,9 +320,11 @@ public final class MikuTPVelocity {
                 if (event.request == null) {
                     return;
                 }
-                if (!deliverToPlayer(event.request.targetUuid, event)) {
-                    mailboxAdd(event.request.targetUuid, event);
-                }
+                // A ready signal is applied once and only makes sense on arrival:
+                // purge any stale copy instead of mail-adding, which would fire the
+                // teleport again on a later join.
+                purgeMailbox(event.request.targetUuid, event.request.id);
+                deliverToPlayer(event.request.targetUuid, event);
             }
             case TP_CANCEL -> {
                 if (event.request == null) {
@@ -471,8 +473,13 @@ public final class MikuTPVelocity {
     }
 
     private void deliverPending(UUID uuid, ServerConnection connection) {
-        PendingEntry entry = pendingEntries.remove(uuid);
-        if (entry == null || entry.expiry() <= System.currentTimeMillis()) {
+        PendingEntry entry = pendingEntries.get(uuid);
+        // Conditional remove: storePending() may have handed the same payload to
+        // this player concurrently, and delivering it twice would teleport twice.
+        if (entry == null || !pendingEntries.remove(uuid, entry)) {
+            return;
+        }
+        if (entry.expiry() <= System.currentTimeMillis()) {
             return;
         }
         send(connection, ProxyMessages.encodePending(uuid.toString(), entry.payload(), 0));

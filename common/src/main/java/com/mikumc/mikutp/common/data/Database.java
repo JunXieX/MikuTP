@@ -273,6 +273,18 @@ public final class Database implements AutoCloseable {
                 // re-inserting it would resurrect it on every backend.
                 return 0;
             }
+            // Home names are identifiers. Rows written by older versions may still
+            // carry mixed case, and the primary key is case-sensitive, so a
+            // replicated "base" next to a legacy "Base" would create a duplicate.
+            // Drop the case variants first, keeping the newer row.
+            try (PreparedStatement ps = connection.prepareStatement(
+                    "DELETE FROM %shomes WHERE owner_uuid = ? AND name = ? COLLATE NOCASE AND name <> ?"
+                            .formatted(prefix))) {
+                ps.setString(1, home.ownerUuid);
+                ps.setString(2, home.name);
+                ps.setString(3, home.name);
+                ps.executeUpdate();
+            }
             try (PreparedStatement ps = connection.prepareStatement("""
                     INSERT INTO %shomes (owner_uuid, name, server, world, x, y, z, yaw, pitch, created_at)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
