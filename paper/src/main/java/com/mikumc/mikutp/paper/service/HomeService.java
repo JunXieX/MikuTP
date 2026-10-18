@@ -65,6 +65,11 @@ public final class HomeService {
     public void onJoin(Player player) {
         UUID id = player.getUniqueId();
         tasks.entity(player, () -> limitCache.put(id, computeLimit(player)));
+        loadAsync(id);
+    }
+
+    /** Reads the player's homes and publishes them unless a path already did. */
+    private void loadAsync(UUID id) {
         tasks.async(() -> {
             try {
                 List<Home> loaded = sort(database.listHomes(id.toString()));
@@ -115,6 +120,17 @@ public final class HomeService {
     public List<Home> homes(UUID player) {
         List<Home> homes = cache.get(player);
         return homes == null ? List.of() : homes;
+    }
+
+    /**
+     * Home list for a menu, loading on first use. Without this a list opened in
+     * the window before the join-time load completes looks empty.
+     */
+    public List<Home> homesForDisplay(UUID player) {
+        if (!loadedPlayers.contains(player)) {
+            loadAsync(player);
+        }
+        return homes(player);
     }
 
     /** Home limit from mikutp.homes.&lt;n&gt; permissions; must run on the player's thread. */
@@ -188,24 +204,27 @@ public final class HomeService {
         tasks.async(() -> {
             synchronized (lockFor(id)) {
                 try {
-                    boolean removed = database.deleteHome(id.toString(), wanted);
-                    if (!removed) {
-                        // Case variant stored by an older version: delete by its stored name.
-                        for (Home home : database.listHomes(id.toString())) {
-                            if (home.name.equalsIgnoreCase(wanted)) {
-                                removed = database.deleteHome(id.toString(), home.name);
-                                break;
-                            }
+                    // Load through the same path mutations use: when the join-time
+                    // load has not finished, deleting straight from the cache would
+                    // miss the entry and leave a stale snapshot to be written later.
+                    List<Home> current = homesForMutation(id);
+                    Home match = null;
+                    for (Home home : current) {
+                        if (home.name.equalsIgnoreCase(wanted)) {
+                            match = home;
+                            break;
                         }
                     }
-                    if (removed) {
-                        cache.computeIfPresent(id, (k, list) -> sort(list.stream()
-                                .filter(h -> !h.name.equalsIgnoreCase(wanted)).toList()));
-                        messages.send(player, "home.deleted", "name", wanted);
-                        publishHomeDelete(id.toString(), wanted);
-                    } else {
+                    if (match == null || !database.deleteHome(id.toString(), match.name)) {
                         messages.send(player, "home.not-found", "name", wanted);
+                        return;
                     }
+                    cache.put(id, sort(current.stream()
+                            .filter(h -> !h.name.equalsIgnoreCase(wanted)).toList()));
+                    messages.send(player, "home.deleted", "name", wanted);
+                    // Publish the stored spelling so the other backends delete the
+                    // exact row rather than relying on case-insensitive matching.
+                    publishHomeDelete(id.toString(), match.name);
                 } catch (Exception e) {
                     plugin.getSLF4JLogger().warn("Failed to delete home", e);
                 }

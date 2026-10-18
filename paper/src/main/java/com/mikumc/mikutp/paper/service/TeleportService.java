@@ -135,14 +135,22 @@ public final class TeleportService {
 
     /** Consumes a buffered cross-server handoff for a player who just arrived. */
     public void applyPending(UUID playerUuid) {
-        PendingTeleport pending = arriving.remove(playerUuid);
-        if (pending == null || pending.position == null || expired(pending)) {
+        PendingTeleport pending = arriving.get(playerUuid);
+        if (pending == null || pending.position == null) {
+            return;
+        }
+        if (expired(pending)) {
+            arriving.remove(playerUuid, pending);
             return;
         }
         String destServer = pending.position.server;
         if (destServer != null && !destServer.isBlank() && !destServer.equals(serverId)) {
+            // Not our handoff: keep it buffered. The payload is only meant for the
+            // destination server, and dropping it here would lose the teleport if
+            // the proxy delivered it slightly early.
             return;
         }
+        arriving.remove(playerUuid, pending);
         if (pending.anchorUuid != null && !pending.anchorUuid.isBlank()) {
             UUID anchorId = parseUuid(pending.anchorUuid);
             Player anchor = anchorId == null ? null : Bukkit.getPlayer(anchorId);

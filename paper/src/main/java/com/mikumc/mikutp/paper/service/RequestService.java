@@ -235,6 +235,31 @@ public final class RequestService {
         awaitingShow.remove(requestId);
     }
 
+    /**
+     * Clears the requester's outgoing entry only when it still refers to
+     * {@code requestId}. An unconditional remove would drop a newer request the
+     * same player sent while this answer was in flight, losing its tracking.
+     */
+    private void clearOutgoing(String requesterUuid, String requestId) {
+        UUID requester = parseUuid(requesterUuid);
+        if (requester == null) {
+            return;
+        }
+        outgoingRequests.computeIfPresent(requester, (k, current) ->
+                current.id.equals(requestId) ? null : current);
+    }
+
+    private static UUID parseUuid(String value) {
+        if (value == null) {
+            return null;
+        }
+        try {
+            return UUID.fromString(value);
+        } catch (IllegalArgumentException e) {
+            return null;
+        }
+    }
+
     /** The requester's previous outgoing request is being replaced. */
     private void publishRequest(TpRequest request) {
         SyncEvent event = SyncEvent.create(SyncEvent.Type.TP_NEW, serverId);
@@ -264,7 +289,7 @@ public final class RequestService {
             // replay TP_NEW (mailbox redelivery, fan-out retry) to a backend that
             // missed it the first time.
             markAnswered(request.id);
-            outgoingRequests.remove(UUID.fromString(request.requesterUuid));
+            clearOutgoing(request.requesterUuid, request.id);
             respondCommon(target, request, response);
         });
     }
@@ -482,15 +507,21 @@ public final class RequestService {
      */
     private void processCancel(SyncEvent event) {
         TpRequest revokedRequest = event.request;
-        String requesterUuid = revokedRequest == null ? null : revokedRequest.requesterUuid;
-        String requesterName = revokedRequest == null ? null : revokedRequest.requesterName;
-        if (requesterUuid == null || requesterName == null) {
+        if (revokedRequest == null) {
+            return;
+        }
+        String requesterName = revokedRequest.requesterName;
+        String revokedId = revokedRequest.id;
+        if (requesterName == null || revokedId == null) {
             return;
         }
         for (Map.Entry<UUID, Map<String, TpRequest>> entry : incoming.entrySet()) {
             List<TpRequest> found = new ArrayList<>();
+            // Match the exact request id, not every request from this requester:
+            // the requester may already have sent a newer request, whose cancel
+            // event would otherwise wipe this one here.
             entry.getValue().values().removeIf(request -> {
-                if (request.requesterUuid.equals(requesterUuid)) {
+                if (revokedId.equals(request.id)) {
                     found.add(request);
                     return true;
                 }
@@ -603,7 +634,7 @@ public final class RequestService {
         if (requester == null) {
             return;
         }
-        outgoingRequests.remove(requester.getUniqueId());
+        clearOutgoing(request.requesterUuid, request.id);
         tasks.entity(requester, () -> {
             Response response;
             try {
@@ -653,7 +684,7 @@ public final class RequestService {
         if (mover == null) {
             return;
         }
-        outgoingRequests.remove(mover.getUniqueId());
+        clearOutgoing(request.targetUuid, request.id);
         messages.send(mover, "tpa.accepted-requester", "player", request.requesterName);
         Player anchor = Bukkit.getPlayer(UUID.fromString(request.requesterUuid));
         if (anchor != null) {
@@ -698,7 +729,7 @@ public final class RequestService {
                     return false;
                 }
                 markAnswered(request.id);
-                outgoingRequests.remove(UUID.fromString(request.requesterUuid));
+                clearOutgoing(request.requesterUuid, request.id);
                 Player requester = Bukkit.getPlayer(UUID.fromString(request.requesterUuid));
                 if (requester != null) {
                     tasks.entity(requester, () -> messages.send(requester, "tpa.expired-requester",
@@ -715,6 +746,9 @@ public final class RequestService {
             // otherwise leave one entry behind per target forever.
             if (mine.isEmpty()) {
                 incoming.remove(targetId, mine);
+                // lastIncoming must not keep pointing at a request that no longer
+                // exists: /tpaccept would then answer a dead id forever.
+                lastIncoming.remove(targetId);
             }
         }
     }

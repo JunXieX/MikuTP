@@ -150,8 +150,11 @@ public final class WildService {
     }
 
     private void giveUp(Player player) {
-        cooldowns.clear(player.getUniqueId(), CooldownManager.Kind.WILD);
-        messages.send(player, "wild.failed");
+        UUID id = player.getUniqueId();
+        cooldowns.clear(id, CooldownManager.Kind.WILD);
+        // Called from the async search loop and from region threads alike:
+        // messages must be sent from the player's own thread on Folia.
+        tasks.entity(player, () -> messages.send(player, "wild.failed"));
     }
 
     /** Runs on the region thread that owns the candidate chunk. */

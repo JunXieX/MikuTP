@@ -29,6 +29,8 @@ public final class WarpService {
     private final TeleportService teleports;
     private final String serverId;
     private volatile List<Warp> warps = List.of();
+    /** True once the list has been read from the database. */
+    private volatile boolean loaded;
     /** Warps are one shared list: serialise mutations so two admins cannot race it. */
     private final Object mutationLock = new Object();
 
@@ -44,10 +46,28 @@ public final class WarpService {
         this.serverId = config.crossServer.serverId;
     }
 
+    /** Initial load; never overwrites a list that a command already mutated. */
     public void load() {
+        reload(false);
+    }
+
+    /** /mtp reload: re-reads the table, discarding the in-memory copy. */
+    public void reload() {
+        reload(true);
+    }
+
+    private void reload(boolean force) {
         tasks.async(() -> {
             try {
-                warps = sorted(database.listWarps(serverId));
+                List<Warp> loadedWarps = sorted(database.listWarps(serverId));
+                synchronized (mutationLock) {
+                    // A /setwarp that won the race already wrote a newer list;
+                    // publishing the older snapshot would silently drop it.
+                    if (force || !loaded) {
+                        warps = loadedWarps;
+                        loaded = true;
+                    }
+                }
             } catch (Exception e) {
                 plugin.getSLF4JLogger().warn("Failed to load warps", e);
             }
@@ -55,6 +75,31 @@ public final class WarpService {
     }
 
     public List<Warp> warps() {
+        return warps;
+    }
+
+    /**
+     * Warp list for display. The startup load runs async, so a menu opened in the
+     * first moments may see an empty cache; kick a reload rather than blocking
+     * the command thread on database I/O.
+     */
+    public List<Warp> warpsForDisplay() {
+        if (!loaded) {
+            load();
+        }
+        return warps;
+    }
+
+    /**
+     * Authoritative warp list for a mutation or a lookup that must not miss a
+     * row, reading the database on first use. Callers already hold the mutation
+     * lock where applicable.
+     */
+    private List<Warp> warpsForUse() throws java.sql.SQLException {
+        if (!loaded) {
+            warps = sorted(database.listWarps(serverId));
+            loaded = true;
+        }
         return warps;
     }
 
@@ -74,7 +119,8 @@ public final class WarpService {
             tasks.async(() -> {
                 synchronized (mutationLock) {
                     try {
-                        for (Warp existing : warps) {
+                        List<Warp> current = warpsForUse();
+                        for (Warp existing : current) {
                             if (!existing.name.equals(wanted) && existing.name.equalsIgnoreCase(wanted)) {
                                 database.deleteWarp(existing.name);
                             }
@@ -83,7 +129,8 @@ public final class WarpService {
                                 loc.getX(), loc.getY(), loc.getZ(), loc.getYaw(), loc.getPitch());
                         Warp warp = new Warp(wanted, position, System.currentTimeMillis());
                         database.saveWarp(warp);
-                        warps = sorted(replace(warps, warp));
+                        warps = sorted(replace(current, warp));
+                        loaded = true;
                         messages.send(player, "warp.set", "name", wanted);
                     } catch (Exception e) {
                         plugin.getSLF4JLogger().warn("Failed to save warp", e);
@@ -101,21 +148,21 @@ public final class WarpService {
         tasks.async(() -> {
             synchronized (mutationLock) {
                 try {
-                    boolean removed = database.deleteWarp(wanted);
-                    if (!removed) {
-                        for (Warp warp : database.listWarps(serverId)) {
-                            if (warp.name.equalsIgnoreCase(wanted)) {
-                                removed = database.deleteWarp(warp.name);
-                                break;
-                            }
+                    List<Warp> current = warpsForUse();
+                    Warp match = null;
+                    for (Warp warp : current) {
+                        if (warp.name.equalsIgnoreCase(wanted)) {
+                            match = warp;
+                            break;
                         }
                     }
-                    if (removed) {
-                        warps = sorted(warps.stream().filter(w -> !w.name.equalsIgnoreCase(wanted)).toList());
-                        messages.send(player, "warp.deleted", "name", wanted);
-                    } else {
+                    if (match == null || !database.deleteWarp(match.name)) {
                         messages.send(player, "warp.not-found", "name", wanted);
+                        return;
                     }
+                    warps = sorted(current.stream()
+                            .filter(w -> !w.name.equalsIgnoreCase(wanted)).toList());
+                    messages.send(player, "warp.deleted", "name", wanted);
                 } catch (Exception e) {
                     plugin.getSLF4JLogger().warn("Failed to delete warp", e);
                 }
@@ -133,14 +180,26 @@ public final class WarpService {
             messages.send(player, "common.cooldown", "seconds", String.valueOf(remaining));
             return;
         }
-        Warp warp = find(warps, name);
-        if (warp == null) {
-            messages.send(player, "warp.not-found", "name", name);
-            return;
-        }
-        cooldowns.apply(id, CooldownManager.Kind.WARP);
-        messages.send(player, "warp.going", "name", warp.name);
-        teleports.send(player, warp.position, PendingTeleport.Source.WARP, warp.name, null);
+        tasks.async(() -> {
+            Warp warp;
+            try {
+                synchronized (mutationLock) {
+                    warp = find(warpsForUse(), name);
+                }
+            } catch (Exception e) {
+                plugin.getSLF4JLogger().warn("Failed to read warps", e);
+                messages.send(player, "warp.not-found", "name", name);
+                return;
+            }
+            if (warp == null) {
+                messages.send(player, "warp.not-found", "name", name);
+                return;
+            }
+            // Only burn the cooldown once a real warp was found.
+            cooldowns.apply(id, CooldownManager.Kind.WARP);
+            messages.send(player, "warp.going", "name", warp.name);
+            teleports.send(player, warp.position, PendingTeleport.Source.WARP, warp.name, null);
+        });
     }
 
     /** True (and tells the player) when the warp feature is switched off. */

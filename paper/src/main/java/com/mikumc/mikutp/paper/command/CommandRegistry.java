@@ -175,7 +175,7 @@ public final class CommandRegistry {
     }
 
     private void openHomeMenu(Player player, boolean delete) {
-        var homes = homeService.homes(player.getUniqueId());
+        var homes = homeService.homesForDisplay(player.getUniqueId());
         if (dialogsEnabled()) {
             if (delete) {
                 dialogs.showHomeDelete(player, homes, 1, name -> homeService.delete(player, name));
@@ -192,7 +192,7 @@ public final class CommandRegistry {
     private LiteralCommandNode<CommandSourceStack> warp() {
         return playerRoot("warp", "mikutp.warp",
                 player -> {
-                    var warps = warpService.warps();
+                    var warps = warpService.warpsForDisplay();
                     if (dialogsEnabled()) {
                         dialogs.showWarpList(player, warps, 1, name -> warpService.go(player, name));
                     } else {
@@ -200,7 +200,7 @@ public final class CommandRegistry {
                     }
                 },
                 (player, name) -> warpService.go(player, name),
-                player -> warpService.warps().stream().map(w -> w.name).toList());
+                player -> warpService.warpsForDisplay().stream().map(w -> w.name).toList());
     }
 
     private LiteralCommandNode<CommandSourceStack> setwarp() {
@@ -219,7 +219,7 @@ public final class CommandRegistry {
     private LiteralCommandNode<CommandSourceStack> delwarp() {
         return playerRoot("delwarp", "mikutp.warp.manage",
                 player -> {
-                    var warps = warpService.warps();
+                    var warps = warpService.warpsForDisplay();
                     if (dialogsEnabled()) {
                         dialogs.showWarpDelete(player, warps, 1, name -> warpService.delete(player, name));
                     } else {
@@ -227,7 +227,7 @@ public final class CommandRegistry {
                     }
                 },
                 (player, name) -> warpService.delete(player, name),
-                player -> warpService.warps().stream().map(w -> w.name).toList());
+                player -> warpService.warpsForDisplay().stream().map(w -> w.name).toList());
     }
 
     // ------------------------------------------------------------------ tpa

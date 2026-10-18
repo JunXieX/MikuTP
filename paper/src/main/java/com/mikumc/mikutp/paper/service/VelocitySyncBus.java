@@ -133,17 +133,26 @@ public final class VelocitySyncBus implements SyncBus {
     private void send(String batchJson, List<com.google.gson.JsonObject> ops) {
         Player carrier = onlinePlayers.any();
         if (carrier == null) {
-            for (int i = ops.size() - 1; i >= 0; i--) {
-                outbound.addFirst(ops.get(i));
-            }
-            queuedOps.addAndGet(ops.size());
+            requeue(ops);
             return;
         }
         tasks.entity(carrier, () -> {
-            if (carrier.isOnline()) {
-                carrier.sendPluginMessage(plugin, ProxyMessages.CHANNEL,
-                        batchJson.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            if (!carrier.isOnline()) {
+                // The carrier vanished between the lookup and the send; without
+                // this the batch would be lost instead of retried.
+                requeue(ops);
+                return;
             }
+            carrier.sendPluginMessage(plugin, ProxyMessages.CHANNEL,
+                    batchJson.getBytes(java.nio.charset.StandardCharsets.UTF_8));
         });
+    }
+
+    /** Puts a drained batch back at the head of the queue, preserving order. */
+    private void requeue(List<com.google.gson.JsonObject> ops) {
+        for (int i = ops.size() - 1; i >= 0; i--) {
+            outbound.addFirst(ops.get(i));
+        }
+        queuedOps.addAndGet(ops.size());
     }
 }

@@ -147,7 +147,22 @@ public final class SyncCoordinator {
                 }
             });
         } catch (Exception e) {
-            plugin.getSLF4JLogger().warn("Failed to apply {} replicated changes", batch.size(), e);
+            // One malformed event must not discard the whole batch: re-apply the
+            // entries one by one so only the truly broken write is dropped.
+            plugin.getSLF4JLogger().warn("Batched apply of {} replicated changes failed, retrying individually",
+                    batch.size(), e);
+            int dropped = 0;
+            for (PendingWrite write : batch) {
+                try {
+                    database.runTransaction(write::apply);
+                } catch (Exception single) {
+                    dropped++;
+                    plugin.getSLF4JLogger().warn("Dropped one replicated change", single);
+                }
+            }
+            if (dropped > 0) {
+                plugin.getSLF4JLogger().warn("Dropped {} of {} replicated changes", dropped, batch.size());
+            }
         }
     }
 

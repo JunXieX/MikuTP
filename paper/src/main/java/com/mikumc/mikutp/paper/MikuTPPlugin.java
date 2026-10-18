@@ -234,7 +234,7 @@ public final class MikuTPPlugin extends JavaPlugin {
         try {
             loadConfiguration(false);
             effects.setEnabled(config.teleport.sounds);
-            warpService.load();
+            warpService.reload();
             getSLF4JLogger().info("MikuTP reloaded (sync mode, server-id and storage changes need a restart)");
         } catch (IOException e) {
             getSLF4JLogger().error("Reload failed: {}", e.getMessage());

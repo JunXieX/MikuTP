@@ -299,6 +299,9 @@ public final class MikuTPVelocity {
 
     /** Deliver a wire event to the backend currently hosting the player. */
     private boolean deliverToPlayer(String playerUuid, SyncEvent event) {
+        if (playerUuid == null) {
+            return false;
+        }
         UUID id;
         try {
             id = UUID.fromString(playerUuid);
@@ -448,6 +451,9 @@ public final class MikuTPVelocity {
     }
 
     private void mailboxAdd(String targetUuid, SyncEvent event) {
+        if (targetUuid == null) {
+            return;
+        }
         try {
             UUID target = UUID.fromString(targetUuid);
             List<MailboxEntry> mailbox = mailboxes.computeIfAbsent(target, k -> new ArrayList<>());
@@ -461,6 +467,9 @@ public final class MikuTPVelocity {
     }
 
     private void purgeMailbox(String targetUuid, String requestId) {
+        if (targetUuid == null || requestId == null) {
+            return;
+        }
         UUID target;
         try {
             target = UUID.fromString(targetUuid);
