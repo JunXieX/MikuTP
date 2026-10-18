@@ -46,7 +46,7 @@ public final class Tasks {
      * callback does not run either.
      */
     public ScheduledTask entity(Player player, Runnable run, Runnable retired) {
-        return player.getScheduler().run(plugin, task -> run.run(), retired == null ? null : task -> retired.run());
+        return player.getScheduler().run(plugin, task -> run.run(), retired);
     }
 
     /** Runs once per tick on the player's region thread until the consumer cancels it. */
