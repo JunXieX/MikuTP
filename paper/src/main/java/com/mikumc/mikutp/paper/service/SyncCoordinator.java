@@ -56,6 +56,9 @@ public final class SyncCoordinator {
     private final AtomicInteger queuedWrites = new AtomicInteger();
     /** Counts shed writes; only the first one is logged. */
     private final AtomicInteger shedWrites = new AtomicInteger();
+    /** Set once the plugin is disabling: new replicated writes are refused so
+     * the drain below is guaranteed to terminate. */
+    private volatile boolean shuttingDown;
     /** Cache updates produced by the batch currently being applied. Only the
      * flush thread touches this; they run after the transaction committed. */
     private final java.util.Deque<Runnable> stagedCacheUpdates = new java.util.ArrayDeque<>();
@@ -110,6 +113,15 @@ public final class SyncCoordinator {
             plugin.getSLF4JLogger().warn("{} replicated changes could not be flushed before shutdown",
                     queuedWrites.get());
         }
+    }
+
+    /**
+     * Stops accepting new writes and drains the queue. Called on disable before
+     * the database closes; the wait is bounded by the caller's shutdown window.
+     */
+    public void close() {
+        shuttingDown = true;
+        shutdown();
     }
 
     /** /mtp resync: asks every backend to re-publish its full local state. */
@@ -169,6 +181,11 @@ public final class SyncCoordinator {
     }
 
     private void enqueue(PendingWrite write) {
+        if (shuttingDown) {
+            // The queue is being drained for shutdown; accepting here would make
+            // the drain a moving target and the write would be lost anyway.
+            return;
+        }
         // Bound the queue: a large resync arriving faster than the flush can
         // commit would otherwise grow it without limit. Shedding the newest is
         // safe because the activation resync re-publishes full state.

@@ -39,6 +39,8 @@ public final class HomeService {
     private final Map<UUID, Integer> limitCache = new ConcurrentHashMap<>();
     /** Striped monitors: two /sethome in flight must not both pass the limit check. */
     private final Object[] locks = new Object[64];
+    /** Join generation per player; a load from an older generation is discarded. */
+    private final Map<UUID, Long> sessions = new ConcurrentHashMap<>();
 
     public HomeService(JavaPlugin plugin, Tasks tasks, MikuTPConfig config, Database database,
                        MessageService messages, CooldownManager cooldowns, TeleportService teleports,
@@ -64,18 +66,23 @@ public final class HomeService {
 
     public void onJoin(Player player) {
         UUID id = player.getUniqueId();
+        // Each join starts a new session. A load started by a previous session may
+        // still be running (a quit does not take the stripe, see onQuit), and
+        // without this stamp it could write the old snapshot over the new session.
+        long session = sessions.merge(id, 1L, Long::sum);
         tasks.entity(player, () -> limitCache.put(id, computeLimit(player)));
-        loadAsync(id);
+        loadAsync(id, session);
     }
 
     /** Reads the player's homes and publishes them unless a mutation already did. */
-    private void loadAsync(UUID id) {
+    private void loadAsync(UUID id, long session) {
         tasks.async(() -> {
             // The read happens under the same stripe the mutations use: a remote
             // HOME_SET merged into the cache while this query was in flight would
             // otherwise be overwritten by the older snapshot.
             synchronized (lockFor(id)) {
-                if (loadedPlayers.contains(id) || onlinePlayers.byId(id) == null) {
+                if (loadedPlayers.contains(id) || onlinePlayers.byId(id) == null
+                        || sessions.getOrDefault(id, 0L) != session) {
                     return;
                 }
                 try {
@@ -93,11 +100,12 @@ public final class HomeService {
         // Memory only: this runs on the player's region thread (Folia confines
         // PlayerQuitEvent there), and the load path holds this stripe while it
         // queries the single SQLite connection. Waiting for that lock here would
-        // stall the whole region. A load that finishes afterwards re-checks the
-        // registry under the same lock and refuses to write for an offline player.
+        // stall the whole region. A load left over from this session is neutralised
+        // by the join stamp checked under the lock before every write.
         cache.remove(player);
         limitCache.remove(player);
         loadedPlayers.remove(player);
+        sessions.remove(player);
     }
 
     /**

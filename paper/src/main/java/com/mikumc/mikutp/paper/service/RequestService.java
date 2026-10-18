@@ -75,6 +75,8 @@ public final class RequestService {
     private final BoundedIdSet answeredRequests = new BoundedIdSet();
     private final BoundedIdSet deliveredEvents = new BoundedIdSet();
     private final BoundedIdSet handledEvents = new BoundedIdSet();
+    /** Request ids a client is answering right now; only one answer may win. */
+    private final BoundedIdSet claimedRequests = new BoundedIdSet();
     /** Requests tracked while their target was not resolvable to a player yet. */
     private final Set<String> awaitingShow = ConcurrentHashMap.newKeySet();
     /**
@@ -124,7 +126,9 @@ public final class RequestService {
 
     public void onQuit(UUID player) {
         lastIncoming.remove(player);
-        deferred.remove(player);
+        // Deferred answers die with the session: they describe a request the
+        // player was waiting for while offline, and replaying them on a later
+        // login of a stale copy would teleport them unexpectedly.
         // The quitting player's incoming requests are dropped locally: the proxy
         // mailbox redelivers unanswered requests on rejoin.
         Map<String, TpRequest> mine = incoming.remove(player);
@@ -296,8 +300,20 @@ public final class RequestService {
     public void respond(Player target, String requestId, Response response) {
         tasks.async(() -> {
             Map<String, TpRequest> mine = incoming.get(target.getUniqueId());
-            TpRequest request = mine == null ? null : mine.remove(requestId);
+            if (mine == null) {
+                messages.send(target, "tpa.no-pending");
+                return;
+            }
+            // Claim the id before removing the entry: the sweep decides expiry on
+            // the same id under this guard, so an accept racing the expiry cannot
+            // produce both "expired" and a teleport.
+            if (!claimedRequests.add(requestId)) {
+                messages.send(target, "tpa.no-pending");
+                return;
+            }
+            TpRequest request = mine.remove(requestId);
             if (request == null) {
+                claimedRequests.remove(requestId);
                 messages.send(target, "tpa.no-pending");
                 return;
             }
@@ -690,7 +706,22 @@ public final class RequestService {
         if (queued == null) {
             return;
         }
+        // Skip answers whose request has already been answered, finalised or
+        // expired: a stale acceptance would teleport the player somewhere they
+        // are no longer waiting to go.
+        long now = System.currentTimeMillis();
+        long expiryMs = config.tpa.requestExpirySeconds * 1000L;
         for (SyncEvent event : queued) {
+            TpRequest request = event.request;
+            if (request == null || request.id == null || answeredRequests.contains(request.id)) {
+                continue;
+            }
+            if (request.createdAt + expiryMs < now) {
+                continue;
+            }
+            if (onlinePlayers.byId(player.getUniqueId()) == null) {
+                return;
+            }
             try {
                 onSyncEvent(event);
             } catch (Exception e) {
@@ -760,16 +791,19 @@ public final class RequestService {
             defer(requesterId, event);
             return;
         }
-        if (!handledEvents.add(event.id)) {
-            return;
-        }
-        clearOutgoing(request.requesterUuid, request.id);
+        // Parse before claiming the event id: a payload that cannot be understood
+        // must not burn the id, otherwise a later well-formed retry (mailbox
+        // replay) would be discarded as handled and the request would hang.
         Response parsed;
         try {
             parsed = Response.valueOf(event.response);
         } catch (IllegalArgumentException | NullPointerException e) {
             return;
         }
+        if (event.id == null || !handledEvents.add(event.id)) {
+            return;
+        }
+        clearOutgoing(request.requesterUuid, request.id);
         tasks.entity(requester, () -> {
             switch (parsed) {
                 case ACCEPT -> {
@@ -818,7 +852,7 @@ public final class RequestService {
             defer(moverId, event);
             return;
         }
-        if (!handledEvents.add(event.id)) {
+        if (event.id == null || !handledEvents.add(event.id)) {
             return;
         }
         clearOutgoing(request.targetUuid, request.id);
@@ -868,6 +902,11 @@ public final class RequestService {
             Map<String, TpRequest> mine = entry.getValue();
             mine.values().removeIf(request -> {
                 if (request.createdAt + expiryMs >= now) {
+                    return false;
+                }
+                // Sweeping keeps the expired entry in the map; the claim guard is
+                // what decides which side wins an answer racing this expiry.
+                if (!claimedRequests.add(request.id)) {
                     return false;
                 }
                 markAnswered(request.id);
@@ -924,6 +963,11 @@ public final class RequestService {
                 continue;
             }
             if (!outgoingRequests.remove(entry.getKey(), request)) {
+                continue;
+            }
+            // An answer already being handled by the target wins: it will publish
+            // its own result, so do not tell the requester it expired.
+            if (!claimedRequests.add(request.id)) {
                 continue;
             }
             markAnswered(request.id);

@@ -19,7 +19,9 @@ public final class StorageFactory {
         HikariConfig h = new HikariConfig();
         h.setPoolName("MikuTP-SQLite");
         h.setMaximumPoolSize(1);
-        h.setConnectionTimeout(5000);
+        // Covers a batch transaction plus one queued reader: a longer wait than
+        // the 5s default keeps a busy batch from failing an unrelated query.
+        h.setConnectionTimeout(15000);
         h.setDriverClassName("org.sqlite.JDBC");
         // busy_timeout: WAL still returns SQLITE_BUSY in a few edge cases (e.g.
         // checkpointing); without a wait the write fails instead of retrying.

@@ -99,7 +99,11 @@ public final class ProfileService {
                 // snapshot produced before it is rejected in SQL.
                 String known = name == null ? "" : name;
                 database.upsertPlayer(uuid.toString(), known, stamped);
-                database.runTransaction(tx -> tx.setTpaEnabled(uuid.toString(), enabled, stamped));
+                // The toggle is the newest profile change as of "now": move the
+                // stamp forward past whatever the upsert wrote, otherwise the guard
+                // in Tx#setTpaEnabled (last_online <= at) could reject this write.
+                long applied = System.currentTimeMillis();
+                database.runTransaction(tx -> tx.setTpaEnabled(uuid.toString(), enabled, applied));
             } catch (Exception e) {
                 plugin.getSLF4JLogger().warn("Failed to persist tpa toggle", e);
                 return;

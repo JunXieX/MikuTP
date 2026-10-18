@@ -160,7 +160,8 @@ public final class CommandRegistry {
                     if (dialogsEnabled()) {
                         dialogs.showNameInput(player, "dialog.name.title", name -> homeService.set(player, name));
                     } else {
-                        messages.send(player, "common.invalid-name");
+                        // Without dialogs the name has to come from the command itself.
+                        messages.send(player, "home.usage");
                     }
                 },
                 (player, name) -> homeService.set(player, name),
@@ -218,7 +219,8 @@ public final class CommandRegistry {
                     if (dialogsEnabled()) {
                         dialogs.showNameInput(player, "dialog.name.title", name -> warpService.set(player, name));
                     } else {
-                        messages.send(player, "common.invalid-name");
+                        // Without dialogs the name has to come from the command itself.
+                        messages.send(player, "warp.usage");
                     }
                 },
                 (player, name) -> warpService.set(player, name),

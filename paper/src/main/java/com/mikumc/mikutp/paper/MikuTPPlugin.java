@@ -163,7 +163,7 @@ public final class MikuTPPlugin extends JavaPlugin {
             requestService.shutdown();
         }
         if (coordinator != null) {
-            coordinator.shutdown();
+            coordinator.close();
         }
         if (expansion != null) {
             expansion.unregister();
