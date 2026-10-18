@@ -30,6 +30,8 @@ public final class SyncCoordinator {
     private static final long DUMP_GUARD_MS = 30_000;
     private static final long FLUSH_INTERVAL_MS = 250;
     private static final int MAX_OPS_PER_FLUSH = 2048;
+    /** Cap on queued replicated writes; a full-network resync is far smaller. */
+    private static final int MAX_PENDING_WRITES = 65_536;
 
     private final JavaPlugin plugin;
     private final Tasks tasks;
@@ -47,6 +49,16 @@ public final class SyncCoordinator {
     private final java.util.concurrent.atomic.AtomicLong lastDump =
             new java.util.concurrent.atomic.AtomicLong(0L);
     private final AtomicInteger activePlayers = new AtomicInteger();
+    /** Serialises flushes so the periodic task cannot interleave with a drain. */
+    private final java.util.concurrent.atomic.AtomicBoolean flushing =
+            new java.util.concurrent.atomic.AtomicBoolean(false);
+    /** Mirrors the queue depth so the cap check is O(1). */
+    private final AtomicInteger queuedWrites = new AtomicInteger();
+    /** Counts shed writes; only the first one is logged. */
+    private final AtomicInteger shedWrites = new AtomicInteger();
+    /** Cache updates produced by the batch currently being applied. Only the
+     * flush thread touches this; they run after the transaction committed. */
+    private final java.util.Deque<Runnable> stagedCacheUpdates = new java.util.ArrayDeque<>();
     private ScheduledTask flushTask;
 
     public SyncCoordinator(JavaPlugin plugin, Tasks tasks, MikuTPConfig config, Database database,
@@ -79,7 +91,15 @@ public final class SyncCoordinator {
             flushTask = null;
         }
         // Drain what is left so a clean stop does not lose replicated state.
-        flushPendingWrites();
+        // Repeated because a flush that is skipped while another one is in
+        // progress would otherwise leave its batch behind.
+        while (!pendingWrites.isEmpty()) {
+            int before = queuedWrites.get();
+            flushPendingWrites();
+            if (queuedWrites.get() >= before) {
+                break;
+            }
+        }
     }
 
     /** /mtp resync: asks every backend to re-publish its full local state. */
@@ -113,9 +133,9 @@ public final class SyncCoordinator {
             return;
         }
         switch (event.type) {
-            case HOME_SET -> enqueue(tx -> homeService.applyRemoteSet(event, tx));
-            case HOME_DELETE -> enqueue(tx -> homeService.applyRemoteDelete(event, tx));
-            case PROFILE -> enqueue(tx -> profileService.applySync(event, tx));
+            case HOME_SET -> enqueue(tx -> homeService.applyRemoteSet(event, tx, this::afterCommit));
+            case HOME_DELETE -> enqueue(tx -> homeService.applyRemoteDelete(event, tx, this::afterCommit));
+            case PROFILE -> enqueue(tx -> profileService.applySync(event, tx, this::afterCommit));
             case BACK -> enqueue(tx -> teleports.applySyncBack(event, tx));
             case IGNORE_SET, IGNORE_DELETE -> enqueue(tx -> requestService.applyIgnoreSync(event, tx));
             case TP_NEW, TP_RESPONDED, TP_READY, TP_CANCEL -> requestService.onSyncEvent(event);
@@ -123,7 +143,28 @@ public final class SyncCoordinator {
         }
     }
 
+    /**
+     * Registers an in-memory update to run once the surrounding batch committed.
+     * Cache state must never lead the database: a rolled-back or individually
+     * dropped write would otherwise leave the two permanently diverged.
+     */
+    private void afterCommit(Runnable update) {
+        stagedCacheUpdates.add(update);
+    }
+
     private void enqueue(PendingWrite write) {
+        // Bound the queue: a large resync arriving faster than the flush can
+        // commit would otherwise grow it without limit. Shedding the newest is
+        // safe because the activation resync re-publishes full state.
+        if (queuedWrites.incrementAndGet() > MAX_PENDING_WRITES) {
+            queuedWrites.decrementAndGet();
+            if (shedWrites.getAndIncrement() == 0) {
+                plugin.getSLF4JLogger().warn("Replicated-change queue is full ({} entries); "
+                        + "dropping new writes until it drains. A resync restores full state.",
+                        MAX_PENDING_WRITES);
+            }
+            return;
+        }
         pendingWrites.add(write);
     }
 
@@ -135,25 +176,44 @@ public final class SyncCoordinator {
 
     /** Applies every queued write in arrival order inside one transaction. */
     private void flushPendingWrites() {
+        // One flush at a time: the periodic task and the shutdown drain would
+        // otherwise split one logical batch across two transactions and lose
+        // commit ordering between a SET and a DELETE for the same row.
+        if (!flushing.compareAndSet(false, true)) {
+            return;
+        }
+        try {
+            flushPendingWritesLocked();
+        } finally {
+            flushing.set(false);
+        }
+    }
+
+    private void flushPendingWritesLocked() {
         if (pendingWrites.isEmpty()) {
             return;
         }
         List<PendingWrite> batch = new ArrayList<>();
         PendingWrite op;
         while (batch.size() < MAX_OPS_PER_FLUSH && (op = pendingWrites.poll()) != null) {
+            queuedWrites.decrementAndGet();
             batch.add(op);
         }
+        stagedCacheUpdates.clear();
         try {
             database.runTransaction(tx -> {
                 for (PendingWrite write : batch) {
                     write.apply(tx);
                 }
             });
+            // The batch committed: publish its cache updates.
+            runStagedCacheUpdates();
         } catch (Exception e) {
             // One malformed event must not discard the whole batch: re-apply the
             // entries one by one so only the truly broken write is dropped.
             plugin.getSLF4JLogger().warn("Batched apply of {} replicated changes failed, retrying individually",
                     batch.size(), e);
+            stagedCacheUpdates.clear();
             int dropped = 0;
             for (PendingWrite write : batch) {
                 try {
@@ -166,7 +226,24 @@ public final class SyncCoordinator {
             if (dropped > 0) {
                 plugin.getSLF4JLogger().warn("Dropped {} of {} replicated changes", dropped, batch.size());
             }
+            // Committed and dropped writes are indistinguishable here, so the
+            // cache is left alone rather than showing rows that may not exist.
+            // The next activation resync refreshes it.
+            stagedCacheUpdates.clear();
         }
+    }
+
+    private void runStagedCacheUpdates() {
+        for (Runnable update : stagedCacheUpdates) {
+            try {
+                update.run();
+            } catch (Exception e) {
+                plugin.getSLF4JLogger().warn("Post-commit cache update failed", e);
+            }
+        }
+        stagedCacheUpdates.clear();
+        // The queue drained below its cap: re-arm the one-shot warning.
+        shedWrites.set(0);
     }
 
     /** Publishes this server's full local state; rate-limited to tame event storms. */
@@ -206,6 +283,24 @@ public final class SyncCoordinator {
                     event.blockerUuid = ignore.blockerUuid;
                     event.blockedUuid = ignore.blockedUuid;
                     event.expiresAt = ignore.expiresAt;
+                    event.createdAt = ignore.createdAt;
+                    syncBus.publish(event);
+                }
+                // Deletions are part of the state: a backend that was offline when
+                // a home or block was removed would otherwise keep (and re-publish)
+                // the vanished row. Tombstones make the dump self-healing.
+                for (var tombstone : database.listTombstones()) {
+                    SyncEvent event = SyncEvent.create(
+                            "home".equals(tombstone.kind()) ? SyncEvent.Type.HOME_DELETE : SyncEvent.Type.IGNORE_DELETE,
+                            serverId);
+                    if ("home".equals(tombstone.kind())) {
+                        event.ownerUuid = tombstone.owner();
+                        event.homeName = tombstone.name();
+                    } else {
+                        event.blockerUuid = tombstone.owner();
+                        event.blockedUuid = tombstone.name();
+                    }
+                    event.deletedAt = tombstone.deletedAt();
                     syncBus.publish(event);
                 }
             } catch (Exception e) {

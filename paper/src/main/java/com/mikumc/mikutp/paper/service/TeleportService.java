@@ -109,11 +109,12 @@ public final class TeleportService {
             plugin.getSLF4JLogger().warn("Malformed pending teleport payload", e);
             return;
         }
-        // A payload missing its source cannot be labelled, and one missing its
-        // world cannot be applied: drop both instead of failing later on the
-        // player's join thread.
-        if (pending == null || pending.position == null || pending.position.world == null
-                || pending.position.world.isBlank() || pending.source == null) {
+        // An anchor-based handoff (/otp) legitimately carries no world; any other
+        // payload without one has nothing to teleport to and is dropped here
+        // rather than failing later on the player's join thread.
+        boolean hasAnchor = pending != null && pending.anchorUuid != null && !pending.anchorUuid.isBlank();
+        if (pending == null || pending.position == null || pending.source == null
+                || (!hasAnchor && (pending.position.world == null || pending.position.world.isBlank()))) {
             return;
         }
         if (expired(pending)) {
@@ -490,11 +491,27 @@ public final class TeleportService {
 
     // ------------------------------------------------------------------ internals
 
+    /** Cooldown bucket that a stored position of this source was paid with. */
+    private static CooldownManager.Kind cooldownKindOf(PendingTeleport.Source source) {
+        return switch (source) {
+            case HOME -> CooldownManager.Kind.HOME;
+            case WARP -> CooldownManager.Kind.WARP;
+            case BACK -> CooldownManager.Kind.BACK;
+            case DEATH -> CooldownManager.Kind.DBACK;
+            case WILD -> CooldownManager.Kind.WILD;
+            // Admin and tpa flows do not charge a cooldown of their own.
+            case ADMIN, TPA, TPA_HERE -> null;
+        };
+    }
+
     private void begin(Player player, Position dest, PendingTeleport.Source source, String label, Runnable afterDispatch) {
         boolean local = dest.server == null || dest.server.isBlank() || dest.server.equals(serverId);
         if (local) {
-            World world = Bukkit.getWorld(dest.world);
+            World world = dest.world == null ? null : Bukkit.getWorld(dest.world);
             if (world == null) {
+                // Nothing was dispatched: the caller already burned a cooldown, so
+                // take it back rather than charging for a failed teleport.
+                cooldowns.clear(player.getUniqueId(), cooldownKindOf(source));
                 messages.send(player, "common.teleport-failed");
                 return;
             }

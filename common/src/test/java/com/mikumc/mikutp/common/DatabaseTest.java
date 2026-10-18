@@ -173,9 +173,41 @@ class DatabaseTest {
         // A delete queued after the set wins: order within the batch is kept.
         database.runTransaction(tx -> {
             tx.saveHome(new Home("uuid-a", "base", new Position("s1", "world", 9, 9, 9, 0f, 0f), 3L));
-            tx.deleteHome("uuid-a", "base");
+            tx.deleteHome("uuid-a", "base", System.currentTimeMillis());
         });
         assertTrue(database.getHome("uuid-a", "base").isEmpty());
+    }
+
+    /** A stale snapshot must not resurrect a row deleted after it was made. */
+    @Test
+    void tombstoneBlocksOlderSnapshot() throws Exception {
+        long created = System.currentTimeMillis() - 60_000;
+        database.saveHome(new Home("uuid-a", "base", new Position("s1", "world", 1, 1, 1, 0f, 0f), created));
+        assertTrue(database.deleteHome("uuid-a", "base"));
+
+        // Replaying the old snapshot (as a resync dump would) is ignored.
+        database.saveHome(new Home("uuid-a", "base", new Position("s1", "world", 1, 1, 1, 0f, 0f), created));
+        assertTrue(database.getHome("uuid-a", "base").isEmpty());
+
+        // A genuinely new /sethome after the delete still wins.
+        database.saveHome(new Home("uuid-a", "base",
+                new Position("s1", "world", 2, 2, 2, 0f, 0f), System.currentTimeMillis()));
+        assertEquals(2.0, database.getHome("uuid-a", "base").orElseThrow().position.x);
+    }
+
+    /** Replicated profiles are last-writer-wins by timestamp. */
+    @Test
+    void staleProfileSnapshotCannotUndoToggle() throws Exception {
+        database.upsertPlayer("uuid-a", "Alice", 1_000L);
+        database.runTransaction(tx -> tx.setTpaEnabled("uuid-a", false, 2_000L));
+        assertFalse(database.getPlayer("uuid-a").orElseThrow().tpaEnabled);
+
+        // A snapshot produced before the flip arrives late and carries the old value.
+        database.runTransaction(tx -> {
+            tx.upsertPlayer("uuid-a", "Alice", 1_000L);
+            tx.setTpaEnabled("uuid-a", true, 1_000L);
+        });
+        assertFalse(database.getPlayer("uuid-a").orElseThrow().tpaEnabled);
     }
 
     @Test

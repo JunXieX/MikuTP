@@ -85,6 +85,9 @@ public final class CooldownManager {
     }
 
     public void clear(UUID player, Kind kind) {
+        if (kind == null) {
+            return;
+        }
         Map<Kind, Long> map = until.get(player);
         if (map != null) {
             map.remove(kind);

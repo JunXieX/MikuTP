@@ -170,7 +170,7 @@ public final class RequestService {
             messages.send(requester, "tpa.self");
             return;
         }
-        if (!profiles.isTpaEnabled(targetId)) {
+        if (!profiles.tpaEnabledFor(targetId)) {
             messages.send(requester, "tpa.target-toggled", "player", targetName);
             return;
         }
@@ -404,12 +404,14 @@ public final class RequestService {
     private void storeIgnore(UUID blocker, UUID blocked, int minutes) {
         long expiresAt = minutes <= 0 ? IgnoreEntry.PERMANENT
                 : System.currentTimeMillis() + minutes * 60_000L;
-        applyIgnore(new IgnoreEntry(blocker.toString(), blocked.toString(), expiresAt, System.currentTimeMillis()));
+        long createdAt = System.currentTimeMillis();
+        applyIgnore(new IgnoreEntry(blocker.toString(), blocked.toString(), expiresAt, createdAt));
         if (syncBus.crossServer()) {
             SyncEvent event = SyncEvent.create(SyncEvent.Type.IGNORE_SET, serverId);
             event.blockerUuid = blocker.toString();
             event.blockedUuid = blocked.toString();
             event.expiresAt = expiresAt;
+            event.createdAt = createdAt;
             syncBus.publish(event);
         }
     }
@@ -418,7 +420,7 @@ public final class RequestService {
         if (featureDisabled(player)) {
             return;
         }
-        boolean next = !profiles.isTpaEnabled(player.getUniqueId());
+        boolean next = !profiles.tpaEnabledFor(player.getUniqueId());
         profiles.setTpaEnabled(player.getUniqueId(), next);
         messages.send(player, next ? "tpa.toggled-on" : "tpa.toggled-off");
     }
@@ -427,25 +429,30 @@ public final class RequestService {
         if (featureDisabled(blocker)) {
             return;
         }
-        profiles.resolve(targetName).thenAccept(opt -> {
+        UUID blockerId = blocker.getUniqueId();
+        long expiresAt = permanent ? IgnoreEntry.PERMANENT
+                : System.currentTimeMillis() + Math.max(1, config.tpa.blockDurationMinutes) * 60_000L;
+        // resolve() completes synchronously for a local player, so the database
+        // write must be pushed onto the async pool explicitly: on Folia a region
+        // thread must never block on SQLite.
+        profiles.resolve(targetName).thenAccept(opt -> tasks.async(() -> {
             if (opt.isEmpty()) {
                 messages.send(blocker, "common.player-not-found", "player", targetName);
                 return;
             }
             UUID blocked = opt.get().uuid();
-            if (blocked.equals(blocker.getUniqueId())) {
+            if (blocked.equals(blockerId)) {
                 messages.send(blocker, "tpa.self");
                 return;
             }
-            long expiresAt = permanent ? IgnoreEntry.PERMANENT
-                    : System.currentTimeMillis() + Math.max(1, config.tpa.blockDurationMinutes) * 60_000L;
-            applyIgnore(new IgnoreEntry(blocker.getUniqueId().toString(), blocked.toString(),
+            applyIgnore(new IgnoreEntry(blockerId.toString(), blocked.toString(),
                     expiresAt, System.currentTimeMillis()));
             if (syncBus.crossServer()) {
                 SyncEvent event = SyncEvent.create(SyncEvent.Type.IGNORE_SET, serverId);
-                event.blockerUuid = blocker.getUniqueId().toString();
+                event.blockerUuid = blockerId.toString();
                 event.blockedUuid = blocked.toString();
                 event.expiresAt = expiresAt;
+                event.createdAt = System.currentTimeMillis();
                 syncBus.publish(event);
             }
             if (permanent) {
@@ -454,33 +461,35 @@ public final class RequestService {
                 messages.send(blocker, "tpa.blocked-target", "player", opt.get().name(),
                         "minutes", String.valueOf(config.tpa.blockDurationMinutes));
             }
-        });
+        }));
     }
 
     public void unblock(Player blocker, String targetName) {
         if (featureDisabled(blocker)) {
             return;
         }
-        profiles.resolve(targetName).thenAccept(opt -> {
+        UUID blockerId = blocker.getUniqueId();
+        profiles.resolve(targetName).thenAccept(opt -> tasks.async(() -> {
             if (opt.isEmpty()) {
                 messages.send(blocker, "common.player-not-found", "player", targetName);
                 return;
             }
             boolean existed;
             try {
-                existed = database.clearIgnore(blocker.getUniqueId().toString(), opt.get().uuid().toString());
+                existed = database.clearIgnore(blockerId.toString(), opt.get().uuid().toString());
             } catch (Exception e) {
                 plugin.getSLF4JLogger().warn("Failed to clear ignore entry", e);
                 return;
             }
             if (existed && syncBus.crossServer()) {
                 SyncEvent event = SyncEvent.create(SyncEvent.Type.IGNORE_DELETE, serverId);
-                event.blockerUuid = blocker.getUniqueId().toString();
+                event.blockerUuid = blockerId.toString();
                 event.blockedUuid = opt.get().uuid().toString();
+                event.deletedAt = System.currentTimeMillis();
                 syncBus.publish(event);
             }
             messages.send(blocker, existed ? "tpa.unblocked" : "tpa.not-blocked", "player", opt.get().name());
-        });
+        }));
     }
 
     public void listBlocks(Player blocker) {
@@ -687,12 +696,15 @@ public final class RequestService {
         if (request == null) {
             return;
         }
-        if (!handledEvents.add(event.id)) {
-            return;
-        }
         UUID requesterId = parseUuid(request.requesterUuid);
         Player requester = requesterId == null ? null : onlinePlayers.byId(requesterId);
         if (requester == null) {
+            // The requester is not on this backend right now (switching servers or
+            // still joining). Do not mark the event handled: the proxy may replay
+            // it, and consuming it here would lose the answer for good.
+            return;
+        }
+        if (!handledEvents.add(event.id)) {
             return;
         }
         clearOutgoing(request.requesterUuid, request.id);
@@ -742,12 +754,14 @@ public final class RequestService {
         if (request == null) {
             return;
         }
-        if (!handledEvents.add(event.id)) {
-            return;
-        }
         UUID moverId = parseUuid(request.targetUuid);
         Player mover = moverId == null ? null : onlinePlayers.byId(moverId);
         if (mover == null) {
+            // Same reasoning as processResponse: leave the event unhandled so a
+            // replay can still deliver it once the mover lands here.
+            return;
+        }
+        if (!handledEvents.add(event.id)) {
             return;
         }
         clearOutgoing(request.targetUuid, request.id);
@@ -769,9 +783,13 @@ public final class RequestService {
         }
         if (event.type == SyncEvent.Type.IGNORE_SET) {
             tx.addIgnore(new IgnoreEntry(event.blockerUuid, event.blockedUuid,
-                    event.expiresAt, System.currentTimeMillis()));
+                    event.expiresAt,
+                    // Use the origin's creation stamp so two backends converge on
+                    // the same last-writer-wins decision.
+                    event.createdAt > 0 ? event.createdAt : System.currentTimeMillis()));
         } else {
-            tx.clearIgnore(event.blockerUuid, event.blockedUuid);
+            long deletedAt = event.deletedAt > 0 ? event.deletedAt : System.currentTimeMillis();
+            tx.clearIgnore(event.blockerUuid, event.blockedUuid, deletedAt);
         }
     }
 
@@ -826,9 +844,36 @@ public final class RequestService {
                 return current;
             });
             if (dropped[0]) {
-                // lastIncoming must not keep pointing at a request that no longer
-                // exists: /tpaccept would then answer a dead id forever.
-                lastIncoming.remove(targetId);
+                // Clear the pointer only when it does not name a live request: a
+                // request tracked concurrently after the sweep must keep its
+                // pointer, otherwise /tpaccept answers a dead id.
+                Map<String, TpRequest> live = incoming.get(targetId);
+                lastIncoming.computeIfPresent(targetId,
+                        (key, id) -> live != null && live.containsKey(id) ? id : null);
+            }
+        }
+        sweepOutgoing(now, expiryMs);
+    }
+
+    /**
+     * Drops the requester's own copy of an expired request. Without this the
+     * entry would sit in the map until the player quits, and the requester would
+     * never learn that their request expired.
+     */
+    private void sweepOutgoing(long now, long expiryMs) {
+        for (Map.Entry<UUID, TpRequest> entry : outgoingRequests.entrySet()) {
+            TpRequest request = entry.getValue();
+            if (request.createdAt + expiryMs >= now) {
+                continue;
+            }
+            if (!outgoingRequests.remove(entry.getKey(), request)) {
+                continue;
+            }
+            markAnswered(request.id);
+            Player requester = onlinePlayers.byId(entry.getKey());
+            if (requester != null) {
+                tasks.entity(requester, () -> messages.send(requester, "tpa.expired-requester",
+                        "player", request.targetName));
             }
         }
     }
@@ -837,7 +882,10 @@ public final class RequestService {
         try {
             return database.isIgnored(blocker.toString(), blocked.toString(), System.currentTimeMillis());
         } catch (Exception e) {
-            return false;
+            // Fail closed: when the block list cannot be read, honour the block
+            // rather than letting a request through that the target forbade.
+            plugin.getSLF4JLogger().warn("Failed to read ignore list, treating as blocked", e);
+            return true;
         }
     }
 }

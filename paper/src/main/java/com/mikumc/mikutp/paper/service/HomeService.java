@@ -71,28 +71,20 @@ public final class HomeService {
     /** Reads the player's homes and publishes them unless a mutation already did. */
     private void loadAsync(UUID id) {
         tasks.async(() -> {
-            try {
-                List<Home> loaded = sort(database.listHomes(id.toString()));
-                // The player may have left while this read was in flight; writing
-                // the cache anyway would resurrect an entry for an offline player
-                // that onQuit already purged, leaking one list per such quit.
-                if (onlinePlayers.byId(id) == null) {
+            // The read happens under the same stripe the mutations use: a remote
+            // HOME_SET merged into the cache while this query was in flight would
+            // otherwise be overwritten by the older snapshot.
+            synchronized (lockFor(id)) {
+                if (loadedPlayers.contains(id) || onlinePlayers.byId(id) == null) {
                     return;
                 }
-                synchronized (lockFor(id)) {
-                    // Take the lock the mutation paths use: without it a /sethome
-                    // that committed after this read started could be overwritten
-                    // by this older snapshot. Re-check presence under the lock too:
-                    // onQuit purges under the same lock, so a quit that landed after
-                    // the check above must not be undone by this write.
-                    if (loadedPlayers.contains(id) || onlinePlayers.byId(id) == null) {
-                        return;
-                    }
+                try {
+                    List<Home> loaded = sort(database.listHomes(id.toString()));
                     cache.put(id, loaded);
                     loadedPlayers.add(id);
+                } catch (Exception e) {
+                    plugin.getSLF4JLogger().warn("Failed to load homes", e);
                 }
-            } catch (Exception e) {
-                plugin.getSLF4JLogger().warn("Failed to load homes", e);
             }
         });
     }
@@ -228,6 +220,7 @@ public final class HomeService {
                             break;
                         }
                     }
+                    long deletedAt = System.currentTimeMillis();
                     if (match == null || !database.deleteHome(id.toString(), match.name)) {
                         messages.send(player, "home.not-found", "name", wanted);
                         return;
@@ -237,7 +230,7 @@ public final class HomeService {
                     messages.send(player, "home.deleted", "name", wanted);
                     // Publish the stored spelling so the other backends delete the
                     // exact row rather than relying on case-insensitive matching.
-                    publishHomeDelete(id.toString(), match.name);
+                    publishHomeDelete(id.toString(), match.name, deletedAt);
                 } catch (Exception e) {
                     plugin.getSLF4JLogger().warn("Failed to delete home", e);
                 }
@@ -258,7 +251,7 @@ public final class HomeService {
         syncBus.publish(event);
     }
 
-    private void publishHomeDelete(String ownerUuid, String name) {
+    private void publishHomeDelete(String ownerUuid, String name, long deletedAt) {
         if (!syncBus.crossServer()) {
             return;
         }
@@ -266,47 +259,64 @@ public final class HomeService {
                 com.mikumc.mikutp.common.sync.SyncEvent.Type.HOME_DELETE, serverId);
         event.ownerUuid = ownerUuid;
         event.homeName = name;
+        event.deletedAt = deletedAt;
         syncBus.publish(event);
     }
 
-    /** Applies a replicated home change from another backend; the write joins the
-     * caller's batched transaction. */
-    public void applyRemoteSet(com.mikumc.mikutp.common.sync.SyncEvent event, Database.Tx tx) throws java.sql.SQLException {
+    /**
+     * Applies a replicated home change from another backend; the write joins the
+     * caller's batched transaction and the cache update is deferred until that
+     * transaction has committed, so a rollback cannot leave the cache ahead of
+     * the database.
+     */
+    public void applyRemoteSet(com.mikumc.mikutp.common.sync.SyncEvent event, Database.Tx tx,
+                               java.util.function.Consumer<Runnable> afterCommit) throws java.sql.SQLException {
         if (event.ownerUuid == null || event.homeName == null || event.homePosition == null) {
             return;
         }
         Home home = new Home(event.ownerUuid, event.homeName, event.homePosition, event.homeCreatedAt);
-        tx.saveHome(home);
+        boolean written = tx.saveHome(home) > 0;
         UUID owner = parseUuid(event.ownerUuid);
-        if (owner != null) {
-            // Merge into an already-loaded list only. Creating one here from a
-            // single replicated home would mark the player as loaded and hide
-            // every local home that the join-time read has not fetched yet.
-            // The stripe lock is required: without it this read-modify-write can
-            // interleave with /sethome's own list replacement and drop a home.
-            synchronized (lockFor(owner)) {
-                List<Home> current = cache.get(owner);
-                if (current != null) {
-                    cache.put(owner, sort(replace(current, home)));
+        // A rejected write (blocked by a newer deletion tombstone, or older than
+        // the row already stored) must not reach the cache either.
+        if (owner != null && written) {
+            // Runs after the commit, so taking the stripe here cannot invert the
+            // lock order (mutations hold the stripe while acquiring a connection,
+            // never the other way round).
+            afterCommit.accept(() -> {
+                synchronized (lockFor(owner)) {
+                    List<Home> current = cache.get(owner);
+                    if (current != null) {
+                        cache.put(owner, sort(replace(current, home)));
+                    }
                 }
-            }
+            });
         }
     }
 
-    public void applyRemoteDelete(com.mikumc.mikutp.common.sync.SyncEvent event, Database.Tx tx) throws java.sql.SQLException {
+    public void applyRemoteDelete(com.mikumc.mikutp.common.sync.SyncEvent event, Database.Tx tx,
+                                  java.util.function.Consumer<Runnable> afterCommit) throws java.sql.SQLException {
         if (event.ownerUuid == null || event.homeName == null) {
             return;
         }
-        tx.deleteHome(event.ownerUuid, event.homeName);
+        long deletedAt = event.deletedAt > 0 ? event.deletedAt : System.currentTimeMillis();
+        tx.deleteHome(event.ownerUuid, event.homeName, deletedAt);
         UUID owner = parseUuid(event.ownerUuid);
         if (owner != null) {
-            synchronized (lockFor(owner)) {
-                List<Home> current = cache.get(owner);
-                if (current != null) {
-                    cache.put(owner, sort(current.stream()
-                            .filter(h -> !h.name.equalsIgnoreCase(event.homeName)).toList()));
+            afterCommit.accept(() -> {
+                synchronized (lockFor(owner)) {
+                    List<Home> current = cache.get(owner);
+                    if (current == null) {
+                        return;
+                    }
+                    // Never drop a home re-created after the delete: only entries
+                    // that predate the deletion stamp go.
+                    List<Home> kept = current.stream()
+                            .filter(h -> !h.name.equalsIgnoreCase(event.homeName) || h.createdAt > deletedAt)
+                            .toList();
+                    cache.put(owner, sort(kept));
                 }
-            }
+            });
         }
     }
 

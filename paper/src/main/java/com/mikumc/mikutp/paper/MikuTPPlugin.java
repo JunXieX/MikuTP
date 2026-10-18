@@ -202,8 +202,10 @@ public final class MikuTPPlugin extends JavaPlugin {
     }
 
     private void showRequest(com.mikumc.mikutp.common.data.TpRequest request) {
-        Player target = request.targetUuid == null ? null
-                : Bukkit.getPlayer(UUID.fromString(request.targetUuid));
+        // Runs on the target's entity thread; resolve through the registry so no
+        // Bukkit player-list lookup happens on a region thread.
+        UUID targetId = request.targetUuid == null ? null : parseUuid(request.targetUuid);
+        Player target = targetId == null ? null : onlinePlayers.byId(targetId);
         if (target == null) {
             return;
         }
@@ -213,6 +215,17 @@ public final class MikuTPPlugin extends JavaPlugin {
             messages.send(target, request.type == com.mikumc.mikutp.common.data.TpRequest.Type.COME
                     ? "tpa.received-here-chat" : "tpa.received-chat", "player", request.requesterName);
             messages.send(target, "tpa.hint-chat", "id", request.id);
+        }
+    }
+
+    private static UUID parseUuid(String value) {
+        if (value == null) {
+            return null;
+        }
+        try {
+            return UUID.fromString(value);
+        } catch (IllegalArgumentException e) {
+            return null;
         }
     }
 

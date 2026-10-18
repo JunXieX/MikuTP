@@ -26,9 +26,6 @@ public final class ProfileService {
     private final OnlinePlayers onlinePlayers;
     private final String serverId;
     private final Map<UUID, Boolean> tpaEnabled = new ConcurrentHashMap<>();
-    /** Last profile timestamp applied per player; replicated events can arrive
-     * out of order, and an older snapshot must not roll back a newer toggle. */
-    private final Map<UUID, Long> lastProfileVersion = new ConcurrentHashMap<>();
 
     public ProfileService(JavaPlugin plugin, Tasks tasks, Database database, SyncBus syncBus,
                           OnlinePlayers onlinePlayers, String serverId) {
@@ -64,11 +61,28 @@ public final class ProfileService {
 
     public void onQuit(UUID uuid) {
         tpaEnabled.remove(uuid);
-        lastProfileVersion.remove(uuid);
     }
 
     public boolean isTpaEnabled(UUID uuid) {
         return tpaEnabled.getOrDefault(uuid, true);
+    }
+
+    /**
+     * Toggle state for any player, local or remote. The in-memory value only
+     * covers players this backend hosts, so a remote target falls back to the
+     * replicated profile row — otherwise a cross-server /tpa would ignore a
+     * toggle the target switched off. Safe to call from an async thread.
+     */
+    public boolean tpaEnabledFor(UUID uuid) {
+        Boolean cached = tpaEnabled.get(uuid);
+        if (cached != null) {
+            return cached;
+        }
+        try {
+            return database.getPlayer(uuid.toString()).map(p -> p.tpaEnabled).orElse(true);
+        } catch (Exception e) {
+            return true;
+        }
     }
 
     public void setTpaEnabled(UUID uuid, boolean enabled) {
@@ -77,12 +91,11 @@ public final class ProfileService {
         // Bukkit's player view, which Folia confines to the owning region thread.
         String name = onlinePlayers.nameOf(uuid);
         long stamped = System.currentTimeMillis();
-        // The local toggle is newer than anything replicated so far; recording the
-        // stamp makes an in-flight snapshot produced before the flip get ignored.
-        lastProfileVersion.merge(uuid, stamped, Math::max);
         tasks.async(() -> {
             try {
-                database.setTpaEnabled(uuid.toString(), enabled);
+                // The timestamp stamps the flip as the newest profile change, so a
+                // replicated snapshot produced before it is rejected in SQL.
+                database.runTransaction(tx -> tx.setTpaEnabled(uuid.toString(), enabled, stamped));
             } catch (Exception e) {
                 plugin.getSLF4JLogger().warn("Failed to persist tpa toggle", e);
                 return;
@@ -103,24 +116,26 @@ public final class ProfileService {
         syncBus.publish(event);
     }
 
-    /** Applies a replicated profile from another backend; the write joins the
-     * caller's batched transaction. */
-    public void applySync(SyncEvent event, Database.Tx tx) throws java.sql.SQLException {
+    /**
+     * Applies a replicated profile from another backend; the write joins the
+     * caller's batched transaction and only touches the in-memory toggle after
+     * that transaction committed. Ordering is enforced in SQL by the profile
+     * timestamp, so a snapshot produced before a local flip cannot undo it.
+     */
+    public void applySync(SyncEvent event, Database.Tx tx,
+                          java.util.function.Consumer<Runnable> afterCommit) throws java.sql.SQLException {
         if (event.playerUuid == null || event.playerName == null) {
             return;
         }
         tx.upsertPlayer(event.playerUuid, event.playerName, event.lastOnline);
+        boolean written = tx.setTpaEnabled(event.playerUuid, event.tpaEnabled, event.lastOnline) > 0;
         UUID uuid = parseUuid(event.playerUuid);
-        if (uuid != null && lastProfileVersion.merge(uuid, event.lastOnline, Math::max) > event.lastOnline) {
-            // A newer profile for this player was already applied (or produced
-            // here): replaying this older snapshot would roll the toggle back.
-            return;
-        }
-        tx.setTpaEnabled(event.playerUuid, event.tpaEnabled);
         // Only mirror the flag for players this backend hosts; touching Bukkit's
-        // player view from the sync applier thread is not allowed on Folia.
-        if (uuid != null && onlinePlayers.byId(uuid) != null) {
-            tpaEnabled.put(uuid, event.tpaEnabled);
+        // player view from the sync applier thread is not allowed on Folia. A
+        // snapshot older than the stored row is rejected in SQL and skipped here
+        // as well, so it cannot roll the toggle back.
+        if (written && uuid != null && onlinePlayers.byId(uuid) != null) {
+            afterCommit.accept(() -> tpaEnabled.put(uuid, event.tpaEnabled));
         }
     }
 

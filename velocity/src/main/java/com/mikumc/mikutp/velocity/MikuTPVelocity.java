@@ -89,6 +89,10 @@ public final class MikuTPVelocity {
     private final Map<UUID, List<MailboxEntry>> mailboxes = new ConcurrentHashMap<>();
     /** Events queued for servers that currently have no players. */
     private final Map<String, java.util.ArrayDeque<String>> outbound = new ConcurrentHashMap<>();
+    /** One monitor per server queue: draining and sending must be atomic with
+     * respect to each other, otherwise two senders can emit batches out of order
+     * and a HOME_SET/HOME_DELETE pair lands reversed. */
+    private final Map<String, Object> queueLocks = new ConcurrentHashMap<>();
     private volatile String token = "";
     private volatile boolean warnedRejected = false;
 
@@ -278,19 +282,30 @@ public final class MikuTPVelocity {
                     return;
                 }
                 purgeMailbox(event.request.targetUuid, event.request.id);
-                deliverToPlayer(event.request.requesterUuid, event);
+                // A requester mid-switch cannot be resolved right now; the mailbox
+                // keeps the answer for their next join instead of dropping it (there
+                // is no other replay path for this event).
+                if (!deliverToPlayer(event.request.requesterUuid, event)) {
+                    mailboxAdd(event.request.requesterUuid, event);
+                }
             }
             case TP_READY -> {
                 if (event.request == null) {
                     return;
                 }
-                deliverToPlayer(event.request.targetUuid, event);
+                if (!deliverToPlayer(event.request.targetUuid, event)) {
+                    mailboxAdd(event.request.targetUuid, event);
+                }
             }
             case TP_CANCEL -> {
                 if (event.request == null) {
                     return;
                 }
                 purgeMailbox(event.request.targetUuid, event.request.id);
+                // The requester may also hold a mailboxed TP_RESPONDED for the very
+                // request being withdrawn; delivering it later would teleport them
+                // to a target they already gave up on.
+                purgeMailbox(event.request.requesterUuid, event.request.id);
                 broadcast(event);
             }
             case HOME_SET, HOME_DELETE, PROFILE, BACK, IGNORE_SET, IGNORE_DELETE, RESYNC_REQUEST -> broadcast(event);
@@ -327,13 +342,17 @@ public final class MikuTPVelocity {
     private void enqueue(RegisteredServer target, SyncEvent event) {
         String name = target.getServerInfo().getName();
         java.util.ArrayDeque<String> queue = outbound.computeIfAbsent(name, n -> new java.util.ArrayDeque<>());
-        synchronized (queue) {
+        synchronized (lockFor(name)) {
             queue.addLast(GSON.toJson(event));
             while (queue.size() > MAX_QUEUED_EVENTS) {
                 queue.pollFirst();
             }
         }
         tryFlush(target);
+    }
+
+    private Object lockFor(String serverName) {
+        return queueLocks.computeIfAbsent(serverName, n -> new Object());
     }
 
     private void tryFlush(RegisteredServer target) {
@@ -350,25 +369,28 @@ public final class MikuTPVelocity {
         if (connection.isEmpty()) {
             return;
         }
-        List<SyncEvent> batch = takeBatch(queue);
-        if (!batch.isEmpty()) {
-            sendEvents(connection.get(), batch);
+        // Drain and send under the queue lock: two senders draining the same
+        // queue concurrently could emit their batches in the wrong order, which
+        // would leave a HOME_SET/HOME_DELETE pair reversed on the receiver.
+        synchronized (lockFor(name)) {
+            List<SyncEvent> batch = takeBatch(queue);
+            if (!batch.isEmpty()) {
+                sendEvents(connection.get(), batch);
+            }
         }
     }
 
     private List<SyncEvent> takeBatch(java.util.ArrayDeque<String> queue) {
         List<SyncEvent> batch = new ArrayList<>();
-        synchronized (queue) {
-            while (!queue.isEmpty() && batch.size() < MAX_EVENTS_PER_BATCH) {
-                String json = queue.pollFirst();
-                try {
-                    SyncEvent event = GSON.fromJson(json, SyncEvent.class);
-                    if (event != null && event.type != null) {
-                        batch.add(event);
-                    }
-                } catch (Exception ignored) {
-                    // Skip malformed entries.
+        while (!queue.isEmpty() && batch.size() < MAX_EVENTS_PER_BATCH) {
+            String json = queue.pollFirst();
+            try {
+                SyncEvent event = GSON.fromJson(json, SyncEvent.class);
+                if (event != null && event.type != null) {
+                    batch.add(event);
                 }
+            } catch (Exception ignored) {
+                // Skip malformed entries.
             }
         }
         return batch;
@@ -408,14 +430,17 @@ public final class MikuTPVelocity {
         }
         // Drain everything, not just one batch: after a long empty period the
         // backlog can exceed MAX_EVENTS_PER_BATCH, and waiting for the next
-        // event to trigger another flush would leave the rest stuck.
-        List<SyncEvent> batch;
-        do {
-            batch = takeBatch(queue);
-            if (!batch.isEmpty()) {
-                sendEvents(connection, batch);
-            }
-        } while (!batch.isEmpty() && !queue.isEmpty());
+        // event to trigger another flush would leave the rest stuck. Held under
+        // the queue lock so this drain cannot interleave with tryFlush.
+        synchronized (lockFor(serverName)) {
+            List<SyncEvent> batch;
+            do {
+                batch = takeBatch(queue);
+                if (!batch.isEmpty()) {
+                    sendEvents(connection, batch);
+                }
+            } while (!batch.isEmpty() && !queue.isEmpty());
+        }
     }
 
     private void deliverPending(UUID uuid, ServerConnection connection) {

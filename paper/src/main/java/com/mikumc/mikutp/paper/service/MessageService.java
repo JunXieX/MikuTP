@@ -55,7 +55,11 @@ public final class MessageService {
         String template = bundle.raw(key);
         boolean placeholderApiApplied = false;
         if (parsePapi && papiAvailable && sender instanceof Player player
-                && PapiSupport.containsPlaceholders(template)) {
+                && ownsPlayer(player) && PapiSupport.containsPlaceholders(template)) {
+            // PlaceholderAPI expansions read live entity state, which on Folia is
+            // only legal on the player's own region thread. Message rendering also
+            // happens from async work (database callbacks, sync appliers), so the
+            // parse is skipped there and the template is rendered as-is.
             template = PapiSupport.parse(player, template);
             placeholderApiApplied = true;
         }
@@ -63,6 +67,15 @@ public final class MessageService {
             return parsedTemplates.computeIfAbsent(template, text -> MM.deserialize(text, prefixResolver));
         }
         return MM.deserialize(template, resolvers(pairs));
+    }
+
+    /** True when the calling thread owns the player's region (Folia). */
+    private static boolean ownsPlayer(Player player) {
+        try {
+            return org.bukkit.Bukkit.isOwnedByCurrentRegion(player);
+        } catch (Throwable ignored) {
+            return false;
+        }
     }
 
     public void send(CommandSender sender, String key, String... pairs) {

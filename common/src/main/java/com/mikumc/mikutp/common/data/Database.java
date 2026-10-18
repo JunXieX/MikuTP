@@ -32,6 +32,9 @@ public final class Database implements AutoCloseable {
 
     private static final Pattern TABLE_PREFIX = Pattern.compile("[a-zA-Z0-9_]*");
 
+    /** How long a deletion tombstone is kept. Well beyond any resync dump. */
+    private static final long TOMBSTONE_TTL_MS = 7L * 24 * 60 * 60 * 1000;
+
     /** Supplies pooled connections; implemented by the platform modules. */
     public interface ConnectionProvider extends AutoCloseable {
         Connection acquire() throws SQLException;
@@ -44,18 +47,23 @@ public final class Database implements AutoCloseable {
     public interface Tx {
         int saveHome(Home home) throws SQLException;
 
-        int deleteHome(String ownerUuid, String name) throws SQLException;
+        /** Deletes a home and records a tombstone so a later stale replication
+         * cannot resurrect it. */
+        int deleteHome(String ownerUuid, String name, long deletedAt) throws SQLException;
 
         int upsertPlayer(String uuid, String name, long now) throws SQLException;
 
-        int setTpaEnabled(String uuid, boolean enabled) throws SQLException;
+        /** Stores the toggle and stamps the profile as of {@code at}, unless the
+         * row already carries a newer profile change. */
+        int setTpaEnabled(String uuid, boolean enabled, long at) throws SQLException;
 
         /** Stores a return position under {@code colPrefix}; a null position clears it. */
         int setPosition(String uuid, Position pos, String colPrefix) throws SQLException;
 
         int addIgnore(IgnoreEntry entry) throws SQLException;
 
-        int clearIgnore(String blockerUuid, String blockedUuid) throws SQLException;
+        /** Removes an ignore entry and records a tombstone (same reason as homes). */
+        int clearIgnore(String blockerUuid, String blockedUuid, long deletedAt) throws SQLException;
     }
 
     /** Transaction body producing a result. */
@@ -165,8 +173,24 @@ public final class Database implements AutoCloseable {
                   created_at BIGINT NOT NULL,
                   PRIMARY KEY (blocker_uuid, blocked_uuid)
                 )""".formatted(prefix));
+        // Deletion tombstones. Replication is last-writer-wins over full state
+        // dumps, so a backend that missed a delete would otherwise re-publish
+        // the deleted row and resurrect it everywhere. A tombstone outlives the
+        // row and blocks any insert older than the delete.
+        exec("""
+                CREATE TABLE IF NOT EXISTS %stombstones (
+                  kind VARCHAR(16) NOT NULL,
+                  owner VARCHAR(36) NOT NULL,
+                  name VARCHAR(64) NOT NULL,
+                  deleted_at BIGINT NOT NULL,
+                  PRIMARY KEY (kind, owner, name)
+                )""".formatted(prefix));
         index("CREATE INDEX IF NOT EXISTS %sidx_homes_owner ON %shomes (owner_uuid)".formatted(prefix, prefix));
         index("CREATE INDEX IF NOT EXISTS %sidx_players_name ON %splayers (name COLLATE NOCASE)".formatted(prefix, prefix));
+        // Tombstones only need to outlive the replication window (a resync dump).
+        // Anything older cannot be contradicted by a snapshot that still exists.
+        exec("DELETE FROM %stombstones WHERE deleted_at < %d"
+                .formatted(prefix, System.currentTimeMillis() - TOMBSTONE_TTL_MS));
     }
 
     private void index(String sql) throws SQLException {
@@ -244,12 +268,19 @@ public final class Database implements AutoCloseable {
 
         @Override
         public int saveHome(Home home) throws SQLException {
+            if (deletedAfter("home", home.ownerUuid, home.name, home.createdAt)) {
+                // A delete for this home happened after this snapshot was made:
+                // re-inserting it would resurrect it on every backend.
+                return 0;
+            }
             try (PreparedStatement ps = connection.prepareStatement("""
                     INSERT INTO %shomes (owner_uuid, name, server, world, x, y, z, yaw, pitch, created_at)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(owner_uuid, name) DO UPDATE SET server = excluded.server, world = excluded.world,
-                      x = excluded.x, y = excluded.y, z = excluded.z, yaw = excluded.yaw, pitch = excluded.pitch
-                    """.formatted(prefix))) {
+                      x = excluded.x, y = excluded.y, z = excluded.z, yaw = excluded.yaw, pitch = excluded.pitch,
+                      created_at = excluded.created_at
+                    WHERE excluded.created_at >= %shomes.created_at
+                    """.formatted(prefix, prefix))) {
                 ps.setString(1, home.ownerUuid);
                 ps.setString(2, home.name);
                 ps.setString(3, home.position.server == null ? "" : home.position.server);
@@ -265,21 +296,33 @@ public final class Database implements AutoCloseable {
         }
 
         @Override
-        public int deleteHome(String ownerUuid, String name) throws SQLException {
+        public int deleteHome(String ownerUuid, String name, long deletedAt) throws SQLException {
+            int removed;
+            // Only rows older than the deletion go: a home re-created after the
+            // delete (a fresh /sethome with the same name) must survive a stale
+            // replicated delete.
             try (PreparedStatement ps = connection.prepareStatement(
-                    "DELETE FROM %shomes WHERE owner_uuid = ? AND name = ?".formatted(prefix))) {
+                    "DELETE FROM %shomes WHERE owner_uuid = ? AND name = ? AND created_at < ?".formatted(prefix))) {
                 ps.setString(1, ownerUuid);
                 ps.setString(2, name);
-                return ps.executeUpdate();
+                ps.setLong(3, deletedAt);
+                removed = ps.executeUpdate();
             }
+            recordDeletion("home", ownerUuid, name, deletedAt);
+            return removed;
         }
 
         @Override
         public int upsertPlayer(String uuid, String name, long now) throws SQLException {
+            // Last-writer-wins by profile timestamp: a replicated snapshot that
+            // was produced earlier must not roll back a newer local change
+            // (name, last-online order, tpa toggle). No in-memory version map is
+            // needed, so nothing has to be cleaned up per player.
             try (PreparedStatement ps = connection.prepareStatement("""
                     INSERT INTO %splayers (uuid, name, last_online, tpa_enabled) VALUES (?, ?, ?, 1)
                     ON CONFLICT(uuid) DO UPDATE SET name = excluded.name, last_online = excluded.last_online
-                    """.formatted(prefix))) {
+                    WHERE excluded.last_online >= %splayers.last_online
+                    """.formatted(prefix, prefix))) {
                 ps.setString(1, uuid);
                 ps.setString(2, name);
                 ps.setLong(3, now);
@@ -288,11 +331,17 @@ public final class Database implements AutoCloseable {
         }
 
         @Override
-        public int setTpaEnabled(String uuid, boolean enabled) throws SQLException {
+        public int setTpaEnabled(String uuid, boolean enabled, long at) throws SQLException {
+            // Bumping last_online stamps the toggle as the newest profile change,
+            // so any snapshot produced before it is rejected by the upsert guard.
+            // The same guard here keeps a late snapshot from undoing a newer flip.
             try (PreparedStatement ps = connection.prepareStatement(
-                    "UPDATE %splayers SET tpa_enabled = ? WHERE uuid = ?".formatted(prefix))) {
+                    "UPDATE %splayers SET tpa_enabled = ?, last_online = ? WHERE uuid = ? AND last_online <= ?"
+                            .formatted(prefix))) {
                 ps.setInt(1, enabled ? 1 : 0);
-                ps.setString(2, uuid);
+                ps.setLong(2, at);
+                ps.setString(3, uuid);
+                ps.setLong(4, at);
                 return ps.executeUpdate();
             }
         }
@@ -339,10 +388,17 @@ public final class Database implements AutoCloseable {
 
         @Override
         public int addIgnore(IgnoreEntry e) throws SQLException {
+            if (deletedAfter("ignore", e.blockerUuid, e.blockedUuid, e.createdAt)) {
+                // The block was lifted after this entry was created: honour the
+                // newer delete instead of re-creating the entry.
+                return 0;
+            }
             try (PreparedStatement ps = connection.prepareStatement("""
                     INSERT INTO %signores (blocker_uuid, blocked_uuid, expires_at, created_at) VALUES (?, ?, ?, ?)
-                    ON CONFLICT(blocker_uuid, blocked_uuid) DO UPDATE SET expires_at = excluded.expires_at
-                    """.formatted(prefix))) {
+                    ON CONFLICT(blocker_uuid, blocked_uuid) DO UPDATE SET expires_at = excluded.expires_at,
+                      created_at = excluded.created_at
+                    WHERE excluded.created_at >= %signores.created_at
+                    """.formatted(prefix, prefix))) {
                 ps.setString(1, e.blockerUuid);
                 ps.setString(2, e.blockedUuid);
                 ps.setLong(3, e.expiresAt);
@@ -352,12 +408,43 @@ public final class Database implements AutoCloseable {
         }
 
         @Override
-        public int clearIgnore(String blockerUuid, String blockedUuid) throws SQLException {
+        public int clearIgnore(String blockerUuid, String blockedUuid, long deletedAt) throws SQLException {
+            int removed;
             try (PreparedStatement ps = connection.prepareStatement(
                     "DELETE FROM %signores WHERE blocker_uuid = ? AND blocked_uuid = ?".formatted(prefix))) {
                 ps.setString(1, blockerUuid);
                 ps.setString(2, blockedUuid);
-                return ps.executeUpdate();
+                removed = ps.executeUpdate();
+            }
+            recordDeletion("ignore", blockerUuid, blockedUuid, deletedAt);
+            return removed;
+        }
+
+        /** True when a delete for this row is newer than the snapshot being written. */
+        private boolean deletedAfter(String kind, String owner, String name, long snapshotAt) throws SQLException {
+            try (PreparedStatement ps = connection.prepareStatement(
+                    "SELECT deleted_at FROM %stombstones WHERE kind = ? AND owner = ? AND name = ?".formatted(prefix))) {
+                ps.setString(1, kind);
+                ps.setString(2, owner);
+                ps.setString(3, name);
+                try (ResultSet rs = ps.executeQuery()) {
+                    return rs.next() && rs.getLong(1) > snapshotAt;
+                }
+            }
+        }
+
+        /** Upserts a deletion stamp, keeping the newest one. */
+        private void recordDeletion(String kind, String owner, String name, long deletedAt) throws SQLException {
+            try (PreparedStatement ps = connection.prepareStatement("""
+                    INSERT INTO %stombstones (kind, owner, name, deleted_at) VALUES (?, ?, ?, ?)
+                    ON CONFLICT(kind, owner, name) DO UPDATE SET deleted_at = excluded.deleted_at
+                    WHERE excluded.deleted_at > %stombstones.deleted_at
+                    """.formatted(prefix, prefix))) {
+                ps.setString(1, kind);
+                ps.setString(2, owner);
+                ps.setString(3, name);
+                ps.setLong(4, deletedAt);
+                ps.executeUpdate();
             }
         }
     }
@@ -380,7 +467,8 @@ public final class Database implements AutoCloseable {
     }
 
     public void setTpaEnabled(String uuid, boolean enabled) throws SQLException {
-        runTransaction(tx -> tx.setTpaEnabled(uuid, enabled));
+        long now = System.currentTimeMillis();
+        runTransaction(tx -> tx.setTpaEnabled(uuid, enabled, now));
     }
 
     private static PlayerProfile readProfile(ResultSet rs) throws SQLException {
@@ -438,11 +526,15 @@ public final class Database implements AutoCloseable {
     }
 
     public boolean deleteHome(String ownerUuid, String name) throws SQLException {
-        return transaction(tx -> tx.deleteHome(ownerUuid, name)) > 0;
+        long now = System.currentTimeMillis();
+        return transaction(tx -> tx.deleteHome(ownerUuid, name, now)) > 0;
     }
 
     public Optional<Home> getHome(String ownerUuid, String name) throws SQLException {
-        return queryOne("SELECT * FROM %shomes WHERE owner_uuid = ? AND name = ?".formatted(prefix),
+        // Case-insensitive: home names are normalised to lowercase, but rows
+        // written by older versions may still carry mixed case.
+        return queryOne(("SELECT * FROM %shomes WHERE owner_uuid = ? AND name = ? COLLATE NOCASE"
+                + " ORDER BY created_at DESC LIMIT 1").formatted(prefix),
                 ps -> {
                     ps.setString(1, ownerUuid);
                     ps.setString(2, name);
@@ -464,6 +556,17 @@ public final class Database implements AutoCloseable {
 
     public int countHomes(String ownerUuid) throws SQLException {
         return queryCount("SELECT COUNT(*) FROM %shomes WHERE owner_uuid = ?".formatted(prefix), ownerUuid);
+    }
+
+    /** A recorded deletion, replicated so a backend that missed the event
+     * converges instead of resurrecting the row. */
+    public record Tombstone(String kind, String owner, String name, long deletedAt) {
+    }
+
+    public List<Tombstone> listTombstones() throws SQLException {
+        return queryList("SELECT kind, owner, name, deleted_at FROM %stombstones".formatted(prefix),
+                rs -> new Tombstone(rs.getString("kind"), rs.getString("owner"),
+                        rs.getString("name"), rs.getLong("deleted_at")));
     }
 
     private static Position readPosition(ResultSet rs) throws SQLException {
@@ -516,7 +619,8 @@ public final class Database implements AutoCloseable {
     }
 
     public boolean clearIgnore(String blockerUuid, String blockedUuid) throws SQLException {
-        return transaction(tx -> tx.clearIgnore(blockerUuid, blockedUuid)) > 0;
+        long now = System.currentTimeMillis();
+        return transaction(tx -> tx.clearIgnore(blockerUuid, blockedUuid, now)) > 0;
     }
 
     public boolean isIgnored(String blockerUuid, String blockedUuid, long now) throws SQLException {

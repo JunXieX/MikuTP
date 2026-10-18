@@ -43,6 +43,11 @@ public final class SyncEvent {
     public String blockerUuid;
     public String blockedUuid;
     public long expiresAt;
+    /** When the row itself was created (origin clock), used for ordering. */
+    public long createdAt;
+    /** HOME_DELETE / IGNORE_DELETE: when the row was deleted. Receivers drop
+     * older snapshots so a stale resync cannot resurrect the row. */
+    public long deletedAt;
 
     // TP_NEW / TP_RESPONDED / TP_READY
     public TpRequest request;
