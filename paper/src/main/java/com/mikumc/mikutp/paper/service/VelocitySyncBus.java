@@ -146,8 +146,11 @@ public final class VelocitySyncBus implements SyncBus {
             return;
         }
         // A retired scheduler (entity removed before the task ran) means the
-        // carrier is gone: put the batch back instead of letting it vanish.
-        if (!tasks.entity(carrier, () -> {
+        // carrier is gone: the retired callback puts the batch back instead of
+        // letting it vanish. Note the API gives no "already retired" signal at
+        // scheduling time, so a batch scheduled against a gone entity is covered
+        // by the retired callback only when the scheduler still had it queued.
+        tasks.entity(carrier, () -> {
             if (!carrier.isOnline()) {
                 // The carrier vanished between the lookup and the send; without
                 // this the batch would be lost instead of retried.
@@ -156,9 +159,7 @@ public final class VelocitySyncBus implements SyncBus {
             }
             carrier.sendPluginMessage(plugin, ProxyMessages.CHANNEL,
                     batchJson.getBytes(java.nio.charset.StandardCharsets.UTF_8));
-        }, () -> requeue(ops))) {
-            requeue(ops);
-        }
+        }, () -> requeue(ops));
     }
 
     /** Puts a drained batch back at the head of the queue, preserving order. */

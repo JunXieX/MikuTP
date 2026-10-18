@@ -42,11 +42,21 @@ public final class Tasks {
      * Entity work with a retirement callback. The callback runs when the entity
      * is removed before the task fires, which is the only chance to release
      * anything the caller parked on the task (a queued batch, for instance).
-     * Returns false when the scheduler is already retired; neither callback runs
-     * in that case.
      */
-    public boolean entity(Player player, Runnable run, Runnable retired) {
-        return player.getScheduler().run(plugin, task -> run.run(), retired) != null;
+    public void entity(Player player, Runnable run, Runnable retired) {
+        player.getScheduler().run(plugin, task -> run.run(), retired);
+    }
+
+    /**
+     * True when the calling thread is the player's region thread, i.e. work may
+     * touch this player directly instead of hopping onto its scheduler.
+     */
+    public boolean owns(Player player) {
+        try {
+            return Bukkit.isOwnedByCurrentRegion(player);
+        } catch (Throwable ignored) {
+            return false;
+        }
     }
 
     /** Runs once per tick on the player's region thread until the consumer cancels it. */

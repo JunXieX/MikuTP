@@ -334,10 +334,11 @@ public final class RequestService {
                 }
             }
             // Feedback (sound + messages) touches the target's entity state, so it
-            // runs on the target's own thread. If the scheduler is already retired
-            // the answer would be lost silently, so publish it from here instead.
-            if (!tasks.entity(target, () -> respondCommon(target, request, response))) {
+            // runs on the target's own thread (unless we are already on it).
+            if (tasks.owns(target)) {
                 respondCommon(target, request, response);
+            } else {
+                tasks.entity(target, () -> respondCommon(target, request, response));
             }
         });
     }
@@ -771,17 +772,20 @@ public final class RequestService {
             awaitingShow.add(request.id);
             return;
         }
-        if (!tasks.entity(target, () -> {
-            Consumer<TpRequest> handler = showRequestHandler;
-            if (handler != null) {
-                handler.accept(request);
-            }
-            effects.requestReceived(target);
-        })) {
-            // The entity scheduler was already retired: the dialog was never shown,
-            // so defer it to the next join instead of leaving it silently tracked.
-            awaitingShow.add(request.id);
+        if (tasks.owns(target)) {
+            showNow(target, request);
+            return;
         }
+        tasks.entity(target, () -> showNow(target, request));
+    }
+
+    /** Renders the request to its target; runs on the target's own thread. */
+    private void showNow(Player target, TpRequest request) {
+        Consumer<TpRequest> handler = showRequestHandler;
+        if (handler != null) {
+            handler.accept(request);
+        }
+        effects.requestReceived(target);
     }
 
     private void processResponse(SyncEvent event) {
