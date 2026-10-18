@@ -171,7 +171,8 @@ public final class MikuTPConfig {
         public boolean enabled = true;
         /** Seconds before an unanswered request expires. */
         public int requestExpirySeconds = 60;
-        /** Minutes applied by the "block this player" dialog button. */
+        /** Minutes a /tpblock lasts; 0 or less means "until unblocked", matching
+         * the permanent option offered by the request dialog. */
         public int blockDurationMinutes = 10;
     }
 

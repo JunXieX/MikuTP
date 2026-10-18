@@ -95,6 +95,8 @@ public final class MikuTPVelocity {
     private final Map<String, Object> queueLocks = new ConcurrentHashMap<>();
     private volatile String token = "";
     private volatile boolean warnedRejected = false;
+    /** Periodic expiry sweep; cancelled on shutdown. */
+    private com.velocitypowered.api.scheduler.ScheduledTask sweepTask;
 
     private record PendingEntry(String payload, long expiry) {
     }
@@ -115,10 +117,23 @@ public final class MikuTPVelocity {
         server.getChannelRegistrar().register(CHANNEL);
         // Expired mailboxes and handoffs are normally drained on the player's
         // next join; a player who never returns would otherwise leave their
-        // entries in memory forever.
-        server.getScheduler().buildTask(this, this::sweepExpired)
+        // entries in memory forever. The handle is kept so the task is cancelled
+        // when the plugin unloads.
+        sweepTask = server.getScheduler().buildTask(this, this::sweepExpired)
                 .repeat(60, java.util.concurrent.TimeUnit.SECONDS).schedule();
         logger.info("MikuTP hub ready on channel {}", CHANNEL.getId());
+    }
+
+    /** Stops the periodic sweep and drops the in-memory state with the plugin. */
+    @Subscribe
+    public void onShutdown(com.velocitypowered.api.event.proxy.ProxyShutdownEvent event) {
+        if (sweepTask != null) {
+            sweepTask.cancel();
+            sweepTask = null;
+        }
+        pendingEntries.clear();
+        mailboxes.clear();
+        outbound.clear();
     }
 
     /** Drops expired entries so long-lived proxies do not accumulate state. */
@@ -252,11 +267,23 @@ public final class MikuTPVelocity {
         if (uuid == null || payload == null) {
             return;
         }
+        UUID id;
         try {
-            pendingEntries.put(UUID.fromString(uuid),
-                    new PendingEntry(payload, System.currentTimeMillis() + PENDING_TTL_MS));
+            id = UUID.fromString(uuid);
         } catch (IllegalArgumentException ignored) {
+            return;
         }
+        PendingEntry entry = new PendingEntry(payload, System.currentTimeMillis() + PENDING_TTL_MS);
+        pendingEntries.put(id, entry);
+        // The connect request and the pending payload travel on different paths,
+        // so the player may already have arrived when this lands. Hand it over
+        // immediately in that case: waiting for the next connect would apply the
+        // teleport on a server they later visit, or never at all.
+        server.getPlayer(id).flatMap(Player::getCurrentServer).ifPresent(connection -> {
+            if (pendingEntries.remove(id, entry)) {
+                send(connection, ProxyMessages.encodePending(uuid, payload, 0));
+            }
+        });
     }
 
     /**

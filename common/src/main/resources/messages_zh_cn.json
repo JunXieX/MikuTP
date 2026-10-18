@@ -17,6 +17,7 @@
 
   "home.limit-reached": "<prefix><red>家的数量已达上限（<white><limit></white>），可删除后重试。</red>",
   "home.set": "<prefix><green>家 <white><name></white> 已保存。</green>",
+  "home.save-failed": "<prefix><red>家保存失败，请稍后重试。</red>",
   "home.deleted": "<prefix><green>家 <white><name></white> 已删除。</green>",
   "home.not-found": "<prefix><red>家 <white><name></white> 不存在。</red>",
   "home.empty": "<prefix><yellow>你还没有家，先用 <white>/sethome</white> 保存一个吧。</yellow>",

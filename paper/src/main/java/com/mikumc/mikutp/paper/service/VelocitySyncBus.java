@@ -39,9 +39,9 @@ public final class VelocitySyncBus implements SyncBus {
     private final String token;
     private final OnlinePlayers onlinePlayers;
     private final ConcurrentLinkedDeque<com.google.gson.JsonObject> outbound = new ConcurrentLinkedDeque<>();
-    /** Mirrors {@code outbound.size()}: ConcurrentLinkedDeque#size() is O(n) and
-     * this runs on every publish, so the depth check must not traverse the queue. */
-    private final java.util.concurrent.atomic.AtomicInteger queuedOps = new java.util.concurrent.atomic.AtomicInteger();
+    /** Mirrors {@code outbound.size()}; guarded by the queue monitor so it can
+     * never drift from the real depth. */
+    private int queuedOps;
     private volatile boolean running;
     private ScheduledTask flushTask;
 
@@ -96,17 +96,19 @@ public final class VelocitySyncBus implements SyncBus {
     private static final int MAX_QUEUED_OPS = MAX_QUEUED_BATCHES * MAX_OPS_PER_BATCH;
 
     private void enqueue(com.google.gson.JsonObject op) {
-        outbound.addLast(op);
-        // Over budget: shed the oldest ops. The activation resync re-converges
-        // state, so a dropped event is not a permanent divergence.
-        int depth = queuedOps.incrementAndGet();
-        while (depth > MAX_QUEUED_OPS) {
-            if (outbound.pollFirst() == null) {
-                // Lost the race with a concurrent drain: nothing left to shed.
-                queuedOps.decrementAndGet();
-                break;
+        // Enqueue and shedding share one lock with the drain below, so the depth
+        // counter always matches the queue. A torn counter would either shed
+        // live events early or stop shedding altogether.
+        int depth;
+        synchronized (outbound) {
+            outbound.addLast(op);
+            depth = ++queuedOps;
+            while (depth > MAX_QUEUED_OPS) {
+                if (outbound.pollFirst() == null) {
+                    break;
+                }
+                depth = --queuedOps;
             }
-            depth = queuedOps.decrementAndGet();
         }
     }
 
@@ -116,13 +118,15 @@ public final class VelocitySyncBus implements SyncBus {
             return;
         }
         List<com.google.gson.JsonObject> ops = new ArrayList<>();
-        while (ops.size() < MAX_OPS_PER_BATCH) {
-            com.google.gson.JsonObject op = outbound.pollFirst();
-            if (op == null) {
-                break;
+        synchronized (outbound) {
+            while (ops.size() < MAX_OPS_PER_BATCH) {
+                com.google.gson.JsonObject op = outbound.pollFirst();
+                if (op == null) {
+                    break;
+                }
+                queuedOps--;
+                ops.add(op);
             }
-            queuedOps.decrementAndGet();
-            ops.add(op);
         }
         if (ops.isEmpty()) {
             return;
@@ -159,9 +163,11 @@ public final class VelocitySyncBus implements SyncBus {
 
     /** Puts a drained batch back at the head of the queue, preserving order. */
     private void requeue(List<com.google.gson.JsonObject> ops) {
-        for (int i = ops.size() - 1; i >= 0; i--) {
-            outbound.addFirst(ops.get(i));
+        synchronized (outbound) {
+            for (int i = ops.size() - 1; i >= 0; i--) {
+                outbound.addFirst(ops.get(i));
+            }
+            queuedOps += ops.size();
         }
-        queuedOps.addAndGet(ops.size());
     }
 }

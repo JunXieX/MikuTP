@@ -123,7 +123,7 @@ public final class MikuTPPlugin extends JavaPlugin {
         coordinator.start();
 
         new CommandRegistry(this, messages, homeService, warpService, requestService,
-                wildService, teleports, dialogs, chats, onlinePlayers, this::reloadAll, coordinator::resync,
+                wildService, teleports, dialogs, chats, onlinePlayers, tasks, this::reloadAll, coordinator::resync,
                 this::infoLine, () -> config.dialogs.enabled, config).register();
 
         getServer().getPluginManager().registerEvents(
@@ -133,10 +133,13 @@ public final class MikuTPPlugin extends JavaPlugin {
                 new WarmupGuard(teleports.warmups(), config), this);
         // A /reload or late enable finds players already online; seed the registry
         // from the global region thread, which is allowed to read the player view.
+        // The coordinator's presence counter is seeded too, otherwise the first
+        // join after a reload would look like "first player" and skip the resync.
         tasks.global(() -> {
             for (Player player : Bukkit.getOnlinePlayers()) {
                 onlinePlayers.add(player);
             }
+            coordinator.seedActivePlayers(onlinePlayers.snapshot().size());
         });
 
         if (papiAvailable) {
@@ -252,28 +255,32 @@ public final class MikuTPPlugin extends JavaPlugin {
         // the sync bus, the network service and the storage layer. Remember them
         // so a config edit cannot leave the running instance holding values that
         // silently differ from what the file now claims.
+        // File IO and YAML parsing run on the async pool: /mtp reload is executed
+        // on a region thread and must not block it.
         String oldMode = String.valueOf(config.sync.mode);
         String oldToken = String.valueOf(config.sync.token);
         String oldServerId = String.valueOf(config.crossServer.serverId);
-        try {
-            loadConfiguration(false);
-            String newMode = String.valueOf(config.sync.mode);
-            String newToken = String.valueOf(config.sync.token);
-            String newServerId = String.valueOf(config.crossServer.serverId);
-            if (!oldMode.equalsIgnoreCase(newMode) || !oldToken.equals(newToken)
-                    || !oldServerId.equals(newServerId)) {
-                config.sync.mode = oldMode;
-                config.sync.token = oldToken;
-                config.crossServer.serverId = oldServerId;
-                getSLF4JLogger().warn("sync.mode / sync.token / cross-server server-id changed in config.yml; "
-                        + "these take effect only after a full server restart and were ignored for now.");
+        tasks.async(() -> {
+            try {
+                loadConfiguration(false);
+                String newMode = String.valueOf(config.sync.mode);
+                String newToken = String.valueOf(config.sync.token);
+                String newServerId = String.valueOf(config.crossServer.serverId);
+                if (!oldMode.equalsIgnoreCase(newMode) || !oldToken.equals(newToken)
+                        || !oldServerId.equals(newServerId)) {
+                    config.sync.mode = oldMode;
+                    config.sync.token = oldToken;
+                    config.crossServer.serverId = oldServerId;
+                    getSLF4JLogger().warn("sync.mode / sync.token / cross-server server-id changed in config.yml; "
+                            + "these take effect only after a full server restart and were ignored for now.");
+                }
+                effects.setEnabled(config.teleport.sounds);
+                warpService.reload();
+                getSLF4JLogger().info("MikuTP reloaded (sync mode, server-id and storage changes need a restart)");
+            } catch (IOException e) {
+                getSLF4JLogger().error("Reload failed: {}", e.getMessage());
             }
-            effects.setEnabled(config.teleport.sounds);
-            warpService.reload();
-            getSLF4JLogger().info("MikuTP reloaded (sync mode, server-id and storage changes need a restart)");
-        } catch (IOException e) {
-            getSLF4JLogger().error("Reload failed: {}", e.getMessage());
-        }
+        });
     }
 
     /** Reads or creates config.yml and the language file. */

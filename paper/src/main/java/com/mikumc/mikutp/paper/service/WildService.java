@@ -188,9 +188,13 @@ public final class WildService {
                 && isSafeLanding(world, x, y, z, block)) {
             float yaw = ThreadLocalRandom.current().nextFloat() * 360f;
             Position spot = Position.local(world.getName(), x + 0.5, y + 1.0, z + 0.5, yaw, 0f);
-            messages.send(player, "wild.searching-done");
-            teleports.send(player, spot, PendingTeleport.Source.WILD,
-                    world.getName() + " " + x + ", " + z, null);
+            String label = world.getName() + " " + x + ", " + z;
+            // This runs on the candidate chunk's region thread, not the player's:
+            // hand the message and the teleport back to the player's own thread.
+            tasks.entity(player, () -> {
+                messages.send(player, "wild.searching-done");
+                teleports.send(player, spot, PendingTeleport.Source.WILD, label, null);
+            });
             return;
         }
         if (attempts.decrementAndGet() > 0) {

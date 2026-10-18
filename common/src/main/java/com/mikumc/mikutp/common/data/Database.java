@@ -353,7 +353,10 @@ public final class Database implements AutoCloseable {
             String sql = ("INSERT INTO %splayers (uuid, name, last_online, tpa_enabled, "
                     + colPrefix + "server, " + colPrefix + "world, " + colPrefix + "x, "
                     + colPrefix + "y, " + colPrefix + "z, " + colPrefix + "yaw, " + colPrefix + "pitch) "
-                    + "VALUES (?, '', ?, 1, ?, ?, ?, ?, ?, ?, ?) "
+                    // A placeholder row must never look like a newer profile: an
+                    // empty name stamped with "now" would overwrite the real name
+                    // on every other backend through the profile upsert guard.
+                    + "VALUES (?, '', 0, 1, ?, ?, ?, ?, ?, ?, ?) "
                     + "ON CONFLICT(uuid) DO UPDATE SET "
                     + colPrefix + "server = excluded." + colPrefix + "server, "
                     + colPrefix + "world = excluded." + colPrefix + "world, "
@@ -364,23 +367,22 @@ public final class Database implements AutoCloseable {
                     + colPrefix + "pitch = excluded." + colPrefix + "pitch").formatted(prefix);
             try (PreparedStatement ps = connection.prepareStatement(sql)) {
                 ps.setString(1, uuid);
-                ps.setLong(2, System.currentTimeMillis());
                 if (pos == null) {
+                    ps.setString(2, null);
                     ps.setString(3, null);
-                    ps.setString(4, null);
+                    ps.setDouble(4, 0);
                     ps.setDouble(5, 0);
                     ps.setDouble(6, 0);
                     ps.setDouble(7, 0);
                     ps.setDouble(8, 0);
-                    ps.setDouble(9, 0);
                 } else {
-                    ps.setString(3, pos.server);
-                    ps.setString(4, pos.world);
-                    ps.setDouble(5, pos.x);
-                    ps.setDouble(6, pos.y);
-                    ps.setDouble(7, pos.z);
-                    ps.setDouble(8, pos.yaw);
-                    ps.setDouble(9, pos.pitch);
+                    ps.setString(2, pos.server);
+                    ps.setString(3, pos.world);
+                    ps.setDouble(4, pos.x);
+                    ps.setDouble(5, pos.y);
+                    ps.setDouble(6, pos.z);
+                    ps.setDouble(7, pos.yaw);
+                    ps.setDouble(8, pos.pitch);
                 }
                 return ps.executeUpdate();
             }
@@ -410,10 +412,14 @@ public final class Database implements AutoCloseable {
         @Override
         public int clearIgnore(String blockerUuid, String blockedUuid, long deletedAt) throws SQLException {
             int removed;
+            // Only the row that existed when the delete was made goes: a block
+            // re-created afterwards must survive a replayed tombstone from a dump.
             try (PreparedStatement ps = connection.prepareStatement(
-                    "DELETE FROM %signores WHERE blocker_uuid = ? AND blocked_uuid = ?".formatted(prefix))) {
+                    "DELETE FROM %signores WHERE blocker_uuid = ? AND blocked_uuid = ? AND created_at < ?"
+                            .formatted(prefix))) {
                 ps.setString(1, blockerUuid);
                 ps.setString(2, blockedUuid);
+                ps.setLong(3, deletedAt);
                 removed = ps.executeUpdate();
             }
             recordDeletion("ignore", blockerUuid, blockedUuid, deletedAt);

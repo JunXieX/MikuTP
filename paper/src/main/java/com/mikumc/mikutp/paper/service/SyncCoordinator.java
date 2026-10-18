@@ -91,14 +91,24 @@ public final class SyncCoordinator {
             flushTask = null;
         }
         // Drain what is left so a clean stop does not lose replicated state.
-        // Repeated because a flush that is skipped while another one is in
-        // progress would otherwise leave its batch behind.
-        while (!pendingWrites.isEmpty()) {
-            int before = queuedWrites.get();
-            flushPendingWrites();
-            if (queuedWrites.get() >= before) {
-                break;
+        // The callback API is not cancellable, so an in-flight flush can still
+        // hold the flag: wait for it instead of abandoning the queue, then drain
+        // what it left behind.
+        for (int attempt = 0; attempt < 100 && !pendingWrites.isEmpty(); attempt++) {
+            if (flushing.get()) {
+                try {
+                    Thread.sleep(50);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    return;
+                }
+                continue;
             }
+            flushPendingWrites();
+        }
+        if (!pendingWrites.isEmpty()) {
+            plugin.getSLF4JLogger().warn("{} replicated changes could not be flushed before shutdown",
+                    queuedWrites.get());
         }
     }
 
@@ -120,6 +130,12 @@ public final class SyncCoordinator {
 
     public void onPlayerQuit() {
         activePlayers.decrementAndGet();
+    }
+
+    /** Seeds the presence counter with players already online at enable time, so
+     * a reload does not mistake the next join for the first one. */
+    public void seedActivePlayers(int count) {
+        activePlayers.set(Math.max(0, count));
     }
 
     private void publishResync() {
@@ -213,23 +229,25 @@ public final class SyncCoordinator {
             // entries one by one so only the truly broken write is dropped.
             plugin.getSLF4JLogger().warn("Batched apply of {} replicated changes failed, retrying individually",
                     batch.size(), e);
-            stagedCacheUpdates.clear();
             int dropped = 0;
             for (PendingWrite write : batch) {
+                // Each retry keeps only its own cache updates: a successful one is
+                // published right away, a failed one contributes nothing, so the
+                // two can never be confused.
+                stagedCacheUpdates.clear();
                 try {
                     database.runTransaction(write::apply);
                 } catch (Exception single) {
                     dropped++;
+                    stagedCacheUpdates.clear();
                     plugin.getSLF4JLogger().warn("Dropped one replicated change", single);
+                    continue;
                 }
+                runStagedCacheUpdates();
             }
             if (dropped > 0) {
                 plugin.getSLF4JLogger().warn("Dropped {} of {} replicated changes", dropped, batch.size());
             }
-            // Committed and dropped writes are indistinguishable here, so the
-            // cache is left alone rather than showing rows that may not exist.
-            // The next activation resync refreshes it.
-            stagedCacheUpdates.clear();
         }
     }
 

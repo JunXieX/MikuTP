@@ -90,14 +90,14 @@ public final class HomeService {
     }
 
     public void onQuit(UUID player) {
-        // Take the same stripe the load uses: a read that is already past its
-        // online check must not write a cache entry for the departing player
-        // after this purge.
-        synchronized (lockFor(player)) {
-            cache.remove(player);
-            limitCache.remove(player);
-            loadedPlayers.remove(player);
-        }
+        // Memory only: this runs on the player's region thread (Folia confines
+        // PlayerQuitEvent there), and the load path holds this stripe while it
+        // queries the single SQLite connection. Waiting for that lock here would
+        // stall the whole region. A load that finishes afterwards re-checks the
+        // registry under the same lock and refuses to write for an offline player.
+        cache.remove(player);
+        limitCache.remove(player);
+        loadedPlayers.remove(player);
     }
 
     /**
@@ -128,14 +128,29 @@ public final class HomeService {
     }
 
     /**
-     * Home list for a menu, loading on first use. Without this a list opened in
-     * the window before the join-time load completes looks empty.
+     * Home list for a menu. The join-time load is asynchronous, so a menu opened
+     * before it finished would show an empty list; this loads synchronously (the
+     * caller is already on an async thread) and returns the real list. Callers
+     * must not run this on a region thread.
      */
     public List<Home> homesForDisplay(UUID player) {
-        if (!loadedPlayers.contains(player)) {
-            loadAsync(player);
+        if (loadedPlayers.contains(player)) {
+            return homes(player);
         }
-        return homes(player);
+        synchronized (lockFor(player)) {
+            if (loadedPlayers.contains(player)) {
+                return homes(player);
+            }
+            try {
+                List<Home> loaded = sort(database.listHomes(player.toString()));
+                cache.put(player, loaded);
+                loadedPlayers.add(player);
+                return loaded;
+            } catch (Exception e) {
+                plugin.getSLF4JLogger().warn("Failed to load homes for display", e);
+                return homes(player);
+            }
+        }
     }
 
     /** Home limit from mikutp.homes.&lt;n&gt; permissions; must run on the player's thread. */
@@ -196,7 +211,7 @@ public final class HomeService {
                         publishHomeSet(home);
                     } catch (Exception e) {
                         plugin.getSLF4JLogger().warn("Failed to save home", e);
-                        messages.send(player, "common.teleport-failed");
+                        messages.send(player, "home.save-failed");
                     }
                 }
             });

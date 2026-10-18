@@ -605,7 +605,7 @@ public final class TeleportService {
                 });
             } catch (Exception e) {
                 plugin.getSLF4JLogger().warn("Cross-server dispatch failed", e);
-                messages.send(player, "common.teleport-failed");
+                tasks.entity(player, () -> messages.send(player, "common.teleport-failed"));
             }
         });
     }

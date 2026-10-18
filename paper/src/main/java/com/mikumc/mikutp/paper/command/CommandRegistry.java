@@ -7,6 +7,7 @@ import com.mikumc.mikutp.paper.service.HomeService;
 import com.mikumc.mikutp.paper.service.MessageService;
 import com.mikumc.mikutp.paper.service.OnlinePlayers;
 import com.mikumc.mikutp.paper.service.RequestService;
+import com.mikumc.mikutp.paper.service.Tasks;
 import com.mikumc.mikutp.paper.service.TeleportService;
 import com.mikumc.mikutp.paper.service.WarpService;
 import com.mikumc.mikutp.paper.service.WildService;
@@ -42,6 +43,7 @@ public final class CommandRegistry {
     private final DialogFactory dialogs;
     private final ChatMenus chats;
     private final OnlinePlayers onlinePlayers;
+    private final Tasks tasks;
     private final Runnable reloadAction;
     private final Runnable resyncAction;
     private final java.util.function.Supplier<String> infoSupplier;
@@ -51,7 +53,7 @@ public final class CommandRegistry {
     public CommandRegistry(JavaPlugin plugin, MessageService messages,
                            HomeService homeService, WarpService warpService, RequestService requestService,
                            WildService wildService, TeleportService teleports, DialogFactory dialogs,
-                           ChatMenus chats, OnlinePlayers onlinePlayers,
+                           ChatMenus chats, OnlinePlayers onlinePlayers, Tasks tasks,
                            Runnable reloadAction, Runnable resyncAction,
                            java.util.function.Supplier<String> infoSupplier,
                            java.util.function.BooleanSupplier dialogsEnabledSupplier,
@@ -66,6 +68,7 @@ public final class CommandRegistry {
         this.dialogs = dialogs;
         this.chats = chats;
         this.onlinePlayers = onlinePlayers;
+        this.tasks = tasks;
         this.reloadAction = reloadAction;
         this.resyncAction = resyncAction;
         this.infoSupplier = infoSupplier;
@@ -172,16 +175,25 @@ public final class CommandRegistry {
     }
 
     private void openHomeMenu(Player player, boolean delete) {
-        var homes = homeService.homesForDisplay(player.getUniqueId());
-        if (dialogsEnabled()) {
-            if (delete) {
-                dialogs.showHomeDelete(player, homes, 1, name -> homeService.delete(player, name));
-            } else {
-                dialogs.showHomeList(player, homes, 1, name -> homeService.go(player, name));
-            }
-        } else {
-            chats.homeList(player, homes, delete);
-        }
+        // The menu needs the full list, which may require a database read: do the
+        // lookup on the async pool and render on the player's own thread.
+        tasks.async(() -> {
+            var homes = homeService.homesForDisplay(player.getUniqueId());
+            tasks.entity(player, () -> {
+                if (!player.isOnline()) {
+                    return;
+                }
+                if (dialogsEnabled()) {
+                    if (delete) {
+                        dialogs.showHomeDelete(player, homes, 1, name -> homeService.delete(player, name));
+                    } else {
+                        dialogs.showHomeList(player, homes, 1, name -> homeService.go(player, name));
+                    }
+                } else {
+                    chats.homeList(player, homes, delete);
+                }
+            });
+        });
     }
 
     // ------------------------------------------------------------------ warp

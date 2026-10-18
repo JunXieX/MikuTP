@@ -77,6 +77,16 @@ public final class RequestService {
     private final BoundedIdSet handledEvents = new BoundedIdSet();
     /** Requests tracked while their target was not resolvable to a player yet. */
     private final Set<String> awaitingShow = ConcurrentHashMap.newKeySet();
+    /**
+     * Answers that arrived while the player they concern was connected to this
+     * backend but not yet visible in the registry (the join window). The proxy
+     * only mails events for players with no server connection at all, so an
+     * event dropped here would have no replay path: keep it until the join
+     * handler runs. Values are the raw events; capped so a broken join cannot
+     * leak memory.
+     */
+    private static final int MAX_DEFERRED = 1024;
+    private final Map<UUID, List<SyncEvent>> deferred = new ConcurrentHashMap<>();
     private ScheduledTask sweepTask;
 
     public RequestService(JavaPlugin plugin, Tasks tasks, MikuTPConfig config, Database database,
@@ -114,6 +124,7 @@ public final class RequestService {
 
     public void onQuit(UUID player) {
         lastIncoming.remove(player);
+        deferred.remove(player);
         // The quitting player's incoming requests are dropped locally: the proxy
         // mailbox redelivers unanswered requests on rejoin.
         Map<String, TpRequest> mine = incoming.remove(player);
@@ -356,7 +367,7 @@ public final class RequestService {
             case ACCEPT -> messages.send(target, "tpa.accepted-target", "player", request.requesterName);
             case DENY -> messages.send(target, "tpa.denied-target", "player", request.requesterName);
             case BLOCK -> messages.send(target, "tpa.blocked-target", "player", request.requesterName,
-                    "minutes", String.valueOf(config.tpa.blockDurationMinutes));
+                    "minutes", blockMinutesLabel());
         }
         UUID requesterId = parseUuid(request.requesterUuid);
         Player requester = requesterId == null ? null : onlinePlayers.byId(requesterId);
@@ -392,6 +403,12 @@ public final class RequestService {
             return;
         }
         publishResponded(request, response);
+    }
+
+    /** Placeholder text for a block duration; 0 means "until unblocked". */
+    private String blockMinutesLabel() {
+        int minutes = config.tpa.blockDurationMinutes;
+        return String.valueOf(Math.max(0, minutes));
     }
 
     private void publishResponded(TpRequest request, Response response) {
@@ -430,8 +447,11 @@ public final class RequestService {
             return;
         }
         UUID blockerId = blocker.getUniqueId();
-        long expiresAt = permanent ? IgnoreEntry.PERMANENT
-                : System.currentTimeMillis() + Math.max(1, config.tpa.blockDurationMinutes) * 60_000L;
+        // 0 (or less) means "until unblocked", the same rule the request dialog's
+        // block button uses through storeIgnore().
+        int minutes = config.tpa.blockDurationMinutes;
+        long expiresAt = permanent || minutes <= 0 ? IgnoreEntry.PERMANENT
+                : System.currentTimeMillis() + minutes * 60_000L;
         // resolve() completes synchronously for a local player, so the database
         // write must be pushed onto the async pool explicitly: on Folia a region
         // thread must never block on SQLite.
@@ -459,7 +479,7 @@ public final class RequestService {
                 messages.send(blocker, "tpa.blocked-permanent-target", "player", opt.get().name());
             } else {
                 messages.send(blocker, "tpa.blocked-target", "player", opt.get().name(),
-                        "minutes", String.valueOf(config.tpa.blockDurationMinutes));
+                        "minutes", String.valueOf(Math.max(0, minutes)));
             }
         }));
     }
@@ -644,6 +664,41 @@ public final class RequestService {
         }
     }
 
+    /**
+     * Keeps an answer that arrived before its player was visible in the registry.
+     * Bounded: anything beyond the cap is dropped and will be recovered by the
+     * request expiring, never by unbounded growth.
+     */
+    private void defer(UUID player, SyncEvent event) {
+        if (player == null || event.id == null) {
+            return;
+        }
+        deferred.compute(player, (key, queue) -> {
+            if (queue == null) {
+                queue = new ArrayList<>();
+            }
+            if (queue.size() < MAX_DEFERRED) {
+                queue.add(event);
+            }
+            return queue;
+        });
+    }
+
+    /** Re-applies answers that were deferred while the player was joining. */
+    public void replayDeferred(Player player) {
+        List<SyncEvent> queued = deferred.remove(player.getUniqueId());
+        if (queued == null) {
+            return;
+        }
+        for (SyncEvent event : queued) {
+            try {
+                onSyncEvent(event);
+            } catch (Exception e) {
+                plugin.getSLF4JLogger().warn("Failed to replay a deferred request event", e);
+            }
+        }
+    }
+
     /** Registers a request for its target; false when it is already tracked. */
     private boolean trackIncoming(TpRequest request) {
         UUID targetId = parseUuid(request.targetUuid);
@@ -700,8 +755,9 @@ public final class RequestService {
         Player requester = requesterId == null ? null : onlinePlayers.byId(requesterId);
         if (requester == null) {
             // The requester is not on this backend right now (switching servers or
-            // still joining). Do not mark the event handled: the proxy may replay
-            // it, and consuming it here would lose the answer for good.
+            // still joining). Leave the event unhandled: the proxy mails it for a
+            // player with no connection, and a player mid-join is queued locally.
+            defer(requesterId, event);
             return;
         }
         if (!handledEvents.add(event.id)) {
@@ -757,8 +813,9 @@ public final class RequestService {
         UUID moverId = parseUuid(request.targetUuid);
         Player mover = moverId == null ? null : onlinePlayers.byId(moverId);
         if (mover == null) {
-            // Same reasoning as processResponse: leave the event unhandled so a
-            // replay can still deliver it once the mover lands here.
+            // Same reasoning as processResponse: keep the event until the player
+            // is visible so the acceptance is not lost in the join window.
+            defer(moverId, event);
             return;
         }
         if (!handledEvents.add(event.id)) {

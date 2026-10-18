@@ -50,6 +50,9 @@ public final class PlayerLifecycle implements Listener {
         profiles.onJoin(player);
         homeService.onJoin(player);
         coordinator.onPlayerJoin();
+        // Answers that arrived while this backend still saw the player as absent
+        // are replayed first: they may be the acceptance the player is waiting for.
+        requestService.replayDeferred(player);
         requestService.redeliverPending(player);
         teleports.applyPending(id);
     }

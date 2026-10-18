@@ -93,8 +93,12 @@ public final class ProfileService {
         long stamped = System.currentTimeMillis();
         tasks.async(() -> {
             try {
-                // The timestamp stamps the flip as the newest profile change, so a
-                // replicated snapshot produced before it is rejected in SQL.
+                // Upsert first: a toggle that races the join-time profile write must
+                // not be lost to an UPDATE that matched no row yet. The timestamp
+                // stamps the flip as the newest profile change, so a replicated
+                // snapshot produced before it is rejected in SQL.
+                String known = name == null ? "" : name;
+                database.upsertPlayer(uuid.toString(), known, stamped);
                 database.runTransaction(tx -> tx.setTpaEnabled(uuid.toString(), enabled, stamped));
             } catch (Exception e) {
                 plugin.getSLF4JLogger().warn("Failed to persist tpa toggle", e);
