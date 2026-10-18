@@ -97,10 +97,15 @@ public final class VelocitySyncBus implements SyncBus {
 
     private void enqueue(com.google.gson.JsonObject op) {
         outbound.addLast(op);
-        int depth = queuedOps.incrementAndGet();
         // Over budget: shed the oldest ops. The activation resync re-converges
         // state, so a dropped event is not a permanent divergence.
-        while (depth > MAX_QUEUED_OPS && outbound.pollFirst() != null) {
+        int depth = queuedOps.incrementAndGet();
+        while (depth > MAX_QUEUED_OPS) {
+            if (outbound.pollFirst() == null) {
+                // Lost the race with a concurrent drain: nothing left to shed.
+                queuedOps.decrementAndGet();
+                break;
+            }
             depth = queuedOps.decrementAndGet();
         }
     }

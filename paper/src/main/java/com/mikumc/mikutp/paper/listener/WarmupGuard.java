@@ -13,6 +13,13 @@ import org.bukkit.event.player.PlayerMoveEvent;
  * /mtp reload takes effect without a restart. */
 public final class WarmupGuard implements Listener {
 
+    /**
+     * Movement below this many blocks is ignored even in the strictest mode.
+     * Comparing raw doubles would cancel on sub-millimetre drift caused by the
+     * client's own position corrections, which the player cannot prevent.
+     */
+    private static final double EPSILON_SQUARED = 1.0e-4;
+
     private final WarmupManager warmups;
     private final MikuTPConfig config;
 
@@ -32,13 +39,8 @@ public final class WarmupGuard implements Listener {
             return;
         }
         double threshold = Math.max(0, config.teleport.moveThresholdBlocks);
-        if (threshold <= 0) {
-            if (to.getX() != from.getX() || to.getY() != from.getY() || to.getZ() != from.getZ()) {
-                warmups.cancel(event.getPlayer(), "common.warmup.cancelled-move");
-            }
-            return;
-        }
-        if (from.distanceSquared(to) >= threshold * threshold) {
+        double limit = threshold <= 0 ? EPSILON_SQUARED : threshold * threshold;
+        if (from.distanceSquared(to) >= limit) {
             warmups.cancel(event.getPlayer(), "common.warmup.cancelled-move");
         }
     }

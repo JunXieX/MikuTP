@@ -65,4 +65,24 @@ class ConfigIOTest {
         assertEquals(7, config.teleport.warmupSeconds);
         assertEquals("mikutp_", config.storage.tablePrefix);
     }
+
+    /** YAML may hand back a quoted scalar as a String; it must still be applied. */
+    @Test
+    void quotedNumbersAreParsed() throws IOException {
+        Path file = dir.resolve("config.yml");
+        String yaml = """
+                teleport:
+                  warmup_seconds: "7"
+                  move_threshold_blocks: "1.5"
+                  sounds: "false"
+                home:
+                  default_limit: "9"
+                """;
+        MikuTPConfig config = ConfigIO.loadOrCreate(file, yaml, MikuTPConfig.class);
+
+        assertEquals(7, config.teleport.warmupSeconds);
+        assertEquals(1.5, config.teleport.moveThresholdBlocks);
+        assertFalse(config.teleport.sounds);
+        assertEquals(9, config.home.defaultLimit);
+    }
 }

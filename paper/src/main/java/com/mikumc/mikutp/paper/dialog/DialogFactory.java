@@ -149,8 +149,7 @@ public final class DialogFactory {
             buttons.add(actionButton(Component.text(home.name), 250,
                     () -> tasks.entity(viewer, () -> onPick.accept(home.name))));
         }
-        Consumer<Integer> reopen = p -> showHomePage(viewer, homes, p, onPick, delete);
-        addPageButtons(buttons, viewer, w[0], w[1], reopen);
+        addPageButtons(buttons, viewer, w[0], w[1], p -> showHomePage(viewer, homes, p, onPick, delete));
         showList(viewer, delete ? "dialog.list.title-delhome" : "dialog.list.title-homes", buttons, w[1]);
     }
 

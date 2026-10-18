@@ -4,7 +4,6 @@ import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.function.IntFunction;
 
 /** Per-player command cooldowns, in-memory only. */
 public final class CooldownManager {
@@ -43,8 +42,13 @@ public final class CooldownManager {
         if (end == null) {
             return 0;
         }
-        long rest = (end - System.currentTimeMillis()) / 1000L;
-        return Math.max(0, rest);
+        long rest = end - System.currentTimeMillis();
+        if (rest <= 0) {
+            return 0;
+        }
+        // Round up: truncating would report 0 while a fraction of a second is
+        // still pending, letting the command through slightly early.
+        return (rest + 999L) / 1000L;
     }
 
     public void apply(UUID player, Kind kind) {

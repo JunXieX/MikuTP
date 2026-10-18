@@ -73,15 +73,15 @@ public final class ConfigIO {
         if (type == String.class) {
             field.set(model, raw.toString());
         } else if (type == int.class || type == Integer.class) {
-            field.set(model, (int) ((Number) raw).intValue());
+            field.set(model, (int) number(raw));
         } else if (type == long.class || type == Long.class) {
-            field.set(model, ((Number) raw).longValue());
+            field.set(model, (long) number(raw));
         } else if (type == double.class || type == Double.class) {
-            field.set(model, ((Number) raw).doubleValue());
+            field.set(model, number(raw));
         } else if (type == float.class || type == Float.class) {
-            field.set(model, (float) ((Number) raw).doubleValue());
+            field.set(model, (float) number(raw));
         } else if (type == boolean.class || type == Boolean.class) {
-            field.set(model, raw instanceof Boolean b ? b : Boolean.parseBoolean(raw.toString()));
+            field.set(model, raw instanceof Boolean b ? b : Boolean.parseBoolean(raw.toString().trim()));
         } else if (List.class.isAssignableFrom(type)) {
             List<String> values = new ArrayList<>();
             if (raw instanceof List<?> list) {
@@ -95,6 +95,19 @@ public final class ConfigIO {
         } else if (raw instanceof Map<?, ?> nested && !type.isPrimitive() && hasNoArgConstructor(type)) {
             merge(field.get(model), nested);
         }
+    }
+
+    /**
+     * Reads a numeric value, accepting the quoted form too ({@code "3"}).
+     * YAML happily stores a quoted scalar as a String; a strict cast would throw
+     * and the caller would silently keep the default, so the user's setting
+     * would appear to be ignored.
+     */
+    private static double number(Object raw) {
+        if (raw instanceof Number n) {
+            return n.doubleValue();
+        }
+        return Double.parseDouble(raw.toString().trim());
     }
 
     private static boolean hasNoArgConstructor(Class<?> type) {

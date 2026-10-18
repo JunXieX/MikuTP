@@ -152,6 +152,10 @@ public final class MikuTPPlugin extends JavaPlugin {
 
     @Override
     public void onDisable() {
+        // Stop producers first, then transport, then storage: closing the bus
+        // before its flush loop is done would push messages onto a channel that
+        // is about to be unregistered, and closing storage first would fail any
+        // write still draining from the coordinator.
         if (requestService != null) {
             requestService.shutdown();
         }
@@ -162,15 +166,15 @@ public final class MikuTPPlugin extends JavaPlugin {
             expansion.unregister();
             expansion = null;
         }
+        if (network != null) {
+            network.shutdown();
+        }
         if (syncBus != null) {
             try {
                 syncBus.close();
             } catch (Exception e) {
                 getSLF4JLogger().warn("Failed to close sync bus cleanly", e);
             }
-        }
-        if (network != null) {
-            network.shutdown();
         }
         if (database != null) {
             try {

@@ -21,7 +21,10 @@ public final class StorageFactory {
         h.setMaximumPoolSize(1);
         h.setConnectionTimeout(5000);
         h.setDriverClassName("org.sqlite.JDBC");
-        h.setJdbcUrl("jdbc:sqlite:" + dataFolder.resolve("data.db").toAbsolutePath());
+        // busy_timeout: WAL still returns SQLITE_BUSY in a few edge cases (e.g.
+        // checkpointing); without a wait the write fails instead of retrying.
+        h.setJdbcUrl("jdbc:sqlite:" + dataFolder.resolve("data.db").toAbsolutePath()
+                + "?busy_timeout=5000");
         HikariDataSource dataSource = new HikariDataSource(h);
         return new Database(new PooledProvider(dataSource), config.storage.tablePrefix);
     }

@@ -189,9 +189,12 @@ public final class WildService {
         if (!ground.getType().isSolid() || HAZARDS.contains(ground.getType())) {
             return false;
         }
-        Material lower = world.getBlockAt(x, y + 1, z).getType();
-        Material upper = world.getBlockAt(x, y + 2, z).getType();
-        return lower.isAir() && upper.isAir();
+        // getHighestBlockYAt can return a plant or snow layer rather than the
+        // actual floor, leaving the player standing inside the block below.
+        // Require both feet and head cells to be free of anything solid.
+        Material feet = world.getBlockAt(x, y + 1, z).getType();
+        Material head = world.getBlockAt(x, y + 2, z).getType();
+        return feet.isAir() && head.isAir();
     }
 
     private boolean blockedBiome(Biome biome) {
