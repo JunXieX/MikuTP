@@ -583,14 +583,6 @@ public final class TeleportService {
         });
     }
 
-    private void playerTeleportAsync(UUID playerUuid, Location target, String label) {
-        Player player = onlinePlayers.byId(playerUuid);
-        if (player == null) {
-            return;
-        }
-        player.teleportAsync(target).thenAccept(ok -> reportTeleport(playerUuid, ok, label));
-    }
-
     /** Anchor-based arrival fallback: use the stored position, else tell the player it failed. */
     private void fallbackPendingArrival(UUID playerUuid, PendingTeleport pending) {
         World world = Bukkit.getWorld(pending.position.world);

@@ -42,11 +42,11 @@ public final class Tasks {
      * Entity work with a retirement callback. The callback runs when the entity
      * is removed before the task fires, which is the only chance to release
      * anything the caller parked on the task (a queued batch, for instance).
-     * Returns null when the scheduler is already retired, in which case the
-     * callback does not run either.
+     * Returns false when the scheduler is already retired; neither callback runs
+     * in that case.
      */
-    public ScheduledTask entity(Player player, Runnable run, Runnable retired) {
-        return player.getScheduler().run(plugin, task -> run.run(), retired);
+    public boolean entity(Player player, Runnable run, Runnable retired) {
+        return player.getScheduler().run(plugin, task -> run.run(), retired) != null;
     }
 
     /** Runs once per tick on the player's region thread until the consumer cancels it. */
