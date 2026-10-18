@@ -93,4 +93,23 @@ class ProxyMessagesTest {
         tampered.addProperty("payload", "{\"evil\":true}");
         assertFalse(ProxyMessages.verify(tampered, token));
     }
+
+    /** The signature must not depend on member insertion order. */
+    @Test
+    void signatureIgnoresMemberOrder() {
+        String token = "shared-secret";
+        String signed = ProxyMessages.sign(ProxyMessages.encodePending("uuid-a", "{}", 300), token);
+        JsonObject original = ProxyMessages.decode(signed);
+
+        // Rebuild the same members in a different order, keeping the signature.
+        JsonObject reordered = new JsonObject();
+        reordered.addProperty(ProxyMessages.SIGNATURE_MEMBER,
+                original.get(ProxyMessages.SIGNATURE_MEMBER).getAsString());
+        reordered.addProperty("ttl", original.get("ttl").getAsInt());
+        reordered.addProperty("payload", original.get("payload").getAsString());
+        reordered.addProperty("player", original.get("player").getAsString());
+        reordered.addProperty("t", original.get("t").getAsString());
+
+        assertTrue(ProxyMessages.verify(reordered, token));
+    }
 }

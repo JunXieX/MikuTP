@@ -12,6 +12,8 @@ import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Base64;
 import java.util.List;
+import java.util.Map;
+import java.util.TreeMap;
 
 /**
  * Wire format of the plugin message channel shared by the backends and the
@@ -225,8 +227,8 @@ public final class ProxyMessages {
     }
 
     /**
-     * Signs {@code json} in place: the signature covers the canonical JSON form
-     * of the message without the {@code sig} member. A blank token produces an
+     * Signs {@code json} in place: the signature covers a canonical form of the
+     * message without the {@code sig} member. A blank token produces an
      * unauthenticated message, which every receiver rejects.
      */
     public static String sign(String json, String token) {
@@ -256,16 +258,34 @@ public final class ProxyMessages {
         return constantTimeEquals(received, expected);
     }
 
+    /**
+     * HMAC over a canonical rendering of the message: members sorted by name.
+     * Falling back to raw {@code toString()} would tie the signature to member
+     * insertion order, which is not part of the wire contract.
+     */
     private static String signature(JsonObject message, String token) {
         try {
             Mac mac = Mac.getInstance("HmacSHA256");
             mac.init(new SecretKeySpec(
                     token == null ? new byte[0] : token.getBytes(StandardCharsets.UTF_8), "HmacSHA256"));
-            byte[] digest = mac.doFinal(GSON.toJson(message).getBytes(StandardCharsets.UTF_8));
+            String canonical = canonicalize(message);
+            byte[] digest = mac.doFinal(canonical.getBytes(StandardCharsets.UTF_8));
             return Base64.getUrlEncoder().withoutPadding().encodeToString(digest);
         } catch (Exception e) {
             throw new IllegalStateException("HmacSHA256 unavailable", e);
         }
+    }
+
+    private static String canonicalize(JsonObject message) {
+        TreeMap<String, JsonElement> sorted = new TreeMap<>();
+        for (Map.Entry<String, JsonElement> entry : message.entrySet()) {
+            sorted.put(entry.getKey(), entry.getValue());
+        }
+        JsonObject ordered = new JsonObject();
+        for (Map.Entry<String, JsonElement> entry : sorted.entrySet()) {
+            ordered.add(entry.getKey(), entry.getValue());
+        }
+        return GSON.toJson(ordered);
     }
 
     private static boolean constantTimeEquals(String a, String b) {

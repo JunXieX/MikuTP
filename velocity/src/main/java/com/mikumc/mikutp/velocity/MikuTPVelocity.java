@@ -406,10 +406,16 @@ public final class MikuTPVelocity {
         if (queue == null) {
             return;
         }
-        List<SyncEvent> batch = takeBatch(queue);
-        if (!batch.isEmpty()) {
-            sendEvents(connection, batch);
-        }
+        // Drain everything, not just one batch: after a long empty period the
+        // backlog can exceed MAX_EVENTS_PER_BATCH, and waiting for the next
+        // event to trigger another flush would leave the rest stuck.
+        List<SyncEvent> batch;
+        do {
+            batch = takeBatch(queue);
+            if (!batch.isEmpty()) {
+                sendEvents(connection, batch);
+            }
+        } while (!batch.isEmpty() && !queue.isEmpty());
     }
 
     private void deliverPending(UUID uuid, ServerConnection connection) {
