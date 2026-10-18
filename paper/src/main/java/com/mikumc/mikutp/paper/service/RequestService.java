@@ -290,14 +290,25 @@ public final class RequestService {
             // missed it the first time.
             markAnswered(request.id);
             clearOutgoing(request.requesterUuid, request.id);
+            // Keep the "latest" pointer off a request that no longer exists.
+            lastIncoming.remove(target.getUniqueId(), request.id);
             respondCommon(target, request, response);
         });
     }
 
     /** Responds to the most recent pending request delivered to the player. */
     public void respondLatest(Player target, Response response) {
-        String id = lastIncoming.get(target.getUniqueId());
+        UUID targetId = target.getUniqueId();
+        String id = lastIncoming.get(targetId);
         if (id == null) {
+            messages.send(target, "tpa.no-pending");
+            return;
+        }
+        // The remembered id can outlive its request (swept elsewhere, or answered
+        // through another path). Clear it so a stale pointer is not reused.
+        Map<String, TpRequest> mine = incoming.get(targetId);
+        if (mine == null || !mine.containsKey(id)) {
+            lastIncoming.remove(targetId, id);
             messages.send(target, "tpa.no-pending");
             return;
         }
@@ -534,6 +545,7 @@ public final class RequestService {
             // re-open a request the requester already withdrew.
             for (TpRequest request : found) {
                 markAnswered(request.id);
+                lastIncoming.remove(entry.getKey(), request.id);
             }
             Player target = Bukkit.getPlayer(entry.getKey());
             if (target == null) {
@@ -601,7 +613,14 @@ public final class RequestService {
             return false;
         }
         mine.put(request.id, request);
-        lastIncoming.put(targetId, request.id);
+        // "Latest" must mean the newest request, not the last one delivered:
+        // events can arrive out of order, and /tpaccept without arguments would
+        // otherwise answer an older request than the player just received.
+        lastIncoming.merge(targetId, request.id, (current, incomingId) -> {
+            TpRequest currentRequest = mine.get(current);
+            return currentRequest == null || currentRequest.createdAt <= request.createdAt
+                    ? incomingId : current;
+        });
         return true;
     }
 
