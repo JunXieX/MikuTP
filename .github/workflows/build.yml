@@ -37,6 +37,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: jar-${{ github.sha }}
+          retention-days: 1
           path: |
             paper/build/libs/*.jar
             velocity/build/libs/*.jar
