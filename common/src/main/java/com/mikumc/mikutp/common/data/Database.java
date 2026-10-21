@@ -358,8 +358,8 @@ public final class Database implements AutoCloseable {
             // replicated "base" next to a legacy "Base" would create a duplicate.
             // Drop the case variants first, keeping the newer row.
             try (PreparedStatement ps = connection.prepareStatement(
-                    "DELETE FROM %shomes WHERE owner_uuid = ? AND name = ? COLLATE NOCASE AND name <> ?"
-                            + " AND created_at <= ?").formatted(prefix)) {
+                    ("DELETE FROM %shomes WHERE owner_uuid = ? AND name = ? COLLATE NOCASE AND name <> ?"
+                            + " AND created_at <= ?").formatted(prefix))) {
                 ps.setString(1, home.ownerUuid);
                 ps.setString(2, home.name);
                 ps.setString(3, home.name);
