@@ -121,6 +121,14 @@ public final class TeleportService {
             return;
         }
         UUID id = player.getUniqueId();
+        // The proxy should only ever deliver this player's own handoff, but the
+        // payload is the authority: a cross-wired or forged frame must not park a
+        // teleport that fires on this player's next join.
+        if (pending.playerUuid != null && !pending.playerUuid.equals(id.toString())) {
+            plugin.getSLF4JLogger().debug("Dropping pending teleport for {} delivered to {}",
+                    pending.playerUuid, id);
+            return;
+        }
         arriving.put(id, pending);
         // The proxy can deliver this after PlayerJoinEvent already ran; applying
         // right away keeps the handoff from waiting for the player's next login.
@@ -331,10 +339,20 @@ public final class TeleportService {
         // own stamp from the database.
         long updatedAt = System.currentTimeMillis();
         tasks.async(() -> {
+            boolean written;
             try {
-                database.setPosition(uuid, pos, colPrefix);
+                // Same stamp as the event: the local row and the replicated version
+                // must be the exact same write, otherwise a peer can win the LWW
+                // comparison against the row it was derived from (X-06).
+                written = database.setPositionIfNewer(uuid, pos, colPrefix, updatedAt);
             } catch (Exception e) {
                 plugin.getSLF4JLogger().warn("Failed to save {} position", kind, e);
+                return;
+            }
+            if (!written) {
+                // A newer position already won locally; publishing this older snapshot
+                // would only be rejected on every receiver.
+                plugin.getSLF4JLogger().debug("Skipped publishing an older {} position for {}", kind, uuid);
                 return;
             }
             if (syncBus.crossServer()) {
@@ -541,6 +559,9 @@ public final class TeleportService {
             return;
         }
         if (!syncBus.crossServer()) {
+            // Nothing was dispatched: mirror the local missing-world branch and give
+            // the cooldown back instead of charging for a failed teleport (X-04).
+            cooldowns.clear(player.getUniqueId(), cooldownKindOf(source));
             messages.send(player, "common.cross-disabled");
             return;
         }

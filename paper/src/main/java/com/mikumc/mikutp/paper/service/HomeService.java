@@ -181,6 +181,13 @@ public final class HomeService {
         return loaded;
     }
 
+    /** True when {@link #homes(UUID)} reflects a full database read for this player.
+     * Consumers that must distinguish "unknown" from "zero homes" (placeholder API)
+     * should check this before reporting a number. */
+    public boolean isHomesLoaded(UUID player) {
+        return loadedPlayers.contains(player);
+    }
+
     /** Cached limit for off-thread consumers (PlaceholderAPI). */
     public int cachedLimit(UUID player) {
         return limitCache.getOrDefault(player, Math.max(0, config.home.defaultLimit));
@@ -311,12 +318,10 @@ public final class HomeService {
                         return;
                     }
                     long deletedAt = System.currentTimeMillis();
-                    // Call the deleting write only when the database still holds the
-                    // row: Database.deleteHome always records a tombstone, and a
-                    // tombstone for a row that never existed here would block a
-                    // slightly older replication of that home forever.
-                    if (database.getHome(id.toString(), match.name).isEmpty()
-                            || !database.deleteHome(id.toString(), match.name)) {
+                    // One transaction for the row delete and its tombstone, so a crash
+                    // can neither lose the delete nor the stamp; a row that is already
+                    // gone writes no tombstone (it would block an older replication).
+                    if (!database.deleteHomeAndTombstone(id.toString(), match.name, deletedAt)) {
                         // The cache was ahead of the database (e.g. a remote delete was
                         // applied in between): drop the stale entry, but write no tombstone.
                         cache.put(id, sort(current.stream()

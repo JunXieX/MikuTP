@@ -105,6 +105,7 @@ class DatabaseTest {
             assertFalse(profile.tpaEnabled);
             // Migrated columns default to "unknown"/"no version".
             assertFalse(profile.tpaKnown);
+            assertEquals(0L, profile.tpaUpdatedAt);
             assertEquals(0L, legacy.getPositionUpdatedAt("old-uuid", Database.BACK_PREFIX));
 
             // The migrated stamp column is usable right away.
@@ -193,6 +194,46 @@ class DatabaseTest {
         assertEquals(2.0, database.getHome("uuid-a", "base").orElseThrow().position.x);
     }
 
+    /** Local delete: the row removal and its tombstone commit in the same transaction. */
+    @Test
+    void deleteHomeAndTombstoneCommitsBoth() throws Exception {
+        long created = System.currentTimeMillis() - 60_000;
+        database.saveHome(new Home("uuid-a", "base", new Position("s1", "world", 1, 1, 1, 0f, 0f), created));
+
+        assertTrue(database.deleteHomeAndTombstone("uuid-a", "base", System.currentTimeMillis()));
+        assertTrue(database.getHome("uuid-a", "base").isEmpty());
+        // The tombstone was written with it: replaying the old snapshot is rejected.
+        assertFalse(database.saveHome(new Home("uuid-a", "base",
+                new Position("s1", "world", 1, 1, 1, 0f, 0f), created)));
+        assertEquals(1, database.listTombstones().size());
+    }
+
+    /** Deleting a home this backend does not have must not leave a blocking tombstone. */
+    @Test
+    void deleteHomeAndTombstoneWithoutRowWritesNoTombstone() throws Exception {
+        assertFalse(database.deleteHomeAndTombstone("uuid-a", "ghost", System.currentTimeMillis()));
+        assertTrue(database.listTombstones().isEmpty());
+
+        // No tombstone means an older replication of that name is still accepted.
+        assertTrue(database.saveHome(new Home("uuid-a", "ghost",
+                new Position("s1", "world", 1, 1, 1, 0f, 0f), 1L)));
+        assertEquals(1, database.countHomes("uuid-a"));
+    }
+
+    /** The row delete and the tombstone share one transaction: both roll back on failure. */
+    @Test
+    void deleteHomeAndTombstoneRollsBackTogether() throws Exception {
+        database.saveHome(new Home("uuid-a", "base", new Position("s1", "world", 1, 1, 1, 0f, 0f), 1_000L));
+
+        assertThrows(java.sql.SQLException.class, () -> database.runTransaction(tx -> {
+            assertTrue(tx.deleteHomeAndTombstone("uuid-a", "base", 2_000L));
+            throw new java.sql.SQLException("boom");
+        }));
+
+        assertEquals(1, database.countHomes("uuid-a"), "the delete must roll back");
+        assertTrue(database.listTombstones().isEmpty(), "the tombstone must roll back");
+    }
+
     @Test
     void staleTombstonesAreHiddenAndFreshOnesListed() throws Exception {
         long ancient = System.currentTimeMillis() - 8L * 24 * 60 * 60 * 1000;
@@ -240,29 +281,68 @@ class DatabaseTest {
         assertTrue(byName.tpaEnabled);
         assertFalse(byName.tpaKnown, "a plain identity upsert must not claim the toggle is known");
 
+        long before = System.currentTimeMillis();
         database.setTpaEnabled("uuid-a", false);
         PlayerProfile toggled = database.getPlayer("uuid-a").orElseThrow();
         assertFalse(toggled.tpaEnabled);
         assertTrue(toggled.tpaKnown);
+        assertTrue(toggled.tpaUpdatedAt >= before, "a flip must advance the toggle stamp");
         assertEquals(2, database.listAllProfiles().size());
         assertTrue(database.listAllProfiles().stream().anyMatch(p -> p.tpaKnown));
     }
 
-    /** M-03: an identity refresh must never reset tpa_known or the stored toggle. */
+    /** M-03: an identity refresh must never reset tpa_known, the toggle or its stamp. */
     @Test
     void identityUpsertNeverClearsTpaKnown() throws Exception {
         database.upsertPlayer("uuid-a", "Alice", 100L);
         database.setTpaEnabled("uuid-a", false);
-        assertTrue(database.getPlayer("uuid-a").orElseThrow().tpaKnown);
+        PlayerProfile before = database.getPlayer("uuid-a").orElseThrow();
+        assertTrue(before.tpaKnown);
+        assertTrue(before.tpaUpdatedAt > 0L);
 
         // Older identity snapshot arrives late: it may not touch the toggle state.
         database.upsertPlayer("uuid-a", "Alice", 50L);
         PlayerProfile profile = database.getPlayer("uuid-a").orElseThrow();
         assertFalse(profile.tpaEnabled);
         assertTrue(profile.tpaKnown);
+        assertEquals(before.tpaUpdatedAt, profile.tpaUpdatedAt);
+        assertEquals(before.lastOnline, profile.lastOnline, "an older identity snapshot is rejected");
     }
 
-    /** Replicated profiles are last-writer-wins by timestamp. */
+    /**
+     * R2-02: toggle ordering must use tpa_updated_at, not last_online. A newer
+     * identity stamp (a join) must not reject an older-but-authoritative toggle,
+     * and a newer toggle must not be blocked by a further-ahead identity stamp.
+     */
+    @Test
+    void toggleOrderingUsesTpaUpdatedAtNotLastOnline() throws Exception {
+        database.upsertPlayer("uuid-a", "Alice", 5_000L);
+
+        // Toggle stamp 1000 is older than last_online 5000: it must still win.
+        assertEquals(1, database.transaction(tx -> tx.setTpaEnabled("uuid-a", false, 1_000L)).intValue());
+        PlayerProfile profile = database.getPlayer("uuid-a").orElseThrow();
+        assertFalse(profile.tpaEnabled);
+        assertTrue(profile.tpaKnown);
+        assertEquals(1_000L, profile.tpaUpdatedAt);
+        assertEquals(5_000L, profile.lastOnline, "a toggle must never lower last_online");
+
+        // Older toggle snapshot is rejected.
+        assertEquals(0, database.transaction(tx -> tx.setTpaEnabled("uuid-a", true, 500L)).intValue());
+        assertFalse(database.getPlayer("uuid-a").orElseThrow().tpaEnabled);
+
+        // Newer toggle is accepted even though last_online is further ahead.
+        assertEquals(1, database.transaction(tx -> tx.setTpaEnabled("uuid-a", true, 2_000L)).intValue());
+        profile = database.getPlayer("uuid-a").orElseThrow();
+        assertTrue(profile.tpaEnabled);
+        assertEquals(2_000L, profile.tpaUpdatedAt);
+        assertEquals(5_000L, profile.lastOnline);
+
+        // Equal stamp still wins (resending the newest snapshot is harmless).
+        assertEquals(1, database.transaction(tx -> tx.setTpaEnabled("uuid-a", false, 2_000L)).intValue());
+        assertFalse(database.getPlayer("uuid-a").orElseThrow().tpaEnabled);
+    }
+
+    /** Replicated toggles are last-writer-wins by their own toggle stamp. */
     @Test
     void staleProfileSnapshotCannotUndoToggle() throws Exception {
         database.upsertPlayer("uuid-a", "Alice", 1_000L);

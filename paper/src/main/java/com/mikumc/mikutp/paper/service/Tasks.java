@@ -17,21 +17,97 @@ import java.util.function.Consumer;
 public final class Tasks {
 
     private final Plugin plugin;
+    /** Set once the plugin is disabling: new async work is refused from then on. */
+    private volatile boolean shuttingDown;
+    /** Async work currently executing; the shutdown drain waits for it to reach zero. */
+    private final java.util.concurrent.atomic.AtomicInteger inFlight =
+            new java.util.concurrent.atomic.AtomicInteger();
 
     public Tasks(Plugin plugin) {
         this.plugin = plugin;
     }
 
     public void async(Runnable run) {
-        Bukkit.getAsyncScheduler().runNow(plugin, task -> run.run());
+        if (shuttingDown) {
+            return;
+        }
+        inFlight.incrementAndGet();
+        try {
+            Bukkit.getAsyncScheduler().runNow(plugin, task -> runGuarded(run));
+        } catch (RuntimeException e) {
+            // Only reachable in the check/disable race; the work is dropped anyway.
+            inFlight.decrementAndGet();
+        }
     }
 
     public void asyncDelayed(Runnable run, long delayMillis) {
-        Bukkit.getAsyncScheduler().runDelayed(plugin, task -> run.run(), Math.max(1, delayMillis), TimeUnit.MILLISECONDS);
+        if (shuttingDown) {
+            return;
+        }
+        inFlight.incrementAndGet();
+        try {
+            Bukkit.getAsyncScheduler().runDelayed(plugin, task -> runGuarded(run),
+                    Math.max(1, delayMillis), TimeUnit.MILLISECONDS);
+        } catch (RuntimeException e) {
+            inFlight.decrementAndGet();
+        }
     }
 
     public ScheduledTask asyncRepeat(Runnable run, long initialDelay, long period, TimeUnit unit) {
-        return Bukkit.getAsyncScheduler().runAtFixedRate(plugin, task -> run.run(), initialDelay, period, unit);
+        if (shuttingDown) {
+            return null;
+        }
+        try {
+            return Bukkit.getAsyncScheduler().runAtFixedRate(plugin, task -> {
+                if (shuttingDown) {
+                    task.cancel();
+                    return;
+                }
+                runGuarded(run);
+            }, initialDelay, period, unit);
+        } catch (RuntimeException e) {
+            // Only reachable in the check/disable race: no task was scheduled.
+            return null;
+        }
+    }
+
+    private void runGuarded(Runnable run) {
+        try {
+            run.run();
+        } finally {
+            inFlight.decrementAndGet();
+        }
+    }
+
+    /**
+     * Refuses new async work and lets in-flight async work finish. Called first in
+     * {@code onDisable}: storage is closed after the bounded drain, so a task that
+     * still ran would otherwise fail against a closed pool (R2-12).
+     */
+    public void beginShutdown() {
+        shuttingDown = true;
+    }
+
+    /**
+     * Waits up to {@code maxMillis} for async work to drain.
+     *
+     * @return true when nothing is in flight any more
+     */
+    public boolean awaitQuiescence(long maxMillis) {
+        long deadline = System.currentTimeMillis() + Math.max(0L, maxMillis);
+        while (inFlight.get() > 0 && System.currentTimeMillis() < deadline) {
+            try {
+                Thread.sleep(10L);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return false;
+            }
+        }
+        return inFlight.get() == 0;
+    }
+
+    public boolean isShuttingDown() {
+        return shuttingDown;
     }
 
     public void entity(Player player, Runnable run) {

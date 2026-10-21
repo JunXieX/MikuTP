@@ -247,6 +247,11 @@ public final class SyncCoordinator {
                 reply.playerName = profile.name;
                 reply.lastOnline = profile.lastOnline;
                 reply.tpaEnabled = profile.tpaEnabled;
+                // This backend is the one that knows the toggle: the answer carries
+                // it as known with its own update stamp, so the asking backend can
+                // apply it without touching its identity clock.
+                reply.tpaKnown = true;
+                reply.tpaUpdatedAt = profile.tpaUpdatedAt;
                 syncBus.publish(reply);
             } catch (Exception e) {
                 plugin.getSLF4JLogger().warn("Failed to answer a replicated profile request", e);
@@ -261,6 +266,12 @@ public final class SyncCoordinator {
         }
         profileAnnouncements.entrySet().removeIf(
                 entry -> now - entry.getValue() > PROFILE_ANNOUNCE_DEBOUNCE_MS);
+        // A burst of distinct players (many joins at once) could keep every entry
+        // fresh forever; the debounce is only an optimisation, so a hard reset is a
+        // safe answer and keeps the map strictly bounded.
+        if (profileAnnouncements.size() > 4096) {
+            profileAnnouncements.clear();
+        }
     }
 
     /**
@@ -400,11 +411,11 @@ public final class SyncCoordinator {
                     publishQuietly(event);
                 }
                 for (var profile : database.listAllProfiles()) {
-                    // Only publish a toggle this backend actually knows: a profile
-                    // row written by replication may still carry a guessed default,
-                    // and broadcasting that would overwrite the real value on the
-                    // backend that knows it.
-                    if (!profile.tpaKnown) {
+                    // Identity rows are always republished: a backend that never saw
+                    // this player still needs the name row to resolve them by name.
+                    // Placeholder rows (created by a replicated position, name "")
+                    // carry no identity and are skipped.
+                    if (profile.name == null || profile.name.isBlank()) {
                         continue;
                     }
                     SyncEvent event = SyncEvent.create(SyncEvent.Type.PROFILE, serverId);
@@ -412,6 +423,11 @@ public final class SyncCoordinator {
                     event.playerName = profile.name;
                     event.lastOnline = profile.lastOnline;
                     event.tpaEnabled = profile.tpaEnabled;
+                    // The toggle carries its own clock and a known flag; receivers
+                    // only apply it when known, so a guessed default can never
+                    // overwrite the value the owning backend already has.
+                    event.tpaKnown = profile.tpaKnown;
+                    event.tpaUpdatedAt = profile.tpaUpdatedAt;
                     publishQuietly(event);
                 }
                 for (var stored : database.listAllStoredPositions()) {

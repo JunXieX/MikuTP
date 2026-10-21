@@ -41,6 +41,16 @@ public final class ProfileService {
                     return size() > REPLICATED_TOGGLE_CACHE_SIZE;
                 }
             });
+    /** How long an unknown toggle is remembered before the DB is consulted again. */
+    private static final long TOGGLE_LOOKUP_TTL_MS = 120_000L;
+    /** Bounded clock of last on-demand DB lookups for unknown toggles. */
+    private final Map<UUID, Long> toggleLookups = java.util.Collections.synchronizedMap(
+            new java.util.LinkedHashMap<UUID, Long>(64, 0.75f, true) {
+                @Override
+                protected boolean removeEldestEntry(Map.Entry<UUID, Long> eldest) {
+                    return size() > REPLICATED_TOGGLE_CACHE_SIZE;
+                }
+            });
 
     public ProfileService(JavaPlugin plugin, Tasks tasks, Database database, SyncBus syncBus,
                           OnlinePlayers onlinePlayers, String serverId) {
@@ -52,8 +62,26 @@ public final class ProfileService {
         this.serverId = serverId;
     }
 
-    /** Called on join: upserts the profile, replicates it and marks presence. */
+    /**
+     * Called on join: upserts the profile, replicates the identity and marks
+     * presence. Identity and the tpa toggle are replicated independently: every
+     * backend needs the name row to resolve the player by name, while only a
+     * backend that actually knows the toggle may publish it.
+     */
     public void onJoin(Player player) {
+        onJoin(player, true);
+    }
+
+    /**
+     * Join-time profile bookkeeping.
+     *
+     * @param replicate true for a real join: the identity is published and, when
+     *                  the toggle is unknown here, the network is asked for it.
+     *                  false for a /mtp reload refresh, which only rebuilds the
+     *                  local cache: a reload must not turn every online player
+     *                  into a burst of PROFILE / PROFILE_REQUEST traffic.
+     */
+    public void onJoin(Player player, boolean replicate) {
         UUID uuid = player.getUniqueId();
         // Read entity state here: this runs on the join thread, the async body below
         // may not touch the Player on Folia.
@@ -61,10 +89,14 @@ public final class ProfileService {
         long now = System.currentTimeMillis();
         tasks.async(() -> {
             boolean known;
+            long toggleStamp;
             try {
-                database.upsertPlayer(uuid.toString(), name, now);
+                if (replicate) {
+                    database.upsertPlayer(uuid.toString(), name, now);
+                }
                 var profile = database.getPlayer(uuid.toString()).orElse(null);
                 known = profile != null && profile.tpaKnown;
+                toggleStamp = profile == null ? 0L : profile.tpaUpdatedAt;
                 if (known) {
                     // Do not clobber a toggle the player flipped while this read
                     // was in flight.
@@ -74,16 +106,29 @@ public final class ProfileService {
                 plugin.getSLF4JLogger().warn("Failed to update profile for {}", name, e);
                 return;
             }
-            if (known) {
-                publishProfile(uuid, name, now, tpaEnabled.getOrDefault(uuid, true));
-            } else {
-                // This backend has no trustworthy toggle for the player yet (fresh
-                // row, or a replica that never received one). Ask the network
-                // instead of publishing a guessed default: a real snapshot may
-                // already carry "disabled" and must not be overwritten by "enabled".
+            if (!replicate) {
+                return;
+            }
+            // Identity is always replicated (a cold backend must still be able to
+            // resolve this player by name). The toggle value only travels as known
+            // when this backend actually knows it.
+            boolean value = known ? tpaEnabled.getOrDefault(uuid, true) : true;
+            publishProfile(uuid, name, now, value, known, toggleStamp);
+            if (!known) {
+                // Ask the network for the toggle; a backend that knows it answers
+                // with a known PROFILE instead of this backend guessing.
                 publishProfileRequest(uuid);
             }
         });
+    }
+
+    /**
+     * Rebuilds the local runtime state for a player who is already online (a server
+     * reload never fires PlayerJoinEvent). Kept as the reload-facing name; it is
+     * {@link #onJoin(Player, boolean)} with replication disabled.
+     */
+    public void refresh(Player player) {
+        onJoin(player, false);
     }
 
     public void onQuit(UUID uuid) {
@@ -104,6 +149,39 @@ public final class ProfileService {
     }
 
     /**
+     * True when this backend holds a trustworthy tpa toggle for the player: hosted
+     * here, learned through a replicated known PROFILE, or (lazily) read back from
+     * the local replica. Never blocks the caller: a cold lookup hydrates the mirror
+     * in the background and reports {@code false} this time, so a scoreboard thread
+     * cannot block on SQLite. Rate-limited per player.
+     */
+    public boolean isTpaKnown(UUID uuid) {
+        if (uuid == null) {
+            return false;
+        }
+        if (tpaEnabled.containsKey(uuid) || replicatedToggles.containsKey(uuid)) {
+            return true;
+        }
+        long now = System.currentTimeMillis();
+        Long previous = toggleLookups.get(uuid);
+        if (previous != null && now - previous < TOGGLE_LOOKUP_TTL_MS) {
+            return false;
+        }
+        toggleLookups.put(uuid, now);
+        tasks.async(() -> {
+            try {
+                var profile = database.getPlayer(uuid.toString()).orElse(null);
+                if (profile != null && profile.tpaKnown) {
+                    replicatedToggles.put(uuid, profile.tpaEnabled);
+                }
+            } catch (Exception e) {
+                plugin.getSLF4JLogger().warn("Failed to look up the tpa toggle of {}", uuid, e);
+            }
+        });
+        return false;
+    }
+
+    /**
      * Toggle state for any player, local or remote. The in-memory value only
      * covers players this backend hosts, so a remote target falls back to the
      * replicated profile row — otherwise a cross-server /tpa would ignore a
@@ -114,10 +192,10 @@ public final class ProfileService {
         if (cached != null) {
             return cached;
         }
-        Boolean replicated = replicatedToggles.get(uuid);
-        if (replicated != null) {
-            return replicated;
-        }
+        // Deliberately does NOT consult the replicated toggle mirror: request gating
+        // must use the authoritative local replica (the mirror is best-effort and may
+        // miss the newest snapshot after a dropped event). The mirror exists only for
+        // read-only placeholders, which tolerate slight staleness.
         try {
             return database.getPlayer(uuid.toString()).map(p -> p.tpaEnabled).orElse(true);
         } catch (Exception e) {
@@ -126,33 +204,42 @@ public final class ProfileService {
     }
 
     public void setTpaEnabled(UUID uuid, boolean enabled) {
-        tpaEnabled.put(uuid, enabled);
+        // Optimistic cache update; the previous value is kept so a failed write can
+        // put it back instead of leaving the cache claiming a toggle the database
+        // never stored (R2-08).
+        Boolean previous = tpaEnabled.put(uuid, enabled);
         // Resolve the name on the caller's thread: this async task must not read
         // Bukkit's player view, which Folia confines to the owning region thread.
         String name = onlinePlayers.nameOf(uuid);
         long stamped = System.currentTimeMillis();
         tasks.async(() -> {
+            long applied;
             try {
                 // Upsert first: a toggle that races the join-time profile write must
-                // not be lost to an UPDATE that matched no row yet. The timestamp
-                // stamps the flip as the newest profile change, so a replicated
-                // snapshot produced before it is rejected in SQL.
-                String known = name == null ? "" : name;
-                database.upsertPlayer(uuid.toString(), known, stamped);
-                // The toggle is the newest profile change as of "now": move the
-                // stamp forward past whatever the upsert wrote, otherwise the guard
-                // in Tx#setTpaEnabled (last_online <= at) could reject this write.
-                long applied = System.currentTimeMillis();
+                // not be lost to an UPDATE that matched no row yet. The identity
+                // stamp keeps name resolution ordered; the toggle carries its own
+                // tpaUpdatedAt stamp so it is never rejected by the identity clock.
+                String knownName = name == null ? "" : name;
+                database.upsertPlayer(uuid.toString(), knownName, stamped);
+                applied = System.currentTimeMillis();
                 database.runTransaction(tx -> tx.setTpaEnabled(uuid.toString(), enabled, applied));
             } catch (Exception e) {
                 plugin.getSLF4JLogger().warn("Failed to persist tpa toggle", e);
+                // Roll the optimistic cache update back, but only while it is still
+                // this attempt's value: a newer /tpatoggle must win.
+                if (previous == null) {
+                    tpaEnabled.remove(uuid, enabled);
+                } else {
+                    tpaEnabled.replace(uuid, enabled, previous);
+                }
                 return;
             }
-            publishProfile(uuid, name, stamped, enabled);
+            publishProfile(uuid, name, stamped, enabled, true, applied);
         });
     }
 
-    private void publishProfile(UUID uuid, String name, long lastOnline, boolean tpaEnabled) {
+    private void publishProfile(UUID uuid, String name, long lastOnline, boolean tpaEnabled,
+                                boolean tpaKnown, long tpaUpdatedAt) {
         if (!syncBus.crossServer() || name == null) {
             return;
         }
@@ -161,6 +248,8 @@ public final class ProfileService {
         event.playerName = name;
         event.lastOnline = lastOnline;
         event.tpaEnabled = tpaEnabled;
+        event.tpaKnown = tpaKnown;
+        event.tpaUpdatedAt = tpaUpdatedAt;
         syncBus.publish(event);
     }
 
@@ -189,14 +278,20 @@ public final class ProfileService {
         if (event.playerUuid == null || event.playerName == null) {
             return;
         }
+        // Identity is always replicated, whether or not the sender knows the toggle:
+        // a cold backend needs the name row to resolve this player by name. Identity
+        // and the toggle use separate clocks, so this write cannot be "blocked" by a
+        // newer identity stamp (that was the old M-03 bug).
         tx.upsertPlayer(event.playerUuid, event.playerName, event.lastOnline);
-        boolean written = tx.setTpaEnabled(event.playerUuid, event.tpaEnabled, event.lastOnline) > 0;
+        if (!event.tpaKnown) {
+            // No trustworthy toggle in this snapshot: leave the local value alone.
+            return;
+        }
+        boolean written = tx.setTpaEnabled(event.playerUuid, event.tpaEnabled, event.tpaUpdatedAt) > 0;
         UUID uuid = parseUuid(event.playerUuid);
         // Mirror the flag after the commit: local players feed the live toggle
         // cache, remote/offline players feed the bounded placeholder mirror. Both
         // are plain map writes (no Bukkit player access from the applier thread).
-        // A snapshot older than the stored row is rejected in SQL and skipped here
-        // as well, so it cannot roll the toggle back.
         if (written && uuid != null) {
             if (onlinePlayers.byId(uuid) != null) {
                 afterCommit.accept(() -> tpaEnabled.put(uuid, event.tpaEnabled));

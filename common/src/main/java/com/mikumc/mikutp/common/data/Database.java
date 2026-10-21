@@ -68,6 +68,10 @@ public final class Database implements AutoCloseable {
          * cannot resurrect it. */
         int deleteHome(String ownerUuid, String name, long deletedAt) throws SQLException;
 
+        /** Deletes a home and records its tombstone in the same transaction, but
+         * only when a row was actually removed. Returns whether a row was deleted. */
+        boolean deleteHomeAndTombstone(String ownerUuid, String name, long deletedAt) throws SQLException;
+
         int upsertPlayer(String uuid, String name, long now) throws SQLException;
 
         /** Stores the toggle and stamps the profile as of {@code at}, unless the
@@ -152,7 +156,12 @@ public final class Database implements AutoCloseable {
                   logout_y DOUBLE,
                   logout_z DOUBLE,
                   logout_yaw DOUBLE,
-                  logout_pitch DOUBLE
+                  logout_pitch DOUBLE,
+                  back_updated_at INTEGER NOT NULL DEFAULT 0,
+                  death_updated_at INTEGER NOT NULL DEFAULT 0,
+                  logout_updated_at INTEGER NOT NULL DEFAULT 0,
+                  tpa_known INTEGER NOT NULL DEFAULT 0,
+                  tpa_updated_at INTEGER NOT NULL DEFAULT 0
                 )""".formatted(prefix));
         // Tables created by older versions: add whichever newer columns are missing.
         Map<String, String> expected = new LinkedHashMap<>();
@@ -188,6 +197,9 @@ public final class Database implements AutoCloseable {
         // Set once an authoritative tpa toggle has been stored (M-03); a plain
         // profile upsert must never claim the toggle is known.
         expected.put("tpa_known", "INTEGER NOT NULL DEFAULT 0");
+        // Toggle version stamp (R2-02): independent of last_online, so identity
+        // replication and toggle replication can never invalidate each other.
+        expected.put("tpa_updated_at", "INTEGER NOT NULL DEFAULT 0");
         addMissingColumns(prefix + "players", expected);
         exec("""
                 CREATE TABLE IF NOT EXISTS %shomes (
@@ -417,19 +429,34 @@ public final class Database implements AutoCloseable {
 
         @Override
         public int deleteHome(String ownerUuid, String name, long deletedAt) throws SQLException {
-            int removed;
-            // Only rows older than the deletion go: a home re-created after the
-            // delete (a fresh /sethome with the same name) must survive a stale
-            // replicated delete.
+            int removed = deleteHomeRows(ownerUuid, name, deletedAt);
+            // Replicated deletes must always leave a tombstone: a backend that no
+            // longer holds the row still has to block a stale snapshot of it.
+            recordDeletion("home", ownerUuid, name, deletedAt);
+            return removed;
+        }
+
+        @Override
+        public boolean deleteHomeAndTombstone(String ownerUuid, String name, long deletedAt) throws SQLException {
+            // Local /delhome: row delete and tombstone commit (or roll back) together,
+            // so a crash between them can neither lose the delete nor the stamp.
+            int removed = deleteHomeRows(ownerUuid, name, deletedAt);
+            if (removed == 0) {
+                return false; // no row here: a tombstone would block an older replication
+            }
+            recordDeletion("home", ownerUuid, name, deletedAt);
+            return true;
+        }
+
+        /** Deletes only rows older than {@code deletedAt}; a re-created home survives. */
+        private int deleteHomeRows(String ownerUuid, String name, long deletedAt) throws SQLException {
             try (PreparedStatement ps = connection.prepareStatement(
                     "DELETE FROM %shomes WHERE owner_uuid = ? AND name = ? AND created_at < ?".formatted(prefix))) {
                 ps.setString(1, ownerUuid);
                 ps.setString(2, name);
                 ps.setLong(3, deletedAt);
-                removed = ps.executeUpdate();
+                return ps.executeUpdate();
             }
-            recordDeletion("home", ownerUuid, name, deletedAt);
-            return removed;
         }
 
         @Override
@@ -452,16 +479,21 @@ public final class Database implements AutoCloseable {
 
         @Override
         public int setTpaEnabled(String uuid, boolean enabled, long at) throws SQLException {
-            // Bumping last_online stamps the toggle as the newest profile change,
-            // so any snapshot produced before it is rejected by the upsert guard.
-            // The same guard here keeps a late snapshot from undoing a newer flip.
+            // Ordering uses the dedicated toggle stamp, never last_online: an older
+            // toggle snapshot is rejected even when the identity is newer (and a
+            // newer toggle is accepted even when last_online is further ahead).
+            // last_online only moves forward, so a late toggle can never roll the
+            // profile order back.
             try (PreparedStatement ps = connection.prepareStatement(
-                    ("UPDATE %splayers SET tpa_enabled = ?, tpa_known = 1, last_online = ?"
-                            + " WHERE uuid = ? AND last_online <= ?").formatted(prefix))) {
+                    ("UPDATE %splayers SET tpa_enabled = ?, tpa_known = 1, tpa_updated_at = ?,"
+                            + " last_online = CASE WHEN last_online < ? THEN ? ELSE last_online END"
+                            + " WHERE uuid = ? AND tpa_updated_at <= ?").formatted(prefix))) {
                 ps.setInt(1, enabled ? 1 : 0);
                 ps.setLong(2, at);
-                ps.setString(3, uuid);
+                ps.setLong(3, at);
                 ps.setLong(4, at);
+                ps.setString(5, uuid);
+                ps.setLong(6, at);
                 return ps.executeUpdate();
             }
         }
@@ -609,13 +641,13 @@ public final class Database implements AutoCloseable {
 
     public Optional<PlayerProfile> getPlayer(String uuid) throws SQLException {
         return queryOne(
-                "SELECT uuid, name, last_online, tpa_enabled, tpa_known FROM %splayers WHERE uuid = ?"
-                        .formatted(prefix),
+                "SELECT uuid, name, last_online, tpa_enabled, tpa_known, tpa_updated_at"
+                        + " FROM %splayers WHERE uuid = ?".formatted(prefix),
                 ps -> ps.setString(1, uuid), Database::readProfile);
     }
 
     public Optional<PlayerProfile> getPlayerByName(String name) throws SQLException {
-        return queryOne(("SELECT uuid, name, last_online, tpa_enabled, tpa_known FROM %splayers"
+        return queryOne(("SELECT uuid, name, last_online, tpa_enabled, tpa_known, tpa_updated_at FROM %splayers"
                 + " WHERE name = ? COLLATE NOCASE ORDER BY last_online DESC LIMIT 1").formatted(prefix),
                 ps -> ps.setString(1, name), Database::readProfile);
     }
@@ -627,7 +659,8 @@ public final class Database implements AutoCloseable {
 
     private static PlayerProfile readProfile(ResultSet rs) throws SQLException {
         return new PlayerProfile(rs.getString("uuid"), rs.getString("name"),
-                rs.getLong("last_online"), rs.getInt("tpa_enabled") != 0, rs.getInt("tpa_known") != 0);
+                rs.getLong("last_online"), rs.getInt("tpa_enabled") != 0,
+                rs.getInt("tpa_known") != 0, rs.getLong("tpa_updated_at"));
     }
 
     /**
@@ -637,7 +670,7 @@ public final class Database implements AutoCloseable {
      */
     public List<PlayerProfile> listAllProfiles() throws SQLException {
         return queryList(
-                ("SELECT uuid, name, last_online, tpa_enabled, tpa_known FROM %splayers"
+                ("SELECT uuid, name, last_online, tpa_enabled, tpa_known, tpa_updated_at FROM %splayers"
                         + " WHERE name <> ''").formatted(prefix),
                 Database::readProfile);
     }
@@ -666,7 +699,9 @@ public final class Database implements AutoCloseable {
     /** Version stamp of one stored position; 0 when the row (or stamp) is absent. */
     public long getPositionUpdatedAt(String uuid, String colPrefix) throws SQLException {
         String stamp = stampColumn(colPrefix);
-        return queryOne("SELECT " + stamp + " FROM %splayers WHERE uuid = ?".formatted(prefix),
+        // Whole SQL parenthesised before .formatted(): formatting must not depend on
+        // which concatenated segment happens to carry the placeholder.
+        return queryOne(("SELECT " + stamp + " FROM %splayers WHERE uuid = ?").formatted(prefix),
                 ps -> ps.setString(1, uuid), rs -> rs.getLong(1)).orElse(0L);
     }
 
@@ -723,6 +758,17 @@ public final class Database implements AutoCloseable {
     public boolean deleteHome(String ownerUuid, String name) throws SQLException {
         long now = System.currentTimeMillis();
         return transaction(tx -> tx.deleteHome(ownerUuid, name, now)) > 0;
+    }
+
+    /**
+     * Deletes a home and records its tombstone in one transaction. The tombstone is
+     * only written when a row was actually removed, so deleting a home this backend
+     * no longer has cannot block a slightly older replication of it.
+     *
+     * @return true when a row was deleted (and the tombstone committed with it)
+     */
+    public boolean deleteHomeAndTombstone(String ownerUuid, String name, long deletedAt) throws SQLException {
+        return transaction(tx -> tx.deleteHomeAndTombstone(ownerUuid, name, deletedAt));
     }
 
     public Optional<Home> getHome(String ownerUuid, String name) throws SQLException {

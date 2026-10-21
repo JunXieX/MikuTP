@@ -58,15 +58,25 @@ public final class MikuTPExpansion extends PlaceholderExpansion {
         String key = params.toLowerCase(java.util.Locale.ROOT);
         UUID id = player == null ? null : player.getUniqueId();
         return switch (key) {
-            case "homes_used" -> id == null ? "" : String.valueOf(homeService.homes(id).size());
-            case "homes_max" -> player instanceof Player online
+            // Home data is only known once this backend has read it: an empty cache
+            // means "unknown" (offline player pruned, or a player hosted elsewhere),
+            // not "0 homes". Answering 0 would be a lie, so the placeholder is left
+            // empty (PlaceholderAPI shows nothing for an empty return).
+            case "homes_used" -> id == null || !homeService.isHomesLoaded(id)
+                    ? ""
+                    : String.valueOf(homeService.homes(id).size());
+            case "homes_max" -> player instanceof Player online && homeService.isHomesLoaded(online.getUniqueId())
                     ? limitText(homeService.cachedLimit(online.getUniqueId()))
                     : "";
-            case "homes_left" -> player instanceof Player online
+            case "homes_left" -> player instanceof Player online && homeService.isHomesLoaded(online.getUniqueId())
                     ? leftText(homeService.cachedLimit(online.getUniqueId()), homeService.homes(id).size())
                     : "";
             case "warps" -> String.valueOf(warpService.warps().size());
-            case "tpa_enabled" -> id == null ? "" : String.valueOf(profiles.isTpaEnabled(id));
+            // Unknown means "this backend never learned the toggle": render empty
+            // rather than the guessed default true.
+            case "tpa_enabled" -> id == null || !profiles.isTpaKnown(id)
+                    ? ""
+                    : String.valueOf(profiles.isTpaEnabled(id));
             case "cooldown_home" -> id == null ? "" : String.valueOf(cooldowns.remaining(id, CooldownManager.Kind.HOME));
             case "cooldown_warp" -> id == null ? "" : String.valueOf(cooldowns.remaining(id, CooldownManager.Kind.WARP));
             case "cooldown_tpa" -> id == null ? "" : String.valueOf(cooldowns.remaining(id, CooldownManager.Kind.TPA));

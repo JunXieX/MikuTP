@@ -159,6 +159,15 @@ public final class MikuTPPlugin extends JavaPlugin {
 
     @Override
     public void onDisable() {
+        // Refuse new background work first, then give the in-flight database tasks a
+        // bounded chance to finish before the pool closes: otherwise those writes
+        // fail against a closed Hikari pool during shutdown (R2-12).
+        if (tasks != null) {
+            tasks.beginShutdown();
+            if (!tasks.awaitQuiescence(500L)) {
+                getSLF4JLogger().warn("Some background database work did not finish within 500ms of shutdown");
+            }
+        }
         // Stop producers first, then transport, then storage: closing the bus
         // before its flush loop is done would push messages onto a channel that
         // is about to be unregistered, and closing storage first would fail any
@@ -295,6 +304,14 @@ public final class MikuTPPlugin extends JavaPlugin {
                 // stays authoritative and every offending value is named in the log.
                 logValidationProblems(parsed);
                 bundle = loadBundle(parsed.languageFile);
+                // Validate the bundle before anything live is swapped: constructing the
+                // service parses the MiniMessage prefix exactly like MessageService.reload
+                // does, so a malformed prefix rejects the reload instead of leaving the
+                // config applied while the message layer still holds the old prefix.
+                MessageService probe = new MessageService(bundle, parsed.parsePlaceholderApi, papiAvailable);
+                if (probe.prefix() == null) {
+                    throw new IOException("messages bundle produced no prefix");
+                }
             } catch (Exception e) {
                 // Keep the running configuration intact and report the failure.
                 getSLF4JLogger().error("Reload failed; the running configuration was kept: {}", e.toString());
@@ -304,14 +321,21 @@ public final class MikuTPPlugin extends JavaPlugin {
             // Apply on the global region thread so command/region readers never see
             // a configuration that has only been partially copied.
             tasks.global(() -> {
-                config.copyFrom(parsed);
-                messages.reload(bundle, parsed.parsePlaceholderApi);
-                effects.setEnabled(parsed.teleport.sounds);
-                warpService.reload();
-                refreshOnlinePlayersNow();
-                getSLF4JLogger().info("MikuTP reloaded (sync mode, server-id, table prefix and language file "
-                        + "need a restart)");
-                done.accept(true);
+                try {
+                    config.copyFrom(parsed);
+                    messages.reload(bundle, parsed.parsePlaceholderApi);
+                    effects.setEnabled(parsed.teleport.sounds);
+                    warpService.reload();
+                    refreshOnlinePlayersNow();
+                    getSLF4JLogger().info("MikuTP reloaded (sync mode, server-id, table prefix and language file "
+                            + "need a restart)");
+                    done.accept(true);
+                } catch (Exception e) {
+                    // The bundle was pre-validated, so this is not expected; report it
+                    // instead of leaving the command waiting for a callback forever.
+                    getSLF4JLogger().error("Reload parsed but could not be applied", e);
+                    done.accept(false);
+                }
             });
         });
     }
@@ -348,8 +372,14 @@ public final class MikuTPPlugin extends JavaPlugin {
 
     /** Bundled message defaults plus the configured override file. */
     private MessageBundle loadBundle(String languageFile) throws IOException {
+        Path overrides = getDataFolder().toPath().resolve(languageFile);
         MessageBundle bundle = new MessageBundle(readResource("messages_zh_cn.json"));
-        bundle.loadOverrides(getDataFolder().toPath().resolve(languageFile));
+        if (!bundle.loadOverrides(overrides)) {
+            // The bundled defaults stay active; surface the broken override instead
+            // of silently rendering default texts for every key.
+            getSLF4JLogger().warn("Language file {} could not be parsed; bundled default messages are used",
+                    overrides);
+        }
         return bundle;
     }
 

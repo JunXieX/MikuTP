@@ -67,12 +67,14 @@ public final class MikuTPVelocity {
      * Must equal the Gradle {@code version} in the root build script; the CI
      * "Verify versions agree" step fails the build when the two drift apart.
      */
-    public static final String VERSION = "1.6.2";
+    public static final String VERSION = "1.6.3";
 
     private static final MinecraftChannelIdentifier CHANNEL =
             MinecraftChannelIdentifier.create("mikumc", "mikutp");
     private static final Gson GSON = new Gson();
     private static final int MAX_EVENTS_PER_BATCH = 64;
+    /** Frames drained synchronously on join; the periodic pump handles the rest. */
+    private static final int MAX_JOIN_FRAMES = 8;
     /** Cap per-server backlog: a server that stays empty must not grow the queue
      * without bound. Older events are shed — the activation resync re-converges. */
     private static final int MAX_QUEUED_EVENTS = 4096;
@@ -138,7 +140,8 @@ public final class MikuTPVelocity {
     /** Periodic backlog pump; cancelled on shutdown. */
     private com.velocitypowered.api.scheduler.ScheduledTask flushTask;
 
-    private record PendingEntry(String payload, long expiry, String destServer, String anchorServer) {
+    private record PendingEntry(String payload, long expiry, String destServer,
+                                String anchorUuid, String anchorServer) {
     }
 
     private record MailboxEntry(String json, long expiry) {
@@ -163,22 +166,36 @@ public final class MikuTPVelocity {
     public void onInit(ProxyInitializeEvent event) {
         loadConfig();
         server.getChannelRegistrar().register(CHANNEL);
-        // Expired mailboxes and handoffs are normally drained on the player's
-        // next join; a player who never returns would otherwise leave their
-        // entries in memory forever. The handle is kept so the task is cancelled
-        // when the plugin unloads.
-        sweepTask = server.getScheduler().buildTask(this, this::sweepExpired)
-                .repeat(60, java.util.concurrent.TimeUnit.SECONDS).schedule();
-        // One frame per publish would turn a resync into thousands of messages;
-        // the pump drains every server queue in batches instead.
-        flushTask = server.getScheduler().buildTask(this, this::flushAllQueues)
-                .repeat(FLUSH_INTERVAL_MS, java.util.concurrent.TimeUnit.MILLISECONDS).schedule();
+        startPeriodicTasks();
         logger.info("MikuTP hub ready on channel {}", CHANNEL.getId());
     }
 
-    /** Stops the periodic sweep and drops the in-memory state with the plugin. */
-    @Subscribe
-    public void onShutdown(com.velocitypowered.api.event.proxy.ProxyShutdownEvent event) {
+    /**
+     * Starts the expiry sweep and the backlog pump. If the scheduler refuses them
+     * (for example because the proxy is already shutting down), the plugin keeps
+     * working in degraded mode: player-scoped delivery and the per-join flush
+     * still run, only periodic expiry and the pump are lost.
+     */
+    private void startPeriodicTasks() {
+        cancelPeriodicTasks();
+        try {
+            // Expired mailboxes and handoffs are normally drained on the player's
+            // next join; a player who never returns would otherwise leave their
+            // entries in memory forever.
+            sweepTask = server.getScheduler().buildTask(this, this::sweepExpired)
+                    .repeat(60, java.util.concurrent.TimeUnit.SECONDS).schedule();
+            // One frame per publish would turn a resync into thousands of messages;
+            // the pump drains every server queue in batches instead.
+            flushTask = server.getScheduler().buildTask(this, this::flushAllQueues)
+                    .repeat(FLUSH_INTERVAL_MS, java.util.concurrent.TimeUnit.MILLISECONDS).schedule();
+        } catch (RuntimeException e) {
+            logger.warn("Could not start the MikuTP periodic tasks: {}", e.toString());
+            cancelPeriodicTasks();
+        }
+    }
+
+    /** Cancels the periodic tasks; safe to call when they never started. */
+    private void cancelPeriodicTasks() {
         if (sweepTask != null) {
             sweepTask.cancel();
             sweepTask = null;
@@ -187,6 +204,12 @@ public final class MikuTPVelocity {
             flushTask.cancel();
             flushTask = null;
         }
+    }
+
+    /** Stops the periodic work and drops the in-memory state with the plugin. */
+    @Subscribe
+    public void onShutdown(com.velocitypowered.api.event.proxy.ProxyShutdownEvent event) {
+        cancelPeriodicTasks();
         pendingEntries.clear();
         mailboxes.clear();
         recentRequests.clear();
@@ -392,9 +415,21 @@ public final class MikuTPVelocity {
         // Anchor-only handoffs (/otp) carry no destination server. The connect
         // request that follows targets the anchor's server, so snapshot it now and
         // deliver there (a later anchor move must not strand the player elsewhere).
-        String anchorServer = destServer == null ? anchorServerName(pendingAnchorUuid(payload)) : null;
+        String anchorUuid = null;
+        String anchorServer = null;
+        if (destServer == null) {
+            anchorUuid = pendingAnchorUuid(payload);
+            anchorServer = anchorUuid == null ? null : anchorServerName(anchorUuid);
+            if (anchorServer == null) {
+                // No destination can be derived: the anchor is offline (or the
+                // payload carries no anchor) and the connect request for this
+                // handoff fails as well. Keeping it would let a later manual server
+                // switch consume it as a stale, unexpected teleport.
+                return;
+            }
+        }
         PendingEntry entry = new PendingEntry(payload,
-                System.currentTimeMillis() + pendingTtlMillis(op), destServer, anchorServer);
+                System.currentTimeMillis() + pendingTtlMillis(op), destServer, anchorUuid, anchorServer);
         putPending(id, entry);
         // The connect request and the handoff travel on different paths, so the
         // player may already have arrived. Hand it over immediately only when
@@ -641,27 +676,12 @@ public final class MikuTPVelocity {
         return sendEncodedBatch(connection, json);
     }
 
-    /** Sends one frame for already-encoded event objects. */
+    /** Sends one frame for already-encoded event objects; an empty batch sends nothing. */
     private boolean sendEncodedBatch(ServerConnection connection, List<String> eventJson) {
-        return send(connection, composeEventsFrame(eventJson));
-    }
-
-    /**
-     * Builds the {@code t=events} frame with the event objects inlined. The objects
-     * come straight from Gson, so joining them yields exactly what
-     * ProxyMessages.encodeEventsBatch produces, without parsing each object back
-     * into a tree. Keep the envelope in sync with that method if it ever changes.
-     */
-    private static String composeEventsFrame(List<String> eventJson) {
-        StringBuilder frame = new StringBuilder(64 + eventJson.size() * 256);
-        frame.append("{\"t\":\"").append(ProxyMessages.TYPE_EVENTS).append("\",\"events\":[");
-        for (int i = 0; i < eventJson.size(); i++) {
-            if (i > 0) {
-                frame.append(',');
-            }
-            frame.append(eventJson.get(i));
+        if (eventJson == null || eventJson.isEmpty()) {
+            return true;
         }
-        return frame.append("]}").toString();
+        return send(connection, EventsFrame.compose(eventJson));
     }
 
     // ------------------------------------------------------------------ player-scoped delivery
@@ -701,18 +721,22 @@ public final class MikuTPVelocity {
         if (queue == null) {
             return;
         }
-        // Drain everything, not just one batch: after a long empty period the
-        // backlog can exceed MAX_EVENTS_PER_BATCH, and waiting for the next
-        // event to trigger another flush would leave the rest stuck. Held under
-        // the queue lock so this drain cannot interleave with tryFlush.
+        // Drain a bounded number of frames on the event handler: a long-empty
+        // server can have thousands of queued events, and sending all of them
+        // here would stall the proxy event thread. The periodic pump picks the
+        // remainder up within a tick. Held under the queue lock so this drain
+        // cannot interleave with tryFlush.
         synchronized (lockFor(serverName)) {
-            List<String> batch;
-            do {
-                batch = takeBatch(queue);
-                if (!batch.isEmpty()) {
-                    sendEncodedBatch(connection, batch);
+            for (int frame = 0; frame < MAX_JOIN_FRAMES; frame++) {
+                List<String> batch = takeBatch(queue);
+                if (batch.isEmpty()) {
+                    return;
                 }
-            } while (!batch.isEmpty() && !queue.isEmpty());
+                sendEncodedBatch(connection, batch);
+                if (queue.isEmpty()) {
+                    return;
+                }
+            }
         }
     }
 
@@ -721,14 +745,8 @@ public final class MikuTPVelocity {
         if (entry == null) {
             return;
         }
-        // Every other server keeps the handoff and retries on the next connect;
-        // delivering it anywhere else would consume it on the wrong backend. An
-        // anchor-only handoff is delivered where the connect request was aimed;
-        // when the anchor was offline at handoff time, deliver anyway so the
-        // backend can report the failure.
-        String destServer = entry.destServer() != null ? entry.destServer() : entry.anchorServer();
-        if (destServer != null && !destServer.equals(connection.getServerInfo().getName())) {
-            return;
+        if (!isPendingDestination(entry, connection.getServerInfo().getName())) {
+            return; // keep the handoff for the server it belongs to
         }
         // Conditional remove: storePending() may have handed the same payload to
         // this player concurrently, and delivering it twice would teleport twice.
@@ -741,6 +759,25 @@ public final class MikuTPVelocity {
         if (!send(connection, ProxyMessages.encodePending(uuid.toString(), entry.payload(), 0))) {
             pendingEntries.putIfAbsent(uuid, entry);
         }
+    }
+
+    /**
+     * True when this connect is where the handoff belongs. A known destination is
+     * matched exactly. For anchor-only handoffs both the server the connect
+     * request was aimed at (the anchor snapshot) and the anchor's current server
+     * count, because the anchor may have moved between snapshot and arrival; when
+     * the anchor is gone the handoff is released so the backend can report the
+     * failure instead of holding it silently until the TTL.
+     */
+    private boolean isPendingDestination(PendingEntry entry, String serverName) {
+        if (entry.destServer() != null) {
+            return entry.destServer().equals(serverName);
+        }
+        if (serverName.equals(entry.anchorServer())) {
+            return true;
+        }
+        String liveAnchorServer = anchorServerName(entry.anchorUuid());
+        return liveAnchorServer == null || liveAnchorServer.equals(serverName);
     }
 
     private void deliverMailbox(UUID uuid, ServerConnection connection) {
@@ -943,9 +980,20 @@ public final class MikuTPVelocity {
                 if (recentRequests.get(target) != list) {
                     continue;
                 }
-                list.add(new RecentRequest(requestId, json, expiry));
-                while (list.size() > MAX_RECENT_REQUESTS) {
-                    list.remove(0);
+                // A duplicate TP_NEW (replayed event) must not occupy a second
+                // slot or be re-delivered twice.
+                boolean present = false;
+                for (RecentRequest existing : list) {
+                    if (existing.requestId().equals(requestId)) {
+                        present = true;
+                        break;
+                    }
+                }
+                if (!present) {
+                    list.add(new RecentRequest(requestId, json, expiry));
+                    while (list.size() > MAX_RECENT_REQUESTS) {
+                        list.remove(0);
+                    }
                 }
                 break;
             }
@@ -1054,6 +1102,7 @@ public final class MikuTPVelocity {
         }
         if (target.isEmpty()) {
             logger.warn("Connect requested for unknown server {}", serverName);
+            dropPending(playerUuid);
             send(source, ProxyMessages.encodeConnectResult(false, "unknown_server"));
             return;
         }
@@ -1061,8 +1110,10 @@ public final class MikuTPVelocity {
             if (error != null) {
                 logger.warn("Connect of {} to {} failed: {}", player.get().getUsername(), serverName,
                         error.getMessage());
+                dropPending(playerUuid);
                 send(source, ProxyMessages.encodeConnectResult(false, "error"));
             } else if (!result.isSuccessful()) {
+                dropPending(playerUuid);
                 send(source, ProxyMessages.encodeConnectResult(false, result.getStatus().name()));
             }
         });
@@ -1077,17 +1128,36 @@ public final class MikuTPVelocity {
         Optional<Player> player = parsePlayer(playerUuid);
         Optional<ServerConnection> anchorServer = parsePlayer(anchorUuid).flatMap(Player::getCurrentServer);
         if (player.isEmpty() || anchorServer.isEmpty()) {
+            dropPending(playerUuid);
             send(source, ProxyMessages.encodeConnectResult(false, "anchor_offline"));
             return;
         }
         player.get().createConnectionRequest(anchorServer.get().getServer()).connect().whenComplete((result, error) -> {
             if (error != null) {
                 logger.warn("Anchor connect of {} failed: {}", player.get().getUsername(), error.getMessage());
+                dropPending(playerUuid);
                 send(source, ProxyMessages.encodeConnectResult(false, "error"));
             } else if (!result.isSuccessful()) {
+                dropPending(playerUuid);
                 send(source, ProxyMessages.encodeConnectResult(false, result.getStatus().name()));
             }
         });
+    }
+
+    /**
+     * Drops a player's handoff after the connect request that should deliver it
+     * failed: the teleport cannot happen, and a later manual server switch must
+     * not consume the stale payload as an unexpected late teleport.
+     */
+    private void dropPending(String playerUuid) {
+        if (playerUuid == null) {
+            return;
+        }
+        try {
+            pendingEntries.remove(UUID.fromString(playerUuid));
+        } catch (IllegalArgumentException ignored) {
+            // Not a uuid: nothing can be keyed by it.
+        }
     }
 
     private void listPlayers(JsonObject message, ServerConnection source) {

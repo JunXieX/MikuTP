@@ -78,6 +78,12 @@ public final class WarpService {
         return warps;
     }
 
+    /** True once the warps table has been read; callers on an async thread may use
+     * this to wait for the startup load before opening a menu. */
+    public boolean isLoaded() {
+        return loaded;
+    }
+
     /**
      * Warp list for display. The startup load runs async, so a menu opened in the
      * first moments may see an empty cache; kick a reload rather than blocking

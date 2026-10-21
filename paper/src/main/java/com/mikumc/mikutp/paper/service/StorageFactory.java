@@ -9,7 +9,7 @@ import java.nio.file.Path;
 import java.sql.Connection;
 import java.sql.SQLException;
 
-/** Opens the local SQLite database through a single pooled connection. */
+/** Opens the pooled local SQLite database (WAL: concurrent readers, one writer). */
 public final class StorageFactory {
 
     private StorageFactory() {

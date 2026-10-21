@@ -43,6 +43,10 @@ public final class CommandRegistry {
         void reload(java.util.function.Consumer<Boolean> done);
     }
 
+    /** How long /warp waits for the warp table's first asynchronous load. */
+    private static final int WARP_LOAD_POLL_MS = 50;
+    private static final int WARP_LOAD_MAX_POLLS = 20;
+
     private final JavaPlugin plugin;
     private final MessageService messages;
     private final HomeService homeService;
@@ -252,14 +256,7 @@ public final class CommandRegistry {
 
     private LiteralCommandNode<CommandSourceStack> warp() {
         return playerRoot("warp", "mikutp.warp",
-                player -> {
-                    var warps = warpService.warpsForDisplay();
-                    if (dialogsEnabled()) {
-                        dialogs.showWarpList(player, warps, 1, name -> warpService.go(player, name));
-                    } else {
-                        chats.warpList(player, warps, false);
-                    }
-                },
+                player -> openWarpMenu(player, false),
                 (player, name) -> warpService.go(player, name),
                 player -> warpService.warpsForDisplay().stream().map(w -> w.name).toList());
     }
@@ -280,16 +277,52 @@ public final class CommandRegistry {
 
     private LiteralCommandNode<CommandSourceStack> delwarp() {
         return playerRoot("delwarp", "mikutp.warp.manage",
-                player -> {
-                    var warps = warpService.warpsForDisplay();
-                    if (dialogsEnabled()) {
-                        dialogs.showWarpDelete(player, warps, 1, name -> warpService.delete(player, name));
-                    } else {
-                        chats.warpList(player, warps, true);
-                    }
-                },
+                player -> openWarpMenu(player, true),
                 (player, name) -> warpService.delete(player, name),
                 player -> warpService.warpsForDisplay().stream().map(w -> w.name).toList());
+    }
+
+    /**
+     * Opens the warp menu once the warp table has been read. The initial load runs
+     * asynchronously at enable time, so a player who runs /warp right after a
+     * restart would otherwise get an empty menu (or a misleading "no warps" line).
+     * The wait is bounded, runs on the async pool only, and then hops back to the
+     * player's own thread to render.
+     */
+    private void openWarpMenu(Player player, boolean delete) {
+        if (warpService.isLoaded()) {
+            showWarpMenu(player, delete);
+            return;
+        }
+        // Kick the load in case the enable-time one has not started yet; WarpService
+        // ignores the call when a load already completed.
+        warpService.load();
+        tasks.async(() -> awaitWarpLoad(player, delete, 0));
+    }
+
+    private void awaitWarpLoad(Player player, boolean delete, int attempt) {
+        if (warpService.isLoaded() || attempt >= WARP_LOAD_MAX_POLLS) {
+            tasks.entity(player, () -> {
+                if (player.isOnline()) {
+                    showWarpMenu(player, delete);
+                }
+            });
+            return;
+        }
+        tasks.asyncDelayed(() -> awaitWarpLoad(player, delete, attempt + 1), WARP_LOAD_POLL_MS);
+    }
+
+    private void showWarpMenu(Player player, boolean delete) {
+        var warps = warpService.warpsForDisplay();
+        if (dialogsEnabled()) {
+            if (delete) {
+                dialogs.showWarpDelete(player, warps, 1, name -> warpService.delete(player, name));
+            } else {
+                dialogs.showWarpList(player, warps, 1, name -> warpService.go(player, name));
+            }
+        } else {
+            chats.warpList(player, warps, delete);
+        }
     }
 
     // ------------------------------------------------------------------ tpa
@@ -369,7 +402,7 @@ public final class CommandRegistry {
     private LiteralCommandNode<CommandSourceStack> tpblock() {
         return playerRoot("tpblock", "mikutp.tpa",
                 player -> requestService.listBlocks(player),
-                (player, name) -> requestService.block(player, name, true),
+                (player, name) -> requestService.block(player, name),
                 null);
     }
 

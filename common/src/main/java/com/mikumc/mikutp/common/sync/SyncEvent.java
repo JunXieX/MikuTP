@@ -34,6 +34,19 @@ public final class SyncEvent {
     public String playerName;
     public long lastOnline;
     public boolean tpaEnabled;
+    /**
+     * Whether tpaEnabled is authoritative. Identity-only snapshots (a backend that
+     * does not know the toggle yet) set this to false, so receivers copy the name
+     * without inventing a toggle value. Defaults to true for compatibility with
+     * senders that predate the flag; new code always sets it explicitly.
+     */
+    public boolean tpaKnown = true;
+    /**
+     * Version stamp of the replicated toggle, independent of {@link #lastOnline}.
+     * Identity updates advance only lastOnline, so they can never roll a newer
+     * toggle back (and an older toggle snapshot cannot stall the identity).
+     */
+    public long tpaUpdatedAt;
     /** "back" or "death". */
     public String backKind;
     /** Position payload; null means "no position in this event" (ignored by

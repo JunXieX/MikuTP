@@ -75,6 +75,12 @@ public final class RequestService {
     /** Request ids that were already answered; replayed TP_NEW events must not re-open them. */
     private final BoundedIdSet answeredRequests = new BoundedIdSet();
     private final BoundedIdSet handledEvents = new BoundedIdSet();
+    /** Request ids their requester withdrew (TP_CANCEL seen here): a TP_READY that
+     * was already in flight must not fire a teleport for a withdrawn request. */
+    private final BoundedIdSet revokedRequests = new BoundedIdSet();
+    /** Striped monitors: two /tpatoggle commands must not both read the old value
+     * and write the same flip (the read-modify-write now runs on the async pool). */
+    private final Object[] toggleLocks = new Object[16];
     /** Request ids a client is answering right now; only one answer may win. */
     private final BoundedIdSet claimedRequests = new BoundedIdSet();
     /** Requests tracked while their target was not resolvable to a player yet. */
@@ -108,6 +114,13 @@ public final class RequestService {
         this.syncBus = syncBus;
         this.onlinePlayers = onlinePlayers;
         this.serverId = config.crossServer.serverId;
+        for (int i = 0; i < toggleLocks.length; i++) {
+            toggleLocks[i] = new Object();
+        }
+    }
+
+    private Object toggleLock(UUID player) {
+        return toggleLocks[(player.hashCode() & 0x7fffffff) % toggleLocks.length];
     }
 
     public void setShowRequestHandler(Consumer<TpRequest> handler) {
@@ -436,17 +449,25 @@ public final class RequestService {
             switch (response) {
                 case ACCEPT -> {
                     messages.send(requester, "tpa.accepted-requester", "player", request.targetName);
+                    boolean moved = false;
                     if (request.type == TpRequest.Type.GO) {
                         Player anchor = onlinePlayers.byId(targetId);
                         if (anchor != null) {
                             teleports.sendLocalTo(requester, anchor, request.targetName, true);
+                            moved = true;
                         }
                     } else {
                         // Come-here: the target travels to the requester.
                         Player mover = onlinePlayers.byId(targetId);
                         if (mover != null) {
                             teleports.sendLocalTo(mover, requester, request.requesterName, true);
+                            moved = true;
                         }
+                    }
+                    if (!moved) {
+                        // The other side retired while the answer was hopping onto its
+                        // thread: say so instead of leaving the requester waiting.
+                        messages.send(requester, "common.teleport-failed");
                     }
                 }
                 case DENY -> messages.send(requester, "tpa.denied-requester", "player", request.targetName);
@@ -517,14 +538,20 @@ public final class RequestService {
         // cold (right after /reload): that read must not run on the region thread.
         UUID id = player.getUniqueId();
         tasks.async(() -> {
-            boolean next = !profiles.tpaEnabledFor(id);
-            profiles.setTpaEnabled(id, next);
+            boolean next;
+            // Serialise the read-modify-write per player: two rapid /tpatoggle calls
+            // would otherwise both read the same value and write the same flip.
+            synchronized (toggleLock(id)) {
+                next = !profiles.tpaEnabledFor(id);
+                profiles.setTpaEnabled(id, next);
+            }
+            boolean flipped = next;
             tasks.entity(player,
-                    () -> messages.send(player, next ? "tpa.toggled-on" : "tpa.toggled-off"));
+                    () -> messages.send(player, flipped ? "tpa.toggled-on" : "tpa.toggled-off"));
         });
     }
 
-    public void block(Player blocker, String targetName, boolean permanent) {
+    public void block(Player blocker, String targetName) {
         if (featureDisabled(blocker)) {
             return;
         }
@@ -550,14 +577,16 @@ public final class RequestService {
                 messages.send(blocker, "tpa.self");
                 return;
             }
-            applyIgnore(new IgnoreEntry(blockerId.toString(), blocked.toString(),
-                    expiresAt, System.currentTimeMillis()));
+            // The local row and the replicated event must carry the same creation
+            // stamp, otherwise the origin and its peers disagree on the LWW order.
+            long createdAt = System.currentTimeMillis();
+            applyIgnore(new IgnoreEntry(blockerId.toString(), blocked.toString(), expiresAt, createdAt));
             if (syncBus.crossServer()) {
                 SyncEvent event = SyncEvent.create(SyncEvent.Type.IGNORE_SET, serverId);
                 event.blockerUuid = blockerId.toString();
                 event.blockedUuid = blocked.toString();
                 event.expiresAt = expiresAt;
-                event.createdAt = System.currentTimeMillis();
+                event.createdAt = createdAt;
                 syncBus.publish(event);
             }
             if (permanentBlock) {
@@ -670,6 +699,10 @@ public final class RequestService {
         if (requesterName == null || revokedId == null) {
             return;
         }
+        // Remember the withdrawal on every backend: the backend hosting the mover of
+        // a COME flow no longer has an incoming copy to remove, yet it still has to
+        // reject a TP_READY that is already in flight.
+        revokedRequests.add(revokedId);
         for (Map.Entry<UUID, Map<String, TpRequest>> entry : incoming.entrySet()) {
             List<TpRequest> found = new ArrayList<>();
             // Match the exact request id, not every request from this requester:
@@ -889,16 +922,16 @@ public final class RequestService {
         if (!withinLifetime(request) || answeredRequests.contains(request.id)) {
             return;
         }
-        if (parsed == Response.ACCEPT) {
-            // The requester must still be waiting for this exact request; a newer
-            // /tpa already revoked it and published TP_CANCEL.
-            TpRequest tracked = requesterId == null ? null : outgoingRequests.get(requesterId);
-            if (tracked == null || !tracked.id.equals(request.id)) {
-                return;
-            }
-        }
         clearOutgoing(request.requesterUuid, request.id);
         tasks.entity(requester, () -> {
+            // Same-request identity is re-checked at execution time: the answer may
+            // have been superseded while the task waited for the requester's thread.
+            if (parsed == Response.ACCEPT) {
+                TpRequest tracked = requesterId == null ? null : outgoingRequests.get(requesterId);
+                if (tracked == null || !tracked.id.equals(request.id)) {
+                    return;
+                }
+            }
             switch (parsed) {
                 case ACCEPT -> {
                     messages.send(requester, "tpa.accepted-requester", "player", request.targetName);
@@ -940,9 +973,9 @@ public final class RequestService {
         if (request == null) {
             return;
         }
-        // A ready signal for a request that has already expired must not fire a
-        // teleport on a player who is no longer waiting for it.
-        if (!withinLifetime(request)) {
+        // A ready signal for a request that has already expired or was withdrawn
+        // must not fire a teleport on a player who is no longer waiting for it.
+        if (!withinLifetime(request) || revokedRequests.contains(request.id)) {
             return;
         }
         UUID moverId = parseUuid(request.targetUuid);
@@ -956,15 +989,23 @@ public final class RequestService {
         if (event.id == null || !handledEvents.add(event.id)) {
             return;
         }
-        clearOutgoing(request.targetUuid, request.id);
+        // outgoingRequests is keyed by the requester, not by the mover (R2-07).
+        clearOutgoing(request.requesterUuid, request.id);
         UUID anchorId = parseUuid(request.requesterUuid);
-        messages.send(mover, "tpa.accepted-requester", "player", request.requesterName);
-        Player anchor = anchorId == null ? null : onlinePlayers.byId(anchorId);
-        if (anchor != null) {
-            teleports.sendLocalTo(mover, anchor, request.requesterName, true);
-        } else {
-            teleports.dispatchToAnchor(mover, request.requesterUuid, null);
-        }
+        tasks.entity(mover, () -> {
+            // Re-check right before the teleport starts: a withdrawal may have arrived
+            // while this task was queued behind the mover's region thread.
+            if (!withinLifetime(request) || revokedRequests.contains(request.id)) {
+                return;
+            }
+            messages.send(mover, "tpa.accepted-requester", "player", request.requesterName);
+            Player anchor = anchorId == null ? null : onlinePlayers.byId(anchorId);
+            if (anchor != null) {
+                teleports.sendLocalTo(mover, anchor, request.requesterName, true);
+            } else {
+                teleports.dispatchToAnchor(mover, request.requesterUuid, null);
+            }
+        });
     }
 
     /** Applies a replicated ignore change; the write joins the caller's batched

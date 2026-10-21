@@ -46,6 +46,9 @@ public final class PlayerLifecycle implements Listener {
         Player player = event.getPlayer();
         UUID id = player.getUniqueId();
         refresh(player);
+        // A real join announces the profile; refresh() deliberately does not, so
+        // /mtp reload cannot turn every online player into PROFILE traffic (R2-03).
+        profiles.onJoin(player);
         coordinator.onPlayerJoin();
         // Answers that arrived while this backend still saw the player as absent
         // are replayed first: they may be the acceptance the player is waiting for.
@@ -68,7 +71,9 @@ public final class PlayerLifecycle implements Listener {
         UUID id = player.getUniqueId();
         onlinePlayers.add(player);
         cooldowns.setBypass(id, player.hasPermission("mikutp.bypass.cooldown"));
-        profiles.onJoin(player);
+        // Quiet variant: rebuilds the local tpa cache without publishing PROFILE /
+        // PROFILE_REQUEST, so reload does not replicate anything (R2-03).
+        profiles.refresh(player);
         homeService.onJoin(player);
         // Request dedupe state (answered/handled request ids) is intentionally not
         // reset here: the proxy re-delivers a pending TP_NEW after a server switch

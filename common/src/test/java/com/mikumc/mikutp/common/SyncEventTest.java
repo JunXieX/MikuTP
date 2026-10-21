@@ -8,6 +8,7 @@ import com.mikumc.mikutp.common.sync.SyncEvent;
 import org.junit.jupiter.api.Test;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -77,6 +78,51 @@ class SyncEventTest {
 
         SyncEvent parsed = ConfigIO.gson().fromJson(ConfigIO.gson().toJson(legacy), SyncEvent.class);
         assertEquals(0L, parsed.backUpdatedAt);
+    }
+
+    /**
+     * R2-01/R2-02: a profile event distinguishes "identity only" from an
+     * authoritative toggle, and carries a toggle stamp independent of lastOnline.
+     */
+    @Test
+    void profileEventCarriesToggleAuthorityAndStamp() {
+        SyncEvent identity = SyncEvent.create(SyncEvent.Type.PROFILE, "s1");
+        identity.playerUuid = "uuid-a";
+        identity.playerName = "Alice";
+        identity.lastOnline = 123L;
+        identity.tpaKnown = false;
+        identity.tpaUpdatedAt = 0L;
+
+        SyncEvent parsedIdentity = ConfigIO.gson().fromJson(ConfigIO.gson().toJson(identity), SyncEvent.class);
+        assertFalse(parsedIdentity.tpaKnown, "identity-only snapshot must not claim toggle authority");
+        assertEquals(0L, parsedIdentity.tpaUpdatedAt);
+        assertEquals(123L, parsedIdentity.lastOnline);
+
+        SyncEvent toggle = SyncEvent.create(SyncEvent.Type.PROFILE, "s1");
+        toggle.playerUuid = "uuid-a";
+        toggle.playerName = "Alice";
+        toggle.lastOnline = 4_000L;
+        toggle.tpaEnabled = false;
+        toggle.tpaKnown = true;
+        toggle.tpaUpdatedAt = 2_000L;
+
+        SyncEvent parsedToggle = ConfigIO.gson().fromJson(ConfigIO.gson().toJson(toggle), SyncEvent.class);
+        assertTrue(parsedToggle.tpaKnown);
+        assertFalse(parsedToggle.tpaEnabled);
+        assertEquals(2_000L, parsedToggle.tpaUpdatedAt);
+        assertEquals(4_000L, parsedToggle.lastOnline);
+    }
+
+    /** Absent field means "known": legacy senders only publish an authoritative toggle. */
+    @Test
+    void missingToggleAuthorityDefaultsToKnown() {
+        SyncEvent legacy = SyncEvent.create(SyncEvent.Type.PROFILE, "s1");
+        legacy.playerUuid = "uuid-a";
+        legacy.playerName = "Alice";
+
+        SyncEvent parsed = ConfigIO.gson().fromJson(ConfigIO.gson().toJson(legacy), SyncEvent.class);
+        assertTrue(parsed.tpaKnown);
+        assertEquals(0L, parsed.tpaUpdatedAt);
     }
 
     /** M-03: the profile-authority request event must round trip like the others. */
