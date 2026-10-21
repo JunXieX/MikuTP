@@ -54,7 +54,7 @@ import java.util.concurrent.ConcurrentHashMap;
  * <p>All state is in memory: backend SQLite databases stay the source of
  * truth, and a proxy restart is healed by the activation-time resync of the
  * backends. Every message is authenticated with the shared token from
- * {@code plugins/mikutp/config.properties}; without a token the hub refuses
+ * {@code plugins/MikuTP/config.properties}; without a token the hub refuses
  * backend traffic so a modified client can never drive it.
  */
 @Plugin(id = "mikutp", name = "MikuTP", version = MikuTPVelocity.VERSION,
@@ -66,7 +66,7 @@ public final class MikuTPVelocity {
      * Must equal the Gradle {@code version} in the root build script; the CI
      * "Verify versions agree" step fails the build when the two drift apart.
      */
-    public static final String VERSION = "1.6.0";
+    public static final String VERSION = "1.6.1";
 
     private static final MinecraftChannelIdentifier CHANNEL =
             MinecraftChannelIdentifier.create("mikumc", "mikutp");
@@ -78,10 +78,22 @@ public final class MikuTPVelocity {
     private static final long MAILBOX_TTL_MS = 120_000;
     private static final long PENDING_TTL_MS = 300_000;
     private static final String CONFIG_FILE = "config.properties";
+    /**
+     * Folder for this plugin's data. Velocity derives the injected
+     * {@code @DataDirectory} from the plugin id, which yields
+     * {@code plugins/mikutp}; the proxy keeps the same folder name as the
+     * backends, {@code plugins/MikuTP}.
+     */
+    private static final String DATA_DIRECTORY = "MikuTP";
 
     private final ProxyServer server;
     private final Logger logger;
     private final Path dataDirectory;
+    /**
+     * Velocity's id-based directory ({@code plugins/mikutp}); only consulted
+     * once to carry an existing configuration over to {@link #dataDirectory}.
+     */
+    private final Path defaultDataDirectory;
 
     /** Cross-server pending teleport handoffs, delivered on arrival. */
     private final Map<UUID, PendingEntry> pendingEntries = new ConcurrentHashMap<>();
@@ -108,7 +120,12 @@ public final class MikuTPVelocity {
     public MikuTPVelocity(ProxyServer server, Logger logger, @DataDirectory Path dataDirectory) {
         this.server = server;
         this.logger = logger;
-        this.dataDirectory = dataDirectory;
+        this.defaultDataDirectory = dataDirectory;
+        // The parent of the injected path is the proxy's plugins directory.
+        Path pluginsDirectory = dataDirectory.getParent();
+        this.dataDirectory = pluginsDirectory == null
+                ? dataDirectory
+                : pluginsDirectory.resolve(DATA_DIRECTORY);
     }
 
     @Subscribe
@@ -149,11 +166,12 @@ public final class MikuTPVelocity {
         });
     }
 
-    /** Reads (and creates a documented template for) {@code plugins/mikutp/config.properties}. */
+    /** Reads (and creates a documented template for) {@code plugins/MikuTP/config.properties}. */
     private void loadConfig() {
         Path file = dataDirectory.resolve(CONFIG_FILE);
         try {
             Files.createDirectories(dataDirectory);
+            migrateFromDefaultDirectory(file);
             if (Files.notExists(file)) {
                 try (OutputStream out = Files.newOutputStream(file)) {
                     out.write(("""
@@ -176,6 +194,27 @@ public final class MikuTPVelocity {
         if (token.isEmpty()) {
             logger.error("No sync token configured: set 'token' in {} to the same value as sync.token "
                     + "in every backend config.yml, otherwise cross-server sync is refused.", file);
+        }
+    }
+
+    /**
+     * Carries the token over from Velocity's id-based directory
+     * ({@code plugins/mikutp}) the first time the renamed directory is used, so
+     * an upgraded proxy keeps syncing instead of silently refusing every
+     * backend. The old file is left untouched: deleting a server's
+     * configuration is not this plugin's call.
+     */
+    private void migrateFromDefaultDirectory(Path file) {
+        Path legacy = defaultDataDirectory.resolve(CONFIG_FILE);
+        if (legacy.equals(file) || Files.exists(file) || Files.notExists(legacy)) {
+            return;
+        }
+        try {
+            Files.copy(legacy, file);
+            logger.info("Copied the proxy configuration from {} to {}; the old directory can be removed.",
+                    legacy, file);
+        } catch (IOException e) {
+            logger.warn("Could not copy the proxy configuration from {} to {}", legacy, file, e);
         }
     }
 

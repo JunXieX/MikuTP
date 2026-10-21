@@ -36,7 +36,7 @@ MikuTP 是一套面向 Paper / Folia / Velocity 的多功能传送插件：家�
 
 ### 单服务器（默认，零依赖）
 
-1. 把 `MikuTP-Paper-1.6.0.jar` 放入 `plugins/`，重启。
+1. 把 `MikuTP-Paper-1.6.1.jar` 放入 `plugins/`，重启。
 2. 完成。数据存储在 `plugins/MikuTP/data.db`（SQLite），无需任何外部服务。
 
 ### 跨服网络（Velocity）
@@ -51,7 +51,7 @@ MikuTP 是一套面向 Paper / Folia / Velocity 的多功能传送插件：家�
      cross_server:
        server_id: survival  # 必须与 velocity.toml 中的服务器名完全一致
      ```
-   - 代理首次启动会生成 `plugins/mikutp/config.properties`，把其中的 `token` 改成**完全相同**的值。
+   - 代理首次启动会生成 `plugins/MikuTP/config.properties`，把其中的 `token` 改成**完全相同**的值。
 3. 依次重启全部后端。此后家、玩家档案、屏蔽列表自动全网同步；`/tpa`、`/home`、`/back`、`/otp` 全部支持跨服。
 
 > 密钥留空时：插件会拒绝所有跨服同步消息并在控制台报错（安全默认）；单服务器模式（`mode: NONE`）下完全不受影响。
@@ -99,7 +99,7 @@ MikuTP 是一套面向 Paper / Folia / Velocity 的多功能传送插件：家�
 把 `paper-plugin.yml` 里的 `api-version: '26.2'` 改为 `'26.1'` 即可。
 
 **跨服同步不生效，控制台提示 token？**
-两端 token 必须完全一致：后端 `config.yml` 的 `sync.token` 与代理 `plugins/mikutp/config.properties` 的 `token`；任一为空都会拒绝同步，这是防止伪造同步消息的安全默认。
+两端 token 必须完全一致：后端 `config.yml` 的 `sync.token` 与代理 `plugins/MikuTP/config.properties` 的 `token`；任一为空都会拒绝同步，这是防止伪造同步消息的安全默认。
 
 **代理重启会有什么影响？**
 本地功能（家、地标、单服传送、随机传送）完全正常；跨服传送暂停，代理恢复后插件自动重新对齐全网数据，无需人工干预。
