@@ -156,6 +156,16 @@ public final class Database implements AutoCloseable {
                 )""".formatted(prefix));
         // Tables created by older versions: add whichever newer columns are missing.
         Map<String, String> expected = new LinkedHashMap<>();
+        // The back-position columns predate the death/logout ones, but the very
+        // oldest schema predates them too; add them when a legacy table is missing
+        // them so /back and the replicated position sync keep working.
+        expected.put("back_server", "VARCHAR(64)");
+        expected.put("back_world", "VARCHAR(64)");
+        expected.put("back_x", "DOUBLE");
+        expected.put("back_y", "DOUBLE");
+        expected.put("back_z", "DOUBLE");
+        expected.put("back_yaw", "DOUBLE");
+        expected.put("back_pitch", "DOUBLE");
         expected.put("death_server", "VARCHAR(64)");
         expected.put("death_world", "VARCHAR(64)");
         expected.put("death_x", "DOUBLE");
@@ -446,8 +456,8 @@ public final class Database implements AutoCloseable {
             // so any snapshot produced before it is rejected by the upsert guard.
             // The same guard here keeps a late snapshot from undoing a newer flip.
             try (PreparedStatement ps = connection.prepareStatement(
-                    "UPDATE %splayers SET tpa_enabled = ?, tpa_known = 1, last_online = ?"
-                            + " WHERE uuid = ? AND last_online <= ?".formatted(prefix))) {
+                    ("UPDATE %splayers SET tpa_enabled = ?, tpa_known = 1, last_online = ?"
+                            + " WHERE uuid = ? AND last_online <= ?").formatted(prefix))) {
                 ps.setInt(1, enabled ? 1 : 0);
                 ps.setLong(2, at);
                 ps.setString(3, uuid);
