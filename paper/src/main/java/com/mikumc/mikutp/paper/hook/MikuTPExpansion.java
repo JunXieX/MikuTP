@@ -71,7 +71,11 @@ public final class MikuTPExpansion extends PlaceholderExpansion {
             case "homes_left" -> player instanceof Player online && homeService.isHomesLoaded(online.getUniqueId())
                     ? leftText(homeService.cachedLimit(online.getUniqueId()), homeService.homes(id).size())
                     : "";
-            case "warps" -> String.valueOf(warpService.warps().size());
+            // Warps are read once at enable and on reload: before that read the
+            // count would be a fabricated 0, so report "unknown" like homes_*.
+            case "warps" -> warpService.isLoaded()
+                    ? String.valueOf(warpService.warps().size())
+                    : "";
             // Unknown means "this backend never learned the toggle": render empty
             // rather than the guessed default true.
             case "tpa_enabled" -> id == null || !profiles.isTpaKnown(id)

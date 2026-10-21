@@ -356,6 +356,45 @@ class DatabaseTest {
         assertFalse(database.getPlayer("uuid-a").orElseThrow().tpaEnabled);
     }
 
+    /**
+     * N-1: two backends writing opposite values with the same stamp must converge to
+     * the conservative value instead of forking forever.
+     */
+    @Test
+    void equalStampToggleTiebreakPrefersDisabled() throws Exception {
+        database.upsertPlayer("uuid-a", "Alice", 100L);
+
+        // Order 1 (backend A): enable, then disable at the same stamp -> disabled.
+        assertEquals(1, database.transaction(tx -> tx.setTpaEnabled("uuid-a", true, 5_000L)).intValue());
+        assertEquals(1, database.transaction(tx -> tx.setTpaEnabled("uuid-a", false, 5_000L)).intValue());
+        PlayerProfile a = database.getPlayer("uuid-a").orElseThrow();
+        assertFalse(a.tpaEnabled);
+        assertEquals(5_000L, a.tpaUpdatedAt);
+        // Equal-stamp repeats write nothing: same value, and an enabling value.
+        assertEquals(0, database.transaction(tx -> tx.setTpaEnabled("uuid-a", false, 5_000L)).intValue());
+        assertEquals(0, database.transaction(tx -> tx.setTpaEnabled("uuid-a", true, 5_000L)).intValue());
+        assertFalse(database.getPlayer("uuid-a").orElseThrow().tpaEnabled);
+
+        // Order 2 (backend B): disable, then enable at the same stamp -> stays disabled.
+        database.upsertPlayer("uuid-b", "Bob", 100L);
+        assertEquals(1, database.transaction(tx -> tx.setTpaEnabled("uuid-b", false, 7_000L)).intValue());
+        assertEquals(0, database.transaction(tx -> tx.setTpaEnabled("uuid-b", true, 7_000L)).intValue());
+        PlayerProfile b = database.getPlayer("uuid-b").orElseThrow();
+        assertFalse(b.tpaEnabled);
+        assertEquals(7_000L, b.tpaUpdatedAt);
+
+        // A strictly newer stamp re-enables normally.
+        assertEquals(1, database.transaction(tx -> tx.setTpaEnabled("uuid-b", true, 7_001L)).intValue());
+        assertTrue(database.getPlayer("uuid-b").orElseThrow().tpaEnabled);
+
+        // Whichever order the two same-stamp events arrive in, the row ends disabled.
+        database.upsertPlayer("uuid-c", "Carol", 100L);
+        assertEquals(1, database.transaction(tx -> tx.setTpaEnabled("uuid-c", true, 9_000L)).intValue());
+        assertEquals(1, database.transaction(tx -> tx.setTpaEnabled("uuid-c", false, 9_000L)).intValue());
+        assertEquals(0, database.transaction(tx -> tx.setTpaEnabled("uuid-c", true, 9_000L)).intValue());
+        assertFalse(database.getPlayer("uuid-c").orElseThrow().tpaEnabled);
+    }
+
     // ------------------------------------------------------------------ positions
 
     @Test

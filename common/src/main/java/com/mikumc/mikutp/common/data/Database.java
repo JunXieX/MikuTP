@@ -74,8 +74,9 @@ public final class Database implements AutoCloseable {
 
         int upsertPlayer(String uuid, String name, long now) throws SQLException;
 
-        /** Stores the toggle and stamps the profile as of {@code at}, unless the
-         * row already carries a newer profile change. */
+        /** Stores the toggle and stamps it as of {@code at}. Older stamps are
+         * rejected; equal stamps accept only the disabling value, so concurrent
+         * same-millisecond flips converge instead of forking. */
         int setTpaEnabled(String uuid, boolean enabled, long at) throws SQLException;
 
         /** Stores a return position under {@code colPrefix}; a null position clears it. */
@@ -484,16 +485,29 @@ public final class Database implements AutoCloseable {
             // newer toggle is accepted even when last_online is further ahead).
             // last_online only moves forward, so a late toggle can never roll the
             // profile order back.
+            //
+            // Equal stamps need a deterministic tiebreak. With a plain "<=", two
+            // backends writing opposite values in the same millisecond would accept
+            // each other's event and fork forever. The tiebreak accepts an equal
+            // stamp only when it disables (0 over 1): every replica then converges
+            // to "disabled" - the privacy-safe direction - and an equal-stamp repeat
+            // of the same value writes nothing.
             try (PreparedStatement ps = connection.prepareStatement(
                     ("UPDATE %splayers SET tpa_enabled = ?, tpa_known = 1, tpa_updated_at = ?,"
                             + " last_online = CASE WHEN last_online < ? THEN ? ELSE last_online END"
-                            + " WHERE uuid = ? AND tpa_updated_at <= ?").formatted(prefix))) {
-                ps.setInt(1, enabled ? 1 : 0);
+                            + " WHERE uuid = ?"
+                            + " AND (tpa_updated_at < ?"
+                            + "      OR (tpa_updated_at = ? AND tpa_enabled = 1 AND ? = 0))")
+                            .formatted(prefix))) {
+                int flag = enabled ? 1 : 0;
+                ps.setInt(1, flag);
                 ps.setLong(2, at);
                 ps.setLong(3, at);
                 ps.setLong(4, at);
                 ps.setString(5, uuid);
                 ps.setLong(6, at);
+                ps.setLong(7, at);
+                ps.setInt(8, flag);
                 return ps.executeUpdate();
             }
         }

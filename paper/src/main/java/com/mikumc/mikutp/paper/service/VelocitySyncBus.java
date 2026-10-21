@@ -29,7 +29,13 @@ import java.util.function.Consumer;
 public final class VelocitySyncBus implements SyncBus {
 
     private static final int FLUSH_INTERVAL_MS = 150;
-    private static final int MAX_OPS_PER_BATCH = 64;
+    /** 48 ops stay below Bukkit's 32767-byte plugin-message cap even for the largest
+     * event kind (worst case ~27KB for a full TP_NEW batch). */
+    private static final int MAX_OPS_PER_BATCH = 48;
+    /** Bukkit caps one plugin message at 32767 bytes; stay clear of the edge. */
+    private static final int MAX_FRAME_BYTES = 32_000;
+    /** A batch that failed this often is dropped instead of retried forever. */
+    private static final int MAX_SEND_ATTEMPTS = 3;
     /** Upper bound for queued ops on a server with no players to carry them: the
      * activation resync re-converges state, so dropping the oldest is safe. Kept
      * near the size of one full-state dump instead of the 262144 ops a
@@ -40,7 +46,11 @@ public final class VelocitySyncBus implements SyncBus {
     private final Tasks tasks;
     private final String token;
     private final OnlinePlayers onlinePlayers;
-    private final ConcurrentLinkedDeque<com.google.gson.JsonObject> outbound = new ConcurrentLinkedDeque<>();
+    /** One queued wire op plus how many send attempts it already survived. */
+    private record QueuedOp(com.google.gson.JsonObject json, int attempt) {
+    }
+
+    private final ConcurrentLinkedDeque<QueuedOp> outbound = new ConcurrentLinkedDeque<>();
     /** Mirrors {@code outbound.size()}; guarded by the queue monitor so it can
      * never drift from the real depth. */
     private int queuedOps;
@@ -107,7 +117,7 @@ public final class VelocitySyncBus implements SyncBus {
         // live events early or stop shedding altogether.
         int depth;
         synchronized (outbound) {
-            outbound.addLast(op);
+            outbound.addLast(new QueuedOp(op, 1));
             depth = ++queuedOps;
             while (depth > MAX_QUEUED_OPS) {
                 if (outbound.pollFirst() == null) {
@@ -123,10 +133,10 @@ public final class VelocitySyncBus implements SyncBus {
         if (!running || outbound.isEmpty()) {
             return;
         }
-        List<com.google.gson.JsonObject> ops = new ArrayList<>();
+        List<QueuedOp> ops = new ArrayList<>();
         synchronized (outbound) {
             while (ops.size() < MAX_OPS_PER_BATCH) {
-                com.google.gson.JsonObject op = outbound.pollFirst();
+                QueuedOp op = outbound.pollFirst();
                 if (op == null) {
                     break;
                 }
@@ -137,46 +147,94 @@ public final class VelocitySyncBus implements SyncBus {
         if (ops.isEmpty()) {
             return;
         }
+        send(ops);
+    }
+
+    /** Encodes and sends one drained batch; an oversized batch is split, not retried. */
+    private void send(List<QueuedOp> ops) {
         // The proxy authenticates every batch with the shared token.
-        send(ProxyMessages.sign(ProxyMessages.encodeBusBatch(ops), token), ops);
+        String batchJson = ProxyMessages.sign(ProxyMessages.encodeBusBatch(jsonOf(ops)), token);
+        byte[] payload = batchJson.getBytes(java.nio.charset.StandardCharsets.UTF_8);
+        if (payload.length > MAX_FRAME_BYTES) {
+            if (ops.size() > 1) {
+                // Bukkit rejects frames over 32767 bytes; hand the tail to the next
+                // flush instead of retrying the same oversized poison pill forever.
+                int half = ops.size() / 2;
+                send(new ArrayList<>(ops.subList(0, half)));
+                requeue(ops.subList(half, ops.size()), false);
+                return;
+            }
+            plugin.getSLF4JLogger().warn("Dropping one oversized sync op ({} bytes)", payload.length);
+            return;
+        }
+        sendEncoded(payload, ops);
     }
 
     /** Sends the batch through the sticky carrier; without one the ops go back to
      * the front of the queue and ride along with the next activation resync. The
      * lookup uses the plugin's own registry: this runs on the async flush thread,
      * where Folia does not allow iterating Bukkit's player view. */
-    private void send(String batchJson, List<com.google.gson.JsonObject> ops) {
+    private void sendEncoded(byte[] payload, List<QueuedOp> ops) {
+        int attempt = ops.stream().mapToInt(QueuedOp::attempt).max().orElse(1);
         Player carrier = stickyCarrierPlayer();
         if (carrier == null) {
-            requeue(ops);
+            requeue(ops, false);
             return;
         }
-        byte[] payload = batchJson.getBytes(java.nio.charset.StandardCharsets.UTF_8);
         // A retired scheduler (entity removed before the task ran) means the carrier
         // is gone: the retired callback puts the batch back instead of letting it
-        // vanish. A failing send does the same, otherwise one exception would
-        // silently drop a whole batch of events and pending handoffs.
+        // vanish. A failing send is classified instead of blindly requeued: an
+        // oversized frame can never succeed and would loop forever (V-R3-01).
         try {
             tasks.entity(carrier, () -> {
                 if (!carrier.isOnline()) {
-                    // The carrier vanished between the lookup and the send; without
-                    // this the batch would be lost instead of retried.
-                    requeue(ops);
+                    // The carrier vanished between the lookup and the send; retry on
+                    // the next flush (the sticky carrier is re-picked then).
+                    requeue(ops, false);
                     return;
                 }
                 try {
                     carrier.sendPluginMessage(plugin, ProxyMessages.CHANNEL, payload);
                 } catch (Exception e) {
-                    plugin.getSLF4JLogger().warn("Failed to send a sync batch ({} ops); re-queueing",
-                            ops.size(), e);
-                    requeue(ops);
+                    handleSendFailure(ops, attempt, e);
                 }
-            }, () -> requeue(ops));
+            }, () -> requeue(ops, false));
         } catch (RuntimeException e) {
-            plugin.getSLF4JLogger().warn("Failed to schedule a sync batch ({} ops); re-queueing",
-                    ops.size(), e);
-            requeue(ops);
+            handleSendFailure(ops, attempt, e);
         }
+    }
+
+    /** Drops poison pills (size failures / too many attempts) instead of looping. */
+    private void handleSendFailure(List<QueuedOp> ops, int attempt, Exception e) {
+        if (isSizeFailure(e) || attempt >= MAX_SEND_ATTEMPTS) {
+            plugin.getSLF4JLogger().warn("Dropping {} sync op(s) after attempt {}: {}",
+                    ops.size(), attempt, e.toString());
+            return;
+        }
+        plugin.getSLF4JLogger().warn("Failed to send a sync batch ({} ops, attempt {}); re-queueing",
+                ops.size(), attempt, e);
+        requeue(ops, true);
+    }
+
+    private static boolean isSizeFailure(Throwable e) {
+        if (e instanceof IllegalArgumentException) {
+            return true;
+        }
+        String message = e.getMessage();
+        if (message == null) {
+            return false;
+        }
+        String lower = message.toLowerCase(java.util.Locale.ROOT);
+        return lower.contains("too big") || lower.contains("too large") || lower.contains("maximum")
+                || lower.contains("length") || lower.contains("size");
+    }
+
+    private static List<com.google.gson.JsonObject> jsonOf(List<QueuedOp> ops) {
+        List<com.google.gson.JsonObject> json = new ArrayList<>(ops.size());
+        for (QueuedOp op : ops) {
+            json.add(op.json());
+        }
+        return json;
     }
 
     /**
@@ -198,10 +256,11 @@ public final class VelocitySyncBus implements SyncBus {
     }
 
     /** Puts a drained batch back at the head of the queue, preserving order. */
-    private void requeue(List<com.google.gson.JsonObject> ops) {
+    private void requeue(List<QueuedOp> ops, boolean retry) {
         synchronized (outbound) {
             for (int i = ops.size() - 1; i >= 0; i--) {
-                outbound.addFirst(ops.get(i));
+                QueuedOp op = ops.get(i);
+                outbound.addFirst(retry ? new QueuedOp(op.json(), op.attempt() + 1) : op);
             }
             queuedOps += ops.size();
             // A retry must not push the queue past the same bound enqueue() uses.

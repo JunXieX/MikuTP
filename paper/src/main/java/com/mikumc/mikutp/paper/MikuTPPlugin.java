@@ -308,10 +308,11 @@ public final class MikuTPPlugin extends JavaPlugin {
                 // service parses the MiniMessage prefix exactly like MessageService.reload
                 // does, so a malformed prefix rejects the reload instead of leaving the
                 // config applied while the message layer still holds the old prefix.
-                MessageService probe = new MessageService(bundle, parsed.parsePlaceholderApi, papiAvailable);
-                if (probe.prefix() == null) {
-                    throw new IOException("messages bundle produced no prefix");
-                }
+                // Constructing the service parses the MiniMessage prefix exactly like
+                // MessageService.reload(); a malformed prefix therefore rejects the reload
+                // before any live state is swapped (R3-05: MiniMessage never returns null,
+                // so the former null check was dead code).
+                new MessageService(bundle, parsed.parsePlaceholderApi, papiAvailable);
             } catch (Exception e) {
                 // Keep the running configuration intact and report the failure.
                 getSLF4JLogger().error("Reload failed; the running configuration was kept: {}", e.toString());
@@ -320,23 +321,30 @@ public final class MikuTPPlugin extends JavaPlugin {
             }
             // Apply on the global region thread so command/region readers never see
             // a configuration that has only been partially copied.
-            tasks.global(() -> {
-                try {
-                    config.copyFrom(parsed);
-                    messages.reload(bundle, parsed.parsePlaceholderApi);
-                    effects.setEnabled(parsed.teleport.sounds);
-                    warpService.reload();
-                    refreshOnlinePlayersNow();
-                    getSLF4JLogger().info("MikuTP reloaded (sync mode, server-id, table prefix and language file "
-                            + "need a restart)");
-                    done.accept(true);
-                } catch (Exception e) {
-                    // The bundle was pre-validated, so this is not expected; report it
-                    // instead of leaving the command waiting for a callback forever.
-                    getSLF4JLogger().error("Reload parsed but could not be applied", e);
-                    done.accept(false);
-                }
-            });
+            try {
+                tasks.global(() -> {
+                    try {
+                        config.copyFrom(parsed);
+                        messages.reload(bundle, parsed.parsePlaceholderApi);
+                        effects.setEnabled(parsed.teleport.sounds);
+                        warpService.reload();
+                        refreshOnlinePlayersNow();
+                        getSLF4JLogger().info("MikuTP reloaded (sync mode, server-id, table prefix and "
+                                + "language file need a restart)");
+                        done.accept(true);
+                    } catch (Exception e) {
+                        // The bundle was pre-validated, so this is not expected; report it
+                        // instead of leaving the command waiting for a callback forever.
+                        getSLF4JLogger().error("Reload parsed but could not be applied", e);
+                        done.accept(false);
+                    }
+                });
+            } catch (RuntimeException e) {
+                // A disabling plugin cannot schedule region work: answer the command
+                // instead of leaving it without feedback (R3-06).
+                getSLF4JLogger().error("Reload could not be scheduled; the running configuration was kept", e);
+                done.accept(false);
+            }
         });
     }
 

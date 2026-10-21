@@ -28,10 +28,14 @@ public final class Tasks {
     }
 
     public void async(Runnable run) {
+        // Increment before the flag check: a task admitted just before shutdown must
+        // still be seen by the bounded drain, otherwise it could run after storage
+        // closes (I-R3-02).
+        inFlight.incrementAndGet();
         if (shuttingDown) {
+            inFlight.decrementAndGet();
             return;
         }
-        inFlight.incrementAndGet();
         try {
             Bukkit.getAsyncScheduler().runNow(plugin, task -> runGuarded(run));
         } catch (RuntimeException e) {
@@ -41,10 +45,12 @@ public final class Tasks {
     }
 
     public void asyncDelayed(Runnable run, long delayMillis) {
+        // Same ordering as async(): count first, then refuse (I-R3-02).
+        inFlight.incrementAndGet();
         if (shuttingDown) {
+            inFlight.decrementAndGet();
             return;
         }
-        inFlight.incrementAndGet();
         try {
             Bukkit.getAsyncScheduler().runDelayed(plugin, task -> runGuarded(run),
                     Math.max(1, delayMillis), TimeUnit.MILLISECONDS);
@@ -63,6 +69,8 @@ public final class Tasks {
                     task.cancel();
                     return;
                 }
+                // Pair the count: runGuarded always decrements (R3-02).
+                inFlight.incrementAndGet();
                 runGuarded(run);
             }, initialDelay, period, unit);
         } catch (RuntimeException e) {

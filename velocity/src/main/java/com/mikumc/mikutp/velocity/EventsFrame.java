@@ -11,9 +11,13 @@ import java.util.List;
  * objects are inlined as already-encoded JSON instead of being parsed back into
  * a tree first, which removes one serialize/parse round trip per event.
  *
- * <p>The two encoders must stay byte-compatible: the backend parses this frame
- * with the same code path no matter which side produced it. {@code EventsFrameTest}
- * pins the equivalence for Gson-produced event JSON.
+ * <p>Raw-byte equivalence with {@link ProxyMessages#encodeEventsBatch(List)} holds
+ * for Gson default escaping output: both encoders inline the same escaped text,
+ * so the frames match byte for byte (pinned by {@code EventsFrameTest}).
+ * At the wire level the two are interchangeable regardless, because
+ * {@code ProxyMessages.sign} re-serializes the whole message (decode -> canonical
+ * form -> toString) before it is sent, so a receiver never depends on the raw
+ * byte layout this class produces.
  *
  * <p>Only JSON produced by {@code Gson.toJson(SyncEvent)} may be passed in. The
  * strings are joined verbatim, so quotes and backslashes inside them are already

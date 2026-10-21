@@ -81,6 +81,10 @@ public final class RequestService {
     /** Striped monitors: two /tpatoggle commands must not both read the old value
      * and write the same flip (the read-modify-write now runs on the async pool). */
     private final Object[] toggleLocks = new Object[16];
+    /** Monotonic local stamp for toggle writes (R3-03): the async persistence of two
+     * flips must never be able to land in reverse order. */
+    private final java.util.concurrent.atomic.AtomicLong lastToggleStamp =
+            new java.util.concurrent.atomic.AtomicLong();
     /** Request ids a client is answering right now; only one answer may win. */
     private final BoundedIdSet claimedRequests = new BoundedIdSet();
     /** Requests tracked while their target was not resolvable to a player yet. */
@@ -121,6 +125,17 @@ public final class RequestService {
 
     private Object toggleLock(UUID player) {
         return toggleLocks[(player.hashCode() & 0x7fffffff) % toggleLocks.length];
+    }
+
+    /** Strictly increasing wall-clock stamp used for toggle replication (R3-03). */
+    private long nextToggleStamp() {
+        long previous;
+        long next;
+        do {
+            previous = lastToggleStamp.get();
+            next = Math.max(System.currentTimeMillis(), previous + 1L);
+        } while (!lastToggleStamp.compareAndSet(previous, next));
+        return next;
     }
 
     public void setShowRequestHandler(Consumer<TpRequest> handler) {
@@ -422,8 +437,15 @@ public final class RequestService {
         switch (response) {
             case ACCEPT -> messages.send(target, "tpa.accepted-target", "player", request.requesterName);
             case DENY -> messages.send(target, "tpa.denied-target", "player", request.requesterName);
-            case BLOCK -> messages.send(target, "tpa.blocked-target", "player", request.requesterName,
-                    "minutes", blockMinutesLabel());
+            case BLOCK -> {
+                if (config.tpa.blockDurationMinutes <= 0) {
+                    // A permanent block must not read as "0 minutes" (I-R3-04).
+                    messages.send(target, "tpa.blocked-permanent-target", "player", request.requesterName);
+                } else {
+                    messages.send(target, "tpa.blocked-target", "player", request.requesterName,
+                            "minutes", blockMinutesLabel());
+                }
+            }
             case FAILED -> {
                 // Never produced by an answer; handled for exhaustiveness.
             }
@@ -515,11 +537,15 @@ public final class RequestService {
         syncBus.publish(event);
     }
 
-    private void storeIgnore(UUID blocker, UUID blocked, int minutes) {
+    /** Stores the ignore row locally and only then replicates it: a failed local
+     * write must not be announced to the network as a successful block (I-R3-05). */
+    private boolean storeIgnore(UUID blocker, UUID blocked, int minutes) {
         long expiresAt = minutes <= 0 ? IgnoreEntry.PERMANENT
                 : System.currentTimeMillis() + minutes * 60_000L;
         long createdAt = System.currentTimeMillis();
-        applyIgnore(new IgnoreEntry(blocker.toString(), blocked.toString(), expiresAt, createdAt));
+        if (!applyIgnore(new IgnoreEntry(blocker.toString(), blocked.toString(), expiresAt, createdAt))) {
+            return false;
+        }
         if (syncBus.crossServer()) {
             SyncEvent event = SyncEvent.create(SyncEvent.Type.IGNORE_SET, serverId);
             event.blockerUuid = blocker.toString();
@@ -528,6 +554,7 @@ public final class RequestService {
             event.createdAt = createdAt;
             syncBus.publish(event);
         }
+        return true;
     }
 
     public void toggle(Player player) {
@@ -543,7 +570,9 @@ public final class RequestService {
             // would otherwise both read the same value and write the same flip.
             synchronized (toggleLock(id)) {
                 next = !profiles.tpaEnabledFor(id);
-                profiles.setTpaEnabled(id, next);
+                // Stamp taken inside the lock: two flips are strictly ordered even when
+                // they happen in the same millisecond (R3-03).
+                profiles.setTpaEnabled(id, next, nextToggleStamp());
             }
             boolean flipped = next;
             tasks.entity(player,
@@ -580,7 +609,12 @@ public final class RequestService {
             // The local row and the replicated event must carry the same creation
             // stamp, otherwise the origin and its peers disagree on the LWW order.
             long createdAt = System.currentTimeMillis();
-            applyIgnore(new IgnoreEntry(blockerId.toString(), blocked.toString(), expiresAt, createdAt));
+            if (!applyIgnore(new IgnoreEntry(blockerId.toString(), blocked.toString(), expiresAt, createdAt))) {
+                // No local row means no replication; do not report a block that was
+                // never stored (I-R3-05).
+                plugin.getSLF4JLogger().warn("Block for {} was not persisted; nothing was published", targetName);
+                return;
+            }
             if (syncBus.crossServer()) {
                 SyncEvent event = SyncEvent.create(SyncEvent.Type.IGNORE_SET, serverId);
                 event.blockerUuid = blockerId.toString();
@@ -922,16 +956,17 @@ public final class RequestService {
         if (!withinLifetime(request) || answeredRequests.contains(request.id)) {
             return;
         }
-        clearOutgoing(request.requesterUuid, request.id);
         tasks.entity(requester, () -> {
-            // Same-request identity is re-checked at execution time: the answer may
-            // have been superseded while the task waited for the requester's thread.
+            // The identity check must run BEFORE the entry is removed: clearOutgoing
+            // deletes the very entry being checked, so doing it first made every
+            // ACCEPT look superseded and silently dropped cross-server accepts (R3-01).
             if (parsed == Response.ACCEPT) {
                 TpRequest tracked = requesterId == null ? null : outgoingRequests.get(requesterId);
                 if (tracked == null || !tracked.id.equals(request.id)) {
                     return;
                 }
             }
+            clearOutgoing(request.requesterUuid, request.id);
             switch (parsed) {
                 case ACCEPT -> {
                     messages.send(requester, "tpa.accepted-requester", "player", request.targetName);
@@ -1026,11 +1061,14 @@ public final class RequestService {
         }
     }
 
-    private void applyIgnore(IgnoreEntry entry) {
+    /** @return true when the local row was written */
+    private boolean applyIgnore(IgnoreEntry entry) {
         try {
             database.addIgnore(entry);
+            return true;
         } catch (Exception e) {
             plugin.getSLF4JLogger().warn("Failed to store ignore entry", e);
+            return false;
         }
     }
 

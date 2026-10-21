@@ -14,9 +14,15 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
  * Pins the event-frame contract between this module and
- * {@link ProxyMessages#encodeEventsBatch(List)}: both must produce the exact
- * same bytes for the same event objects, otherwise a backend would have to
- * trust two different encoders.
+ * {@link ProxyMessages#encodeEventsBatch(List)}: for Gson's default escaping
+ * output both must produce the exact same bytes, otherwise a backend would have
+ * to trust two different encoders.
+ *
+ * <p>This byte-level equality is a producer-side guarantee, not a wire
+ * requirement: {@code ProxyMessages.sign} re-serializes the message (decode ->
+ * canonical form -> toString) after this frame is composed, so the receiver
+ * always sees a frame produced by the signer. The assertions here keep the two
+ * encoders aligned for the case where the frame is used without re-signing.
  */
 class EventsFrameTest {
 

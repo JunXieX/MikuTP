@@ -203,7 +203,20 @@ public final class ProfileService {
         }
     }
 
+    /** Toggles the flag, stamping it with the local wall clock. */
     public void setTpaEnabled(UUID uuid, boolean enabled) {
+        setTpaEnabled(uuid, enabled, System.currentTimeMillis());
+    }
+
+    /**
+     * Toggles the replicated flag with a caller-supplied monotonic stamp.
+     *
+     * <p>The stamp is the tpa_updated_at clock: callers that already hold a newer
+     * stamp pass it in so a local flip cannot be rejected by a future-stamped
+     * snapshot from another backend (R3-03). The identity clock stays local: it only
+     * orders name/last-online replication.
+     */
+    public void setTpaEnabled(UUID uuid, boolean enabled, long stamp) {
         // Optimistic cache update; the previous value is kept so a failed write can
         // put it back instead of leaving the cache claiming a toggle the database
         // never stored (R2-08).
@@ -211,31 +224,69 @@ public final class ProfileService {
         // Resolve the name on the caller's thread: this async task must not read
         // Bukkit's player view, which Folia confines to the owning region thread.
         String name = onlinePlayers.nameOf(uuid);
-        long stamped = System.currentTimeMillis();
+        long identityStamp = System.currentTimeMillis();
         tasks.async(() -> {
-            long applied;
+            // Upsert first: a toggle that races the join-time profile write must not
+            // be lost to an UPDATE that matched no row yet.
             try {
-                // Upsert first: a toggle that races the join-time profile write must
-                // not be lost to an UPDATE that matched no row yet. The identity
-                // stamp keeps name resolution ordered; the toggle carries its own
-                // tpaUpdatedAt stamp so it is never rejected by the identity clock.
                 String knownName = name == null ? "" : name;
-                database.upsertPlayer(uuid.toString(), knownName, stamped);
-                applied = System.currentTimeMillis();
-                database.runTransaction(tx -> tx.setTpaEnabled(uuid.toString(), enabled, applied));
+                database.upsertPlayer(uuid.toString(), knownName, identityStamp);
             } catch (Exception e) {
-                plugin.getSLF4JLogger().warn("Failed to persist tpa toggle", e);
-                // Roll the optimistic cache update back, but only while it is still
-                // this attempt's value: a newer /tpatoggle must win.
-                if (previous == null) {
-                    tpaEnabled.remove(uuid, enabled);
-                } else {
-                    tpaEnabled.replace(uuid, enabled, previous);
-                }
+                plugin.getSLF4JLogger().warn("Failed to persist the profile of {}", uuid, e);
+                rollbackToggle(uuid, enabled, previous);
                 return;
             }
-            publishProfile(uuid, name, stamped, enabled, true, applied);
+            long effectiveStamp = stamp;
+            int updated;
+            try {
+                updated = writeToggle(uuid, enabled, effectiveStamp);
+            } catch (Exception e) {
+                plugin.getSLF4JLogger().warn("Failed to persist tpa toggle", e);
+                rollbackToggle(uuid, enabled, previous);
+                return;
+            }
+            if (updated == 0) {
+                // A snapshot carrying a newer tpa_updated_at (a future-stamped peer,
+                // or a concurrent flip) won the SQL guard. Retry once with a stamp
+                // that is guaranteed to win, so the cache and the broadcast never
+                // disagree with the database about which write took effect (N-2).
+                long retryStamp;
+                try {
+                    var row = database.getPlayer(uuid.toString()).orElse(null);
+                    retryStamp = Math.max(System.currentTimeMillis(),
+                            (row == null ? 0L : row.tpaUpdatedAt) + 1L);
+                    updated = writeToggle(uuid, enabled, retryStamp);
+                } catch (Exception e) {
+                    plugin.getSLF4JLogger().warn("Failed to persist tpa toggle on retry", e);
+                    rollbackToggle(uuid, enabled, previous);
+                    return;
+                }
+                effectiveStamp = retryStamp;
+                if (updated == 0) {
+                    // Practically unreachable (the retry stamp is newer than the row
+                    // we read); keep the cache and the broadcast on the same stamp and
+                    // make the anomaly visible instead of silently diverging.
+                    plugin.getSLF4JLogger().warn(
+                            "Tpa toggle for {} could not be stored even after a stamped retry; "
+                                    + "broadcasting it with stamp {}", uuid, effectiveStamp);
+                }
+            }
+            publishProfile(uuid, name, identityStamp, enabled, true, effectiveStamp);
         });
+    }
+
+    /** One transactional write of the toggle; returns the number of updated rows. */
+    private int writeToggle(UUID uuid, boolean enabled, long at) throws java.sql.SQLException {
+        return database.transaction(tx -> tx.setTpaEnabled(uuid.toString(), enabled, at));
+    }
+
+    /** Restores the optimistic cache value when the write failed (only if still ours). */
+    private void rollbackToggle(UUID uuid, boolean attempted, Boolean previous) {
+        if (previous == null) {
+            tpaEnabled.remove(uuid, attempted);
+        } else {
+            tpaEnabled.replace(uuid, attempted, previous);
+        }
     }
 
     private void publishProfile(UUID uuid, String name, long lastOnline, boolean tpaEnabled,

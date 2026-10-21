@@ -67,7 +67,7 @@ public final class MikuTPVelocity {
      * Must equal the Gradle {@code version} in the root build script; the CI
      * "Verify versions agree" step fails the build when the two drift apart.
      */
-    public static final String VERSION = "1.6.3";
+    public static final String VERSION = "1.6.4";
 
     private static final MinecraftChannelIdentifier CHANNEL =
             MinecraftChannelIdentifier.create("mikumc", "mikutp");
@@ -135,6 +135,8 @@ public final class MikuTPVelocity {
     private volatile boolean warnedRejected = false;
     private volatile boolean warnedSendFailure = false;
     private volatile boolean warnedMalformed = false;
+    /** One-shot warning for a handoff dropped after the destination refused it. */
+    private volatile boolean warnedDroppedHandoff = false;
     /** Periodic expiry sweep; cancelled on shutdown. */
     private com.velocitypowered.api.scheduler.ScheduledTask sweepTask;
     /** Periodic backlog pump; cancelled on shutdown. */
@@ -439,7 +441,11 @@ public final class MikuTPVelocity {
                 if (destServer.equals(connection.getServerInfo().getName())
                         && pendingEntries.remove(id, entry)
                         && !send(connection, ProxyMessages.encodePending(uuid, payload, 0))) {
-                    pendingEntries.putIfAbsent(id, entry);
+                    // The player is already on the destination but the frame was
+                    // refused (closed/retired connection). Re-queueing would only
+                    // retry on a later ServerConnected, which is not guaranteed and
+                    // could fire on an unrelated switch, so drop it and surface it.
+                    warnDroppedHandoff(id);
                 }
             });
         }
@@ -757,7 +763,10 @@ public final class MikuTPVelocity {
             return;
         }
         if (!send(connection, ProxyMessages.encodePending(uuid.toString(), entry.payload(), 0))) {
-            pendingEntries.putIfAbsent(uuid, entry);
+            // Same policy as the immediate path: the player is on the destination
+            // now and the frame was refused, so do not keep a handoff that could
+            // only resurface later as an unexpected teleport.
+            warnDroppedHandoff(uuid);
         }
     }
 
@@ -1098,6 +1107,10 @@ public final class MikuTPVelocity {
         Optional<Player> player = parsePlayer(playerUuid);
         Optional<RegisteredServer> target = server.getServer(serverName);
         if (player.isEmpty()) {
+            // The connect can never happen, so the handoff it belongs to must not
+            // survive: a later manual switch could otherwise consume it as a stale,
+            // unexpected teleport (same rule as the failure paths below).
+            dropPending(playerUuid);
             return;
         }
         if (target.isEmpty()) {
@@ -1213,6 +1226,16 @@ public final class MikuTPVelocity {
         } catch (Exception e) {
             warnSendFailure(e);
             return false;
+        }
+    }
+
+    private void warnDroppedHandoff(UUID player) {
+        if (warnedDroppedHandoff) {
+            logger.debug("Dropped a cross-server handoff for {}: the destination connection refused the frame", player);
+        } else {
+            warnedDroppedHandoff = true;
+            logger.warn("Dropped a cross-server handoff for {}: the destination connection refused the frame; "
+                    + "that teleport will not be applied", player);
         }
     }
 
