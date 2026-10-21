@@ -444,7 +444,7 @@ class DatabaseTest {
 
     /** m-02: a nested pooled-connection acquire would block until the pool timeout. */
     @Test
-    void nestedDatabaseCallInsideTransactionFailsFast() {
+    void nestedDatabaseCallInsideTransactionFailsFast() throws Exception {
         assertThrows(IllegalStateException.class, () -> database.runTransaction(tx -> {
             database.getPlayer("uuid-a");
         }));
