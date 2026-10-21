@@ -23,6 +23,9 @@ import java.util.UUID;
 public final class TeleportService {
 
     private static final int PENDING_TTL_SECONDS = 300;
+    /** Request flows only need a minute: the acceptance is applied within the warmup
+     * + server-switch window, and a stale handoff must not fire on a later switch. */
+    private static final int REQUEST_PENDING_TTL_SECONDS = 60;
 
     private final JavaPlugin plugin;
     private final Tasks tasks;
@@ -148,7 +151,13 @@ public final class TeleportService {
     /** A buffered handoff is only useful while it is fresh. */
     private static boolean expired(PendingTeleport pending) {
         return pending.createdAt > 0
-                && System.currentTimeMillis() - pending.createdAt > PENDING_TTL_SECONDS * 1000L;
+                && System.currentTimeMillis() - pending.createdAt > pendingTtlSeconds(pending.source) * 1000L;
+    }
+
+    /** TTL of one handoff: request flows use the short window, everything else the full one. */
+    private static int pendingTtlSeconds(PendingTeleport.Source source) {
+        return source == PendingTeleport.Source.TPA || source == PendingTeleport.Source.TPA_HERE
+                ? REQUEST_PENDING_TTL_SECONDS : PENDING_TTL_SECONDS;
     }
 
     /** Consumes a buffered cross-server handoff for a player who just arrived. */
@@ -698,7 +707,7 @@ public final class TeleportService {
                 try {
                     PendingTeleport pending = new PendingTeleport(playerToTeleport.toString(), here,
                             source, System.currentTimeMillis(), positionOwner.toString());
-                    syncBus.pendingStore(playerToTeleport, pending, PENDING_TTL_SECONDS);
+                    syncBus.pendingStore(playerToTeleport, pending, pendingTtlSeconds(source));
                     runQuietly(onSuccess);
                 } catch (Exception e) {
                     plugin.getSLF4JLogger().warn("Failed to stash cross-server destination", e);

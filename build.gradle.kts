@@ -1,4 +1,4 @@
 allprojects {
     group = "com.mikumc"
-    version = "1.6.4"
+    version = "1.7.0"
 }

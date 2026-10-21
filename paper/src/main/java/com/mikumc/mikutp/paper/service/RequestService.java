@@ -364,25 +364,32 @@ public final class RequestService {
             clearOutgoing(request.requesterUuid, request.id);
             // Keep the "latest" pointer off a request that no longer exists.
             lastIncoming.remove(target.getUniqueId(), request.id);
-            if (response == Response.BLOCK) {
+            Response answer = response;
+            if (answer == Response.BLOCK) {
                 // A blocking answer also writes an ignore entry: database work
                 // belongs on this async thread, not the target's region thread.
                 UUID blocker = parseUuid(request.targetUuid);
                 UUID blocked = parseUuid(request.requesterUuid);
-                if (blocker != null && blocked != null) {
-                    storeIgnore(blocker, blocked, config.tpa.blockDurationMinutes);
+                if (blocker == null || blocked == null
+                        || !storeIgnore(blocker, blocked, config.tpa.blockDurationMinutes)) {
+                    // A block that was not persisted must not be announced as a
+                    // successful one: fall back to the normal deny path (R4-02).
+                    plugin.getSLF4JLogger().warn("Block for request {} was not stored; treating it as DENY",
+                            request.id);
+                    answer = Response.DENY;
                 }
             }
+            final Response finalAnswer = answer;
             // Feedback (sound + messages) touches the target's entity state, so it
             // runs on the target's own thread (unless we are already on it).
             if (tasks.owns(target)) {
-                respondCommon(target, request, response);
+                respondCommon(target, request, finalAnswer);
             } else {
                 // A retiring entity must not swallow the answer: the player did click
                 // the button, so the hand-off still has to reach the requester.
                 tasks.entity(target,
-                        () -> respondCommon(target, request, response),
-                        () -> respondDetached(target.getUniqueId(), request, response));
+                        () -> respondCommon(target, request, finalAnswer),
+                        () -> respondDetached(target.getUniqueId(), request, finalAnswer));
             }
         });
     }

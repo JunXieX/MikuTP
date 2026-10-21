@@ -67,7 +67,7 @@ public final class MikuTPVelocity {
      * Must equal the Gradle {@code version} in the root build script; the CI
      * "Verify versions agree" step fails the build when the two drift apart.
      */
-    public static final String VERSION = "1.6.4";
+    public static final String VERSION = "1.7.0";
 
     private static final MinecraftChannelIdentifier CHANNEL =
             MinecraftChannelIdentifier.create("mikumc", "mikutp");
@@ -1119,6 +1119,7 @@ public final class MikuTPVelocity {
             send(source, ProxyMessages.encodeConnectResult(false, "unknown_server"));
             return;
         }
+        dropStalePending(playerUuid, target.get().getServerInfo().getName());
         player.get().createConnectionRequest(target.get()).connect().whenComplete((result, error) -> {
             if (error != null) {
                 logger.warn("Connect of {} to {} failed: {}", player.get().getUsername(), serverName,
@@ -1145,6 +1146,7 @@ public final class MikuTPVelocity {
             send(source, ProxyMessages.encodeConnectResult(false, "anchor_offline"));
             return;
         }
+        dropStalePending(playerUuid, anchorServer.get().getServer().getServerInfo().getName());
         player.get().createConnectionRequest(anchorServer.get().getServer()).connect().whenComplete((result, error) -> {
             if (error != null) {
                 logger.warn("Anchor connect of {} failed: {}", player.get().getUsername(), error.getMessage());
@@ -1155,6 +1157,31 @@ public final class MikuTPVelocity {
                 send(source, ProxyMessages.encodeConnectResult(false, result.getStatus().name()));
             }
         });
+    }
+
+    /**
+     * Drops a handoff whose recorded destination is not the server this connect is
+     * actually going to (the target server changed inside the stash->connect
+     * window). The payload could never be applied there, and keeping it would let a
+     * later manual switch consume it as an unexpected late teleport. Anchor-only
+     * handoffs (destServer == null) are left to the anchorServer logic.
+     */
+    private void dropStalePending(String playerUuid, String actualServer) {
+        if (playerUuid == null || actualServer == null) {
+            return;
+        }
+        try {
+            UUID id = UUID.fromString(playerUuid);
+            PendingEntry entry = pendingEntries.get(id);
+            if (entry != null && entry.destServer() != null
+                    && !entry.destServer().equals(actualServer)
+                    && pendingEntries.remove(id, entry)) {
+                logger.debug("Dropped a stale cross-server handoff for {}: destination {} but connect target {}",
+                        playerUuid, entry.destServer(), actualServer);
+            }
+        } catch (IllegalArgumentException ignored) {
+            // Not a uuid: nothing can be keyed by it.
+        }
     }
 
     /**

@@ -30,7 +30,9 @@ public final class VelocitySyncBus implements SyncBus {
 
     private static final int FLUSH_INTERVAL_MS = 150;
     /** 48 ops stay below Bukkit's 32767-byte plugin-message cap even for the largest
-     * event kind (worst case ~27KB for a full TP_NEW batch). */
+     * event kind (measured: 48 TP_CANCEL ops ≈31,173B = 827B under the 32,000
+     * budget / 1,594B under the 32,767 cap; 48 TP_NEW ≈31,029B). Anything that still
+     * exceeds MAX_FRAME_BYTES is split defensively below. */
     private static final int MAX_OPS_PER_BATCH = 48;
     /** Bukkit caps one plugin message at 32767 bytes; stay clear of the edge. */
     private static final int MAX_FRAME_BYTES = 32_000;
@@ -160,8 +162,11 @@ public final class VelocitySyncBus implements SyncBus {
                 // Bukkit rejects frames over 32767 bytes; hand the tail to the next
                 // flush instead of retrying the same oversized poison pill forever.
                 int half = ops.size() / 2;
-                send(new ArrayList<>(ops.subList(0, half)));
+                // Requeue the tail BEFORE recursing: a nested split inside the head
+                // would otherwise push its (older) tail behind this outer tail and
+                // invert the order (L1).
                 requeue(ops.subList(half, ops.size()), false);
+                send(new ArrayList<>(ops.subList(0, half)));
                 return;
             }
             plugin.getSLF4JLogger().warn("Dropping one oversized sync op ({} bytes)", payload.length);
