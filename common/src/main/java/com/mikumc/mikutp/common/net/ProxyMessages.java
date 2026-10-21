@@ -165,14 +165,28 @@ public final class ProxyMessages {
         return op;
     }
 
-    /** Bus op handing a pending teleport payload to the proxy. */
-    public static JsonObject pendingOp(String playerUuid, String payloadJson, int ttlSeconds) {
+    /**
+     * Bus op handing a pending teleport payload to the proxy.
+     *
+     * @param destServer when non-null, the proxy only delivers the handoff on
+     *                   that server (member {@code server}); null keeps the old
+     *                   "deliver wherever the player lands" behaviour
+     */
+    public static JsonObject pendingOp(String playerUuid, String payloadJson, int ttlSeconds, String destServer) {
         JsonObject op = new JsonObject();
         op.addProperty("k", "pending");
         op.addProperty("uuid", playerUuid);
         op.addProperty("payload", payloadJson);
         op.addProperty("ttl", ttlSeconds);
+        if (destServer != null) {
+            op.addProperty("server", destServer);
+        }
         return op;
+    }
+
+    /** Compatibility overload: pending op without a destination server. */
+    public static JsonObject pendingOp(String playerUuid, String payloadJson, int ttlSeconds) {
+        return pendingOp(playerUuid, payloadJson, ttlSeconds, null);
     }
 
     /** Hands a pending teleport payload to the proxy for the arriving player. */
@@ -228,10 +242,14 @@ public final class ProxyMessages {
 
     /**
      * Signs {@code json} in place: the signature covers a canonical form of the
-     * message without the {@code sig} member. A blank token produces an
-     * unauthenticated message, which every receiver rejects.
+     * message without the {@code sig} member. Without a token the message is
+     * returned verbatim: an empty-key HMAC would look like a valid signature
+     * while every receiver rejects it anyway (and it must never throw).
      */
     public static String sign(String json, String token) {
+        if (json == null || token == null || token.isBlank()) {
+            return json;
+        }
         JsonObject o = decode(json);
         if (o == null) {
             return json;

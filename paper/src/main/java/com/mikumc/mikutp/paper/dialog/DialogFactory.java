@@ -78,13 +78,24 @@ public final class DialogFactory {
         Component body = messages.render(target,
                 request.type == TpRequest.Type.COME ? "dialog.request.body-come" : "dialog.request.body-go",
                 "player", request.requesterName);
+        int blockMinutes = blockDurationMinutes.getAsInt();
+        Component blockLabel;
+        if (blockMinutes <= 0) {
+            // 0 (or less) means "until unblocked": rendering the configured number
+            // would advertise "block for 0 minutes" while the action is permanent.
+            blockLabel = messages.has("dialog.request.block-permanent")
+                    ? messages.render(target, "dialog.request.block-permanent")
+                    : messages.render(target, "dialog.request.block", "minutes", "0");
+        } else {
+            blockLabel = messages.render(target, "dialog.request.block",
+                    "minutes", String.valueOf(blockMinutes));
+        }
         List<ActionButton> buttons = List.of(
                 actionButton(messages.render(target, "dialog.request.accept"), 300,
                         () -> tasks.entity(target, () -> requestService.respond(target, request.id, RequestService.Response.ACCEPT))),
                 actionButton(messages.render(target, "dialog.request.deny"), 300,
                         () -> tasks.entity(target, () -> requestService.respond(target, request.id, RequestService.Response.DENY))),
-                actionButton(messages.render(target, "dialog.request.block",
-                                "minutes", String.valueOf(blockDurationMinutes.getAsInt())), 300,
+                actionButton(blockLabel, 300,
                         () -> tasks.entity(target, () -> requestService.respond(target, request.id, RequestService.Response.BLOCK))));
         Dialog dialog = Dialog.create(b -> b.empty()
                 .base(DialogBase.builder(title)
@@ -142,6 +153,12 @@ public final class DialogFactory {
     // ------------------------------------------------------------------ internals
 
     private void showHomePage(Player viewer, List<Home> homes, int page, Consumer<String> onPick, boolean delete) {
+        if (homes.isEmpty()) {
+            // An empty multi-action dialog gives the player nothing to act on and no
+            // hint how to create a home; the chat fallback already explains it.
+            messages.send(viewer, "home.empty");
+            return;
+        }
         int[] w = window(homes.size(), page);
         List<ActionButton> buttons = new ArrayList<>();
         for (int i = w[2]; i < w[3]; i++) {
@@ -154,6 +171,10 @@ public final class DialogFactory {
     }
 
     private void showWarpPage(Player viewer, List<Warp> warps, int page, Consumer<String> onPick, boolean delete) {
+        if (warps.isEmpty()) {
+            messages.send(viewer, "warp.empty");
+            return;
+        }
         int[] w = window(warps.size(), page);
         List<ActionButton> buttons = new ArrayList<>();
         for (int i = w[2]; i < w[3]; i++) {

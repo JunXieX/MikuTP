@@ -11,6 +11,7 @@ import java.nio.file.Path;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class ConfigIOTest {
@@ -64,6 +65,69 @@ class ConfigIOTest {
 
         assertEquals(7, config.teleport.warmupSeconds);
         assertEquals("mikutp_", config.storage.tablePrefix);
+    }
+
+    // ------------------------------------------------------------------ strict loader (M-04)
+
+    /** A valid file is read without writing anything to disk. */
+    @Test
+    void strictLoadReadsWithoutWriting() throws IOException {
+        Path file = dir.resolve("config.yml");
+        Files.writeString(file, """
+                teleport:
+                  warmup_seconds: 7
+                home:
+                  default_limit: 9
+                """);
+        java.nio.file.attribute.FileTime before =
+                Files.getLastModifiedTime(file);
+
+        MikuTPConfig config = ConfigIO.loadStrict(file, MikuTPConfig.class);
+
+        assertEquals(7, config.teleport.warmupSeconds);
+        assertEquals(9, config.home.defaultLimit);
+        assertEquals(before, Files.getLastModifiedTime(file), "strict load must not rewrite the file");
+    }
+
+    @Test
+    void strictLoadRejectsMissingFile() {
+        assertThrows(IOException.class,
+                () -> ConfigIO.loadStrict(dir.resolve("absent.yml"), MikuTPConfig.class));
+    }
+
+    @Test
+    void strictLoadRejectsSyntaxError() throws IOException {
+        Path file = dir.resolve("config.yml");
+        Files.writeString(file, "teleport:\n  warmup_seconds: [unclosed\n");
+        assertThrows(IOException.class, () -> ConfigIO.loadStrict(file, MikuTPConfig.class));
+    }
+
+    /** A typo in the type of a value must not be silently replaced by the default. */
+    @Test
+    void strictLoadRejectsWrongType() throws IOException {
+        Path file = dir.resolve("config.yml");
+        Files.writeString(file, """
+                teleport:
+                  warmup_seconds: not-a-number
+                """);
+        assertThrows(IOException.class, () -> ConfigIO.loadStrict(file, MikuTPConfig.class));
+    }
+
+    @Test
+    void strictLoadRejectsNonMappingRoot() throws IOException {
+        Path file = dir.resolve("config.yml");
+        Files.writeString(file, "- not\n- a mapping\n");
+        assertThrows(IOException.class, () -> ConfigIO.loadStrict(file, MikuTPConfig.class));
+    }
+
+    /** The strict loader still accepts a valid subset (missing keys keep defaults). */
+    @Test
+    void strictLoadAcceptsPartialFile() throws IOException {
+        Path file = dir.resolve("config.yml");
+        Files.writeString(file, "home:\n  default_limit: 3\n");
+        MikuTPConfig config = ConfigIO.loadStrict(file, MikuTPConfig.class);
+        assertEquals(3, config.home.defaultLimit);
+        assertEquals(5000, config.wild.maxRadius);
     }
 
     /** YAML may hand back a quoted scalar as a String; it must still be applied. */

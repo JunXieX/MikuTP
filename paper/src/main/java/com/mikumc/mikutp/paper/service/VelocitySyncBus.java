@@ -30,9 +30,11 @@ public final class VelocitySyncBus implements SyncBus {
 
     private static final int FLUSH_INTERVAL_MS = 150;
     private static final int MAX_OPS_PER_BATCH = 64;
-    /** Upper bound for queued batches on a server with no other players; the
-     * activation resync re-converges state, so dropping the oldest is safe. */
-    private static final int MAX_QUEUED_BATCHES = 4096;
+    /** Upper bound for queued ops on a server with no players to carry them: the
+     * activation resync re-converges state, so dropping the oldest is safe. Kept
+     * near the size of one full-state dump instead of the 262144 ops a
+     * batch-count bound would allow (each op is a live JsonObject). */
+    private static final int MAX_QUEUED_OPS = 8192;
 
     private final JavaPlugin plugin;
     private final Tasks tasks;
@@ -42,6 +44,9 @@ public final class VelocitySyncBus implements SyncBus {
     /** Mirrors {@code outbound.size()}; guarded by the queue monitor so it can
      * never drift from the real depth. */
     private int queuedOps;
+    /** Carrier kept across flushes while it stays online, so consecutive batches
+     * ride one connection and reach the proxy in order. */
+    private volatile UUID stickyCarrier;
     private volatile boolean running;
     private ScheduledTask flushTask;
 
@@ -75,8 +80,13 @@ public final class VelocitySyncBus implements SyncBus {
 
     @Override
     public void pendingStore(UUID player, PendingTeleport pending, int ttlSeconds) {
+        // The proxy must know where the handoff applies: without the destination it
+        // hands the payload to whichever server the player is still connected to
+        // (the source), where it can never be applied and is then forgotten.
+        String destServer = pending == null || pending.position == null
+                ? null : pending.position.server;
         enqueue(ProxyMessages.pendingOp(player.toString(),
-                ConfigIO.gson().toJson(pending), ttlSeconds));
+                ConfigIO.gson().toJson(pending), ttlSeconds, destServer));
     }
 
     /** Stops the flush loop; queued events are dropped (a restart triggers a
@@ -90,10 +100,6 @@ public final class VelocitySyncBus implements SyncBus {
     }
 
     // ------------------------------------------------------------------ internals
-
-    /** Bounded by MAX_QUEUED_BATCHES*MAX_OPS_PER_BATCH ops; the oldest are shed
-     * when the queue is full (the activation resync re-converges state). */
-    private static final int MAX_QUEUED_OPS = MAX_QUEUED_BATCHES * MAX_OPS_PER_BATCH;
 
     private void enqueue(com.google.gson.JsonObject op) {
         // Enqueue and shedding share one lock with the drain below, so the depth
@@ -135,31 +141,60 @@ public final class VelocitySyncBus implements SyncBus {
         send(ProxyMessages.sign(ProxyMessages.encodeBusBatch(ops), token), ops);
     }
 
-    /** Picks any online player as the carrier; without one the ops go back to
-     * the front of the queue and ride along with the next activation resync.
-     * The lookup uses the plugin's own registry: this runs on the async flush
-     * thread, where Folia does not allow iterating Bukkit's player view. */
+    /** Sends the batch through the sticky carrier; without one the ops go back to
+     * the front of the queue and ride along with the next activation resync. The
+     * lookup uses the plugin's own registry: this runs on the async flush thread,
+     * where Folia does not allow iterating Bukkit's player view. */
     private void send(String batchJson, List<com.google.gson.JsonObject> ops) {
-        Player carrier = onlinePlayers.any();
+        Player carrier = stickyCarrierPlayer();
         if (carrier == null) {
             requeue(ops);
             return;
         }
-        // A retired scheduler (entity removed before the task ran) means the
-        // carrier is gone: the retired callback puts the batch back instead of
-        // letting it vanish. Note the API gives no "already retired" signal at
-        // scheduling time, so a batch scheduled against a gone entity is covered
-        // by the retired callback only when the scheduler still had it queued.
-        tasks.entity(carrier, () -> {
-            if (!carrier.isOnline()) {
-                // The carrier vanished between the lookup and the send; without
-                // this the batch would be lost instead of retried.
-                requeue(ops);
-                return;
+        byte[] payload = batchJson.getBytes(java.nio.charset.StandardCharsets.UTF_8);
+        // A retired scheduler (entity removed before the task ran) means the carrier
+        // is gone: the retired callback puts the batch back instead of letting it
+        // vanish. A failing send does the same, otherwise one exception would
+        // silently drop a whole batch of events and pending handoffs.
+        try {
+            tasks.entity(carrier, () -> {
+                if (!carrier.isOnline()) {
+                    // The carrier vanished between the lookup and the send; without
+                    // this the batch would be lost instead of retried.
+                    requeue(ops);
+                    return;
+                }
+                try {
+                    carrier.sendPluginMessage(plugin, ProxyMessages.CHANNEL, payload);
+                } catch (Exception e) {
+                    plugin.getSLF4JLogger().warn("Failed to send a sync batch ({} ops); re-queueing",
+                            ops.size(), e);
+                    requeue(ops);
+                }
+            }, () -> requeue(ops));
+        } catch (RuntimeException e) {
+            plugin.getSLF4JLogger().warn("Failed to schedule a sync batch ({} ops); re-queueing",
+                    ops.size(), e);
+            requeue(ops);
+        }
+    }
+
+    /**
+     * Keeps one carrier while it stays online: consecutive batches then travel on
+     * the same connection and reach the proxy in order. Picking a different player
+     * on every flush could reorder batches across Netty threads.
+     */
+    private Player stickyCarrierPlayer() {
+        UUID current = stickyCarrier;
+        if (current != null) {
+            Player player = onlinePlayers.byId(current);
+            if (player != null) {
+                return player;
             }
-            carrier.sendPluginMessage(plugin, ProxyMessages.CHANNEL,
-                    batchJson.getBytes(java.nio.charset.StandardCharsets.UTF_8));
-        }, () -> requeue(ops));
+        }
+        Player next = onlinePlayers.any();
+        stickyCarrier = next == null ? null : next.getUniqueId();
+        return next;
     }
 
     /** Puts a drained batch back at the head of the queue, preserving order. */
@@ -169,6 +204,13 @@ public final class VelocitySyncBus implements SyncBus {
                 outbound.addFirst(ops.get(i));
             }
             queuedOps += ops.size();
+            // A retry must not push the queue past the same bound enqueue() uses.
+            while (queuedOps > MAX_QUEUED_OPS) {
+                if (outbound.pollLast() == null) {
+                    break;
+                }
+                queuedOps--;
+            }
         }
     }
 }

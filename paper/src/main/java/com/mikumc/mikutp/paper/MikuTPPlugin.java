@@ -37,6 +37,7 @@ import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.List;
 import java.util.UUID;
 
 /** Plugin entry point; wires storage, the sync bus, services, commands and hooks. */
@@ -61,6 +62,7 @@ public final class MikuTPPlugin extends JavaPlugin {
     private ChatMenus chats;
     private SyncCoordinator coordinator;
     private MikuTPExpansion expansion;
+    private PlayerLifecycle lifecycle;
     private boolean papiAvailable;
 
     @Override
@@ -70,12 +72,20 @@ public final class MikuTPPlugin extends JavaPlugin {
         // covers the case where it exists but failed to enable.
         papiAvailable = getServer().getPluginManager().isPluginEnabled("PlaceholderAPI");
         try {
-            loadConfiguration(true);
-        } catch (IOException e) {
-            getSLF4JLogger().error("Failed to load configuration, disabling plugin", e);
+            config = parseConfig();
+            messages = createMessageService(config);
+        } catch (Exception e) {
+            // Never continue on built-in defaults: a changed table prefix would open
+            // a second database and split the player data. Fail loudly instead.
+            getSLF4JLogger().error(
+                    "Failed to load {}; the plugin will not start until the file is fixed "
+                            + "(built-in defaults are intentionally not used as a fallback).",
+                    getDataFolder().toPath().resolve("config.yml"), e);
             getServer().getPluginManager().disablePlugin(this);
             return;
         }
+        logConfigNotes(config);
+        logValidationProblems(config);
 
         try {
             database = StorageFactory.create(getDataFolder().toPath(), config);
@@ -126,21 +136,15 @@ public final class MikuTPPlugin extends JavaPlugin {
                 wildService, teleports, dialogs, chats, onlinePlayers, tasks, this::reloadAll, coordinator::resync,
                 this::infoLine, () -> config.dialogs.enabled, config).register();
 
-        getServer().getPluginManager().registerEvents(
-                new PlayerLifecycle(profiles, homeService, requestService, teleports, cooldowns, coordinator,
-                        onlinePlayers), this);
+        lifecycle = new PlayerLifecycle(profiles, homeService, requestService, teleports, cooldowns,
+                coordinator, onlinePlayers);
+        getServer().getPluginManager().registerEvents(lifecycle, this);
         getServer().getPluginManager().registerEvents(
                 new WarmupGuard(teleports.warmups(), config), this);
-        // A /reload or late enable finds players already online; seed the registry
-        // from the global region thread, which is allowed to read the player view.
-        // The coordinator's presence counter is seeded too, otherwise the first
-        // join after a reload would look like "first player" and skip the resync.
-        tasks.global(() -> {
-            for (Player player : Bukkit.getOnlinePlayers()) {
-                onlinePlayers.add(player);
-            }
-            coordinator.seedActivePlayers(onlinePlayers.snapshot().size());
-        });
+        // A /reload or late enable finds players already online; rebuild their full
+        // runtime state (profile cache, cooldown bypass, home caches), not just the
+        // registry, because no PlayerJoinEvent fires for them.
+        refreshOnlinePlayers();
 
         if (papiAvailable) {
             expansion = new MikuTPExpansion(this, homeService, warpService, profiles, cooldowns,
@@ -161,6 +165,12 @@ public final class MikuTPPlugin extends JavaPlugin {
         // write still draining from the coordinator.
         if (requestService != null) {
             requestService.shutdown();
+        }
+        if (wildService != null) {
+            wildService.shutdown();
+        }
+        if (teleports != null) {
+            teleports.warmups().shutdown();
         }
         if (coordinator != null) {
             coordinator.close();
@@ -250,76 +260,123 @@ public final class MikuTPPlugin extends JavaPlugin {
                 + " | dialogs=" + (config.dialogs.enabled ? "on" : "off");
     }
 
-    private void reloadAll() {
-        // Transport settings (mode, token, server id) are read once at startup by
-        // the sync bus, the network service and the storage layer. Remember them
-        // so a config edit cannot leave the running instance holding values that
-        // silently differ from what the file now claims.
-        // File IO and YAML parsing run on the async pool: /mtp reload is executed
-        // on a region thread and must not block it.
+    /**
+     * Reloads config.yml and the language file. Parsing happens on the async pool;
+     * the new configuration is only applied after it parsed successfully, so a
+     * broken file always leaves the running configuration untouched.
+     *
+     * @param done receives {@code true} when the reload was applied, {@code false}
+     *             when it failed (the caller reports the result to the sender)
+     */
+    private void reloadAll(java.util.function.Consumer<Boolean> done) {
+        // Transport and storage settings are read once at startup by the running
+        // services, so a reload cannot apply them. Parse first, then reject those
+        // sections explicitly instead of letting config.yml claim new values.
         String oldMode = String.valueOf(config.sync.mode);
         String oldToken = String.valueOf(config.sync.token);
         String oldServerId = String.valueOf(config.crossServer.serverId);
-        // Read once by the running services at startup; a reload cannot apply them.
         String oldPrefix = String.valueOf(config.storage.tablePrefix);
         String oldLanguage = String.valueOf(config.languageFile);
         tasks.async(() -> {
+            MikuTPConfig parsed;
+            MessageBundle bundle;
             try {
-                loadConfiguration(false);
-                String newMode = String.valueOf(config.sync.mode);
-                String newToken = String.valueOf(config.sync.token);
-                String newServerId = String.valueOf(config.crossServer.serverId);
-                if (!oldMode.equalsIgnoreCase(newMode) || !oldToken.equals(newToken)
-                        || !oldServerId.equals(newServerId)) {
-                    config.sync.mode = oldMode;
-                    config.sync.token = oldToken;
-                    config.crossServer.serverId = oldServerId;
-                    getSLF4JLogger().warn("sync.mode / sync.token / cross-server server-id changed in config.yml; "
-                            + "these take effect only after a full server restart and were ignored for now.");
+                parsed = parseConfig();
+                parsed.sync.mode = oldMode;
+                parsed.sync.token = oldToken;
+                parsed.crossServer.serverId = oldServerId;
+                parsed.storage.tablePrefix = oldPrefix;
+                if (!oldLanguage.equals(parsed.languageFile)) {
+                    getSLF4JLogger().warn("language-file changed in config.yml; the running instance keeps "
+                            + "{} until the server restarts", oldLanguage);
+                    parsed.languageFile = oldLanguage;
                 }
-                if (!oldPrefix.equals(config.storage.tablePrefix) || !oldLanguage.equals(config.languageFile)) {
-                    config.storage.tablePrefix = oldPrefix;
-                    config.languageFile = oldLanguage;
-                    getSLF4JLogger().warn("storage.table-prefix / language-file changed in config.yml; "
-                            + "these take effect only after a full server restart and were ignored for now.");
-                }
-                effects.setEnabled(config.teleport.sounds);
-                warpService.reload();
-                getSLF4JLogger().info("MikuTP reloaded (sync mode, server-id and storage changes need a restart)");
-            } catch (IOException e) {
-                getSLF4JLogger().error("Reload failed: {}", e.getMessage());
+                // Semantic problems are reported, not repaired: the operator's file
+                // stays authoritative and every offending value is named in the log.
+                logValidationProblems(parsed);
+                bundle = loadBundle(parsed.languageFile);
+            } catch (Exception e) {
+                // Keep the running configuration intact and report the failure.
+                getSLF4JLogger().error("Reload failed; the running configuration was kept: {}", e.toString());
+                done.accept(false);
+                return;
             }
+            // Apply on the global region thread so command/region readers never see
+            // a configuration that has only been partially copied.
+            tasks.global(() -> {
+                config.copyFrom(parsed);
+                messages.reload(bundle, parsed.parsePlaceholderApi);
+                effects.setEnabled(parsed.teleport.sounds);
+                warpService.reload();
+                refreshOnlinePlayersNow();
+                getSLF4JLogger().info("MikuTP reloaded (sync mode, server-id, table prefix and language file "
+                        + "need a restart)");
+                done.accept(true);
+            });
         });
     }
 
-    /** Reads or creates config.yml and the language file. */
-    private void loadConfiguration(boolean initial) throws IOException {
+    /**
+     * Rebuilds the per-player runtime state of everyone already online. A server
+     * reload (or a late enable) never fires PlayerJoinEvent, so without this the
+     * profile toggle cache, cooldown bypass and home caches would stay empty.
+     */
+    private void refreshOnlinePlayers() {
+        tasks.global(this::refreshOnlinePlayersNow);
+    }
+
+    /** Must run on the global region thread (it reads the player view). */
+    private void refreshOnlinePlayersNow() {
+        for (Player player : Bukkit.getOnlinePlayers()) {
+            onlinePlayers.add(player);
+            if (lifecycle != null) {
+                tasks.entity(player, () -> lifecycle.refresh(player));
+            }
+        }
+        coordinator.seedActivePlayers(onlinePlayers.snapshot().size());
+    }
+
+    /** Parses config.yml, creating the commented default on first start. */
+    private MikuTPConfig parseConfig() throws IOException {
         Path configFile = getDataFolder().toPath().resolve("config.yml");
-        MikuTPConfig loaded;
-        try {
-            loaded = ConfigIO.loadOrCreate(configFile, readResource("config.yml"), MikuTPConfig.class);
-        } catch (Exception e) {
-            // A broken YAML must not take the whole plugin down: fall back to defaults.
-            getSLF4JLogger().error("config.yml 解析失败，已回退到内置默认配置：{}", e.toString());
-            loaded = new MikuTPConfig();
+        if (Files.notExists(configFile)) {
+            return ConfigIO.loadOrCreate(configFile, readResource("config.yml"), MikuTPConfig.class);
         }
-        if (config == null) {
-            config = loaded;
-        } else {
-            config.copyFrom(loaded);
-        }
-        if (loaded.configVersion != MikuTPConfig.CURRENT_VERSION) {
-            getSLF4JLogger().info("config.yml 的 config_version 为 {}（本版本为 {}），建议对照内置默认配置核对新增项",
-                    loaded.configVersion, MikuTPConfig.CURRENT_VERSION);
-        }
+        // Strict parse: a malformed file throws instead of silently keeping defaults.
+        return ConfigIO.loadStrict(configFile, MikuTPConfig.class);
+    }
+
+    /** Bundled message defaults plus the configured override file. */
+    private MessageBundle loadBundle(String languageFile) throws IOException {
         MessageBundle bundle = new MessageBundle(readResource("messages_zh_cn.json"));
-        bundle.loadOverrides(getDataFolder().toPath().resolve(config.languageFile));
-        if (messages == null) {
-            messages = new MessageService(bundle, config.parsePlaceholderApi, papiAvailable);
-        } else {
-            messages.reload(bundle, config.parsePlaceholderApi);
+        bundle.loadOverrides(getDataFolder().toPath().resolve(languageFile));
+        return bundle;
+    }
+
+    private MessageService createMessageService(MikuTPConfig cfg) throws IOException {
+        return new MessageService(loadBundle(cfg.languageFile), cfg.parsePlaceholderApi, papiAvailable);
+    }
+
+    /** Logs semantic config problems (bad pattern, negative cooldowns, blank token, ...).
+     * Parsing already succeeded, so these are reported and the values used as written. */
+    private void logValidationProblems(MikuTPConfig cfg) {
+        List<String> problems = cfg.validationProblems();
+        for (String problem : problems) {
+            getSLF4JLogger().warn("config.yml: {}", problem);
         }
-        if (initial && !config.dialogs.enabled) {
+        if (!problems.isEmpty()) {
+            getSLF4JLogger().warn("config.yml has {} problem(s) listed above; the values are used as written "
+                    + "(fix the file and run /mikutp reload)", problems.size());
+        }
+    }
+
+    /** First-start notes: config version and the dialog fallback. */
+    private void logConfigNotes(MikuTPConfig cfg) {
+        if (cfg.configVersion != MikuTPConfig.CURRENT_VERSION) {
+            getSLF4JLogger().info("config.yml 的 config_version 为 {}（本版本为 {}），建议对照内置默认配置核对新增项",
+                    cfg.configVersion, MikuTPConfig.CURRENT_VERSION);
+        }
+        if (!cfg.dialogs.enabled) {
             getSLF4JLogger().info("Dialog menus are disabled; falling back to clickable chat menus");
         }
     }

@@ -32,6 +32,11 @@ public final class SyncCoordinator {
     private static final int MAX_OPS_PER_FLUSH = 2048;
     /** Cap on queued replicated writes; a full-network resync is far smaller. */
     private static final int MAX_PENDING_WRITES = 65_536;
+    /** Upper bound for the shutdown drain: it runs on the disabling region thread. */
+    private static final long SHUTDOWN_FLUSH_BUDGET_MS = 500;
+    private static final long SHUTDOWN_FLUSH_POLL_MS = 25;
+    /** How often a PROFILE_REQUEST for the same player is answered, at most. */
+    private static final long PROFILE_ANNOUNCE_DEBOUNCE_MS = 2_000;
 
     private final JavaPlugin plugin;
     private final Tasks tasks;
@@ -62,6 +67,9 @@ public final class SyncCoordinator {
     /** Cache updates produced by the batch currently being applied. Only the
      * flush thread touches this; they run after the transaction committed. */
     private final java.util.Deque<Runnable> stagedCacheUpdates = new java.util.ArrayDeque<>();
+    /** Last time a PROFILE_REQUEST for a player was answered; keeps joins from storming. */
+    private final java.util.concurrent.ConcurrentHashMap<String, Long> profileAnnouncements =
+            new java.util.concurrent.ConcurrentHashMap<>();
     private ScheduledTask flushTask;
 
     public SyncCoordinator(JavaPlugin plugin, Tasks tasks, MikuTPConfig config, Database database,
@@ -96,11 +104,17 @@ public final class SyncCoordinator {
         // Drain what is left so a clean stop does not lose replicated state.
         // The callback API is not cancellable, so an in-flight flush can still
         // hold the flag: wait for it instead of abandoning the queue, then drain
-        // what it left behind.
+        // what it left behind. The wait is explicitly capped because this runs on
+        // the disabling thread (the global region thread on Folia): a long stall
+        // here would hold up the whole shutdown.
+        long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(SHUTDOWN_FLUSH_BUDGET_MS);
         for (int attempt = 0; attempt < 100 && !pendingWrites.isEmpty(); attempt++) {
             if (flushing.get()) {
+                if (System.nanoTime() > deadline) {
+                    break;
+                }
                 try {
-                    Thread.sleep(50);
+                    Thread.sleep(SHUTDOWN_FLUSH_POLL_MS);
                 } catch (InterruptedException e) {
                     Thread.currentThread().interrupt();
                     return;
@@ -124,11 +138,19 @@ public final class SyncCoordinator {
         shutdown();
     }
 
-    /** /mtp resync: asks every backend to re-publish its full local state. */
-    public void resync() {
-        if (syncBus.crossServer()) {
-            publishResync();
+    /**
+     * /mtp resync: asks every backend to re-publish its full local state.
+     *
+     * @return true when the request was broadcast; false in single-server mode,
+     *         where there is nothing to resynchronise. The command reports the
+     *         real outcome instead of always claiming success.
+     */
+    public boolean resync() {
+        if (!syncBus.crossServer()) {
+            return false;
         }
+        publishResync();
+        return true;
     }
 
     /** Called on join: the first player after a quiet period triggers a resync. */
@@ -160,15 +182,85 @@ public final class SyncCoordinator {
         if (event.type == null) {
             return;
         }
+        // The proxy fans state events out to every backend, including the one that
+        // published them. Re-applying our own write would double the SQLite work and
+        // can race a concurrent local delete (the staged cache update would then
+        // resurrect the deleted row), so self-originated *state replication* events
+        // are dropped here. TP_* must NOT be dropped: the proxy routes them back to
+        // this backend when both players live here, and a local TP_CANCEL still has
+        // to close the target's dialog. RESYNC_REQUEST must not be dropped either:
+        // its self-echo is what triggers our own dump.
+        if (isOwnStateEvent(event)) {
+            return;
+        }
         switch (event.type) {
             case HOME_SET -> enqueue(tx -> homeService.applyRemoteSet(event, tx, this::afterCommit));
             case HOME_DELETE -> enqueue(tx -> homeService.applyRemoteDelete(event, tx, this::afterCommit));
             case PROFILE -> enqueue(tx -> profileService.applySync(event, tx, this::afterCommit));
             case BACK -> enqueue(tx -> teleports.applySyncBack(event, tx));
             case IGNORE_SET, IGNORE_DELETE -> enqueue(tx -> requestService.applyIgnoreSync(event, tx));
+            case PROFILE_REQUEST -> announceKnownProfile(event);
             case TP_NEW, TP_RESPONDED, TP_READY, TP_CANCEL -> requestService.onSyncEvent(event);
             case RESYNC_REQUEST -> dumpSelf();
         }
+    }
+
+    /** True for broadcast state-replication events whose origin already applied them. */
+    private boolean isOwnStateEvent(SyncEvent event) {
+        if (event.origin == null || !event.origin.equals(serverId)) {
+            return false;
+        }
+        return switch (event.type) {
+            case HOME_SET, HOME_DELETE, PROFILE, PROFILE_REQUEST, BACK, IGNORE_SET, IGNORE_DELETE -> true;
+            case TP_NEW, TP_RESPONDED, TP_READY, TP_CANCEL, RESYNC_REQUEST -> false;
+        };
+    }
+
+    /**
+     * A backend joined a player whose local profile does not know the replicated
+     * tpa toggle yet and asked the network for it. If this backend does know the
+     * value, re-announce the profile so the newcomer converges. A short debounce
+     * keeps a burst of joins (or a flapping player) from generating a publish storm.
+     */
+    private void announceKnownProfile(SyncEvent event) {
+        String uuid = event.playerUuid;
+        if (uuid == null) {
+            return;
+        }
+        long now = System.currentTimeMillis();
+        Long previous = profileAnnouncements.get(uuid);
+        if (previous != null && now - previous < PROFILE_ANNOUNCE_DEBOUNCE_MS) {
+            return;
+        }
+        profileAnnouncements.put(uuid, now);
+        pruneProfileAnnouncements(now);
+        tasks.async(() -> {
+            try {
+                var profile = database.getPlayer(uuid).orElse(null);
+                if (profile == null || !profile.tpaKnown) {
+                    // This backend does not know the toggle either; stay silent and
+                    // let a backend that does answer the request.
+                    return;
+                }
+                SyncEvent reply = SyncEvent.create(SyncEvent.Type.PROFILE, serverId);
+                reply.playerUuid = profile.uuid;
+                reply.playerName = profile.name;
+                reply.lastOnline = profile.lastOnline;
+                reply.tpaEnabled = profile.tpaEnabled;
+                syncBus.publish(reply);
+            } catch (Exception e) {
+                plugin.getSLF4JLogger().warn("Failed to answer a replicated profile request", e);
+            }
+        });
+    }
+
+    /** Drops stale debounce entries once the map grows; it never needs to be large. */
+    private void pruneProfileAnnouncements(long now) {
+        if (profileAnnouncements.size() < 512) {
+            return;
+        }
+        profileAnnouncements.entrySet().removeIf(
+                entry -> now - entry.getValue() > PROFILE_ANNOUNCE_DEBOUNCE_MS);
     }
 
     /**
@@ -290,6 +382,8 @@ public final class SyncCoordinator {
         long now = System.currentTimeMillis();
         long previous = lastDump.get();
         if (now - previous < DUMP_GUARD_MS) {
+            plugin.getSLF4JLogger().debug("Skipped a requested state dump: the previous one is younger than {}ms",
+                    DUMP_GUARD_MS);
             return;
         }
         if (!lastDump.compareAndSet(previous, now)) {
@@ -303,19 +397,29 @@ public final class SyncCoordinator {
                     event.homeName = home.name;
                     event.homePosition = home.position;
                     event.homeCreatedAt = home.createdAt;
-                    syncBus.publish(event);
+                    publishQuietly(event);
                 }
                 for (var profile : database.listAllProfiles()) {
+                    // Only publish a toggle this backend actually knows: a profile
+                    // row written by replication may still carry a guessed default,
+                    // and broadcasting that would overwrite the real value on the
+                    // backend that knows it.
+                    if (!profile.tpaKnown) {
+                        continue;
+                    }
                     SyncEvent event = SyncEvent.create(SyncEvent.Type.PROFILE, serverId);
                     event.playerUuid = profile.uuid;
                     event.playerName = profile.name;
                     event.lastOnline = profile.lastOnline;
                     event.tpaEnabled = profile.tpaEnabled;
-                    syncBus.publish(event);
+                    publishQuietly(event);
                 }
                 for (var stored : database.listAllStoredPositions()) {
-                    publishBack(stored.uuid(), "back", stored.back());
-                    publishBack(stored.uuid(), "death", stored.death());
+                    // Carry the per-position update stamps: the receiving side only
+                    // overwrites a row when the replicated stamp is not older, so a
+                    // dump without a stamp could not propagate positions at all.
+                    publishBack(stored.uuid(), "back", stored.back(), stored.backUpdatedAt());
+                    publishBack(stored.uuid(), "death", stored.death(), stored.deathUpdatedAt());
                 }
                 for (var ignore : database.listAllIgnores()) {
                     SyncEvent event = SyncEvent.create(SyncEvent.Type.IGNORE_SET, serverId);
@@ -323,7 +427,7 @@ public final class SyncCoordinator {
                     event.blockedUuid = ignore.blockedUuid;
                     event.expiresAt = ignore.expiresAt;
                     event.createdAt = ignore.createdAt;
-                    syncBus.publish(event);
+                    publishQuietly(event);
                 }
                 // Deletions are part of the state: a backend that was offline when
                 // a home or block was removed would otherwise keep (and re-publish)
@@ -340,7 +444,7 @@ public final class SyncCoordinator {
                         event.blockedUuid = tombstone.name();
                     }
                     event.deletedAt = tombstone.deletedAt();
-                    syncBus.publish(event);
+                    publishQuietly(event);
                 }
             } catch (Exception e) {
                 plugin.getSLF4JLogger().warn("State dump failed", e);
@@ -348,7 +452,22 @@ public final class SyncCoordinator {
         });
     }
 
-    private void publishBack(String uuid, String kind, com.mikumc.mikutp.common.data.Position position) {
+    /**
+     * Publishes one replayed record. A single record that cannot be serialized or
+     * queued must not abort the rest of the dump: a partial dump silently leaves
+     * the network with half the state.
+     */
+    private void publishQuietly(SyncEvent event) {
+        try {
+            syncBus.publish(event);
+        } catch (Exception e) {
+            plugin.getSLF4JLogger().warn("Dropped one resync record ({} for {})",
+                    event.type, event.playerUuid, e);
+        }
+    }
+
+    private void publishBack(String uuid, String kind, com.mikumc.mikutp.common.data.Position position,
+                             long updatedAt) {
         if (position == null) {
             return;
         }
@@ -356,6 +475,7 @@ public final class SyncCoordinator {
         event.playerUuid = uuid;
         event.backKind = kind;
         event.backPosition = position;
-        syncBus.publish(event);
+        event.backUpdatedAt = updatedAt;
+        publishQuietly(event);
     }
 }

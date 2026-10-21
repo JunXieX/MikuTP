@@ -33,6 +33,16 @@ import java.util.function.Predicate;
  */
 public final class CommandRegistry {
 
+    /**
+     * Runs a configuration reload and reports the outcome through the callback.
+     * The callback may run on any thread (the reload itself is asynchronous);
+     * the reload command hops back to the global region before messaging.
+     */
+    @FunctionalInterface
+    public interface ReloadAction {
+        void reload(java.util.function.Consumer<Boolean> done);
+    }
+
     private final JavaPlugin plugin;
     private final MessageService messages;
     private final HomeService homeService;
@@ -44,8 +54,8 @@ public final class CommandRegistry {
     private final ChatMenus chats;
     private final OnlinePlayers onlinePlayers;
     private final Tasks tasks;
-    private final Runnable reloadAction;
-    private final Runnable resyncAction;
+    private final ReloadAction reloadAction;
+    private final java.util.function.BooleanSupplier resyncAction;
     private final java.util.function.Supplier<String> infoSupplier;
     private final java.util.function.BooleanSupplier dialogsEnabledSupplier;
     private final MikuTPConfig config;
@@ -54,7 +64,7 @@ public final class CommandRegistry {
                            HomeService homeService, WarpService warpService, RequestService requestService,
                            WildService wildService, TeleportService teleports, DialogFactory dialogs,
                            ChatMenus chats, OnlinePlayers onlinePlayers, Tasks tasks,
-                           Runnable reloadAction, Runnable resyncAction,
+                           ReloadAction reloadAction, java.util.function.BooleanSupplier resyncAction,
                            java.util.function.Supplier<String> infoSupplier,
                            java.util.function.BooleanSupplier dialogsEnabledSupplier,
                            MikuTPConfig config) {
@@ -80,14 +90,30 @@ public final class CommandRegistry {
         plugin.getLifecycleManager().registerEventHandler(LifecycleEvents.COMMANDS, event -> {
             var registrar = event.registrar();
             // 命令可按 config.yml 的 commands 段单独关闭或改别名；绝不覆盖原版指令。
+            // Literals owned by this plugin: an alias must never shadow one of them,
+            // and no alias may be used twice (the registrar rejects duplicates).
+            java.util.Set<String> reserved = new java.util.LinkedHashSet<>(List.of(
+                    "home", "sethome", "delhome", "warp", "setwarp", "delwarp",
+                    "tpa", "tpahere", "tpaccept", "tpdeny", "tpatoggle", "tpblock",
+                    "tpunblock", "wild", "back", "dback", "otp", "otph", "outtp",
+                    "mikutp-ui", "mtp"));
             java.util.function.Consumer<Registration> reg = r -> {
                 var entry = entry(r.key());
+                String literal = r.node().getLiteral();
                 if (entry != null && !entry.enabled) {
-                    plugin.getSLF4JLogger().info("Command /{} disabled in config.yml", r.key());
+                    plugin.getSLF4JLogger().info("Command /{} disabled in config.yml", literal);
                     return;
                 }
                 List<String> aliases = entry != null && entry.aliases != null ? entry.aliases : r.defaultAliases();
-                registrar.register(r.node(), r.description(), aliases);
+                List<String> safe = safeAliases(literal, aliases, reserved);
+                try {
+                    registrar.register(r.node(), r.description(), safe);
+                } catch (RuntimeException e) {
+                    // One conflicting alias must not abort the whole lifecycle event
+                    // and take every other command down with it.
+                    plugin.getSLF4JLogger().warn("Could not register /{} (alias conflict?): {}",
+                            literal, e.getMessage());
+                }
             };
             reg.accept(new Registration("home", home(), "传送到你的家", List.of("homes")));
             reg.accept(new Registration("sethome", sethome(), "设置一个家", List.of()));
@@ -143,6 +169,31 @@ public final class CommandRegistry {
 
     private record Registration(String key, LiteralCommandNode<CommandSourceStack> node,
                                 String description, List<String> defaultAliases) {
+    }
+
+    /**
+     * Filters aliases that cannot be registered: blank entries, aliases that shadow
+     * one of this plugin's literals, and aliases already used by another command.
+     * Duplicates make the registrar throw, which would otherwise abort the whole
+     * COMMANDS lifecycle.
+     */
+    private List<String> safeAliases(String literal, List<String> aliases, java.util.Set<String> reserved) {
+        if (aliases == null || aliases.isEmpty()) {
+            return List.of();
+        }
+        List<String> safe = new java.util.ArrayList<>(aliases.size());
+        for (String alias : aliases) {
+            if (alias == null || alias.isBlank()) {
+                continue;
+            }
+            String normalized = alias.toLowerCase(java.util.Locale.ROOT);
+            if (normalized.equals(literal) || !reserved.add(normalized)) {
+                plugin.getSLF4JLogger().warn("Ignoring alias '{}' of /{}: already used", alias, literal);
+                continue;
+            }
+            safe.add(alias);
+        }
+        return safe;
     }
 
     // ------------------------------------------------------------------ home
@@ -468,13 +519,28 @@ public final class CommandRegistry {
                     return 1;
                 });
         root.then(Commands.literal("reload").executes(ctx -> {
-            reloadAction.run();
-            ctx.getSource().getSender().sendMessage(messages.render(ctx.getSource().getSender(), "common.reload-done"));
+            CommandSender sender = ctx.getSource().getSender();
+            // The reload runs asynchronously; report the real outcome when it is done
+            // rather than claiming success before anything was read.
+            reloadAction.reload(ok -> tasks.global(() -> {
+                if (Boolean.TRUE.equals(ok)) {
+                    sender.sendMessage(messages.render(sender, "common.reload-done"));
+                    // Commands are registered once at startup: config.yml changes to
+                    // names/aliases can only take effect after a restart.
+                    if (messages.has("admin.commands-need-restart")) {
+                        sender.sendMessage(messages.render(sender, "admin.commands-need-restart"));
+                    }
+                } else {
+                    sender.sendMessage(messages.render(sender, "common.reload-failed", "error", "config.yml"));
+                }
+            }));
             return 1;
         }));
         root.then(Commands.literal("resync").executes(ctx -> {
-            resyncAction.run();
-            ctx.getSource().getSender().sendMessage(messages.render(ctx.getSource().getSender(), "admin.resync-done"));
+            CommandSender sender = ctx.getSource().getSender();
+            // Report what actually happened: single-server mode has nothing to resync.
+            boolean dispatched = resyncAction.getAsBoolean();
+            sender.sendMessage(messages.render(sender, dispatched ? "admin.resync-done" : "common.cross-disabled"));
             return 1;
         }));
         root.then(Commands.literal("permissions").executes(ctx -> {

@@ -18,11 +18,22 @@ public final class StorageFactory {
     public static Database create(Path dataFolder, MikuTPConfig config) {
         HikariConfig h = new HikariConfig();
         h.setPoolName("MikuTP-SQLite");
-        h.setMaximumPoolSize(1);
-        // Covers a batch transaction plus one queued reader: a longer wait than
-        // the 5s default keeps a busy batch from failing an unrelated query.
+        // WAL mode allows one writer with concurrent readers (sqlite.org/wal.html:
+        // "Readers and writers can proceed concurrently"). A single pooled
+        // connection serialised every read behind the sync batch transaction, so
+        // a /home or /back lookup could wait for a 2048-statement commit; four
+        // connections keep read latency independent of write batch size while
+        // SQLite itself still serialises writers.
+        h.setMaximumPoolSize(4);
+        // Covers a batch transaction plus a few queued operations: a longer wait
+        // than the 5s default keeps a busy batch from failing an unrelated query.
         h.setConnectionTimeout(15000);
         h.setDriverClassName("org.sqlite.JDBC");
+        // synchronous is per-connection; journal_mode=WAL is set once (database
+        // file level) by Database.init(). NORMAL is the documented safe pairing
+        // with WAL (a committed transaction can lose only the last commit on a
+        // power failure, never corrupt the database).
+        h.setConnectionInitSql("PRAGMA synchronous=NORMAL");
         // busy_timeout: WAL still returns SQLITE_BUSY in a few edge cases (e.g.
         // checkpointing); without a wait the write fails instead of retrying.
         h.setJdbcUrl("jdbc:sqlite:" + dataFolder.resolve("data.db").toAbsolutePath()

@@ -11,6 +11,23 @@ public final class Validate {
     private Validate() {
     }
 
+    /**
+     * True when {@code pattern} is a usable regular expression. Startup/reload code
+     * calls this so a broken pattern is reported once instead of silently making
+     * every name look invalid.
+     */
+    public static boolean isValidPattern(String pattern) {
+        if (pattern == null || pattern.isBlank()) {
+            return false;
+        }
+        try {
+            java.util.regex.Pattern.compile(pattern);
+            return true;
+        } catch (java.util.regex.PatternSyntaxException e) {
+            return false;
+        }
+    }
+
     public static boolean validName(String pattern, String name) {
         if (name == null || name.isBlank() || pattern == null || pattern.isBlank()) {
             return false;

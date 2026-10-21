@@ -20,7 +20,11 @@ import java.util.Map;
  */
 final class BoundedIdSet {
 
-    private static final int MAX_SIZE = 4096;
+    // Large enough that a request answered inside its configured lifetime is
+    // never evicted before it expires: the idempotency guards (answered/claimed
+    // request ids) rely on remembering the whole pending window, not just the
+    // newest few events.
+    private static final int MAX_SIZE = 16384;
 
     private final Map<String, Boolean> order = new LinkedHashMap<>();
 

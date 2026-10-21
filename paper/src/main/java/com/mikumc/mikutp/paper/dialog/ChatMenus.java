@@ -26,7 +26,8 @@ public final class ChatMenus {
             messages.send(viewer, "home.empty");
             return;
         }
-        viewer.sendMessage(messages.render(viewer, "dialog.list.title-homes"));
+        viewer.sendMessage(messages.render(viewer,
+                delete ? "dialog.list.title-delhome" : "dialog.list.title-homes"));
         for (Home home : homes) {
             String command = (delete ? "/delhome " : "/home ") + home.name;
             viewer.sendMessage(line(home.name, command, home.position == null ? "" : home.position.shortText()));
@@ -38,7 +39,8 @@ public final class ChatMenus {
             messages.send(viewer, "warp.empty");
             return;
         }
-        viewer.sendMessage(messages.render(viewer, "dialog.list.title-warps"));
+        viewer.sendMessage(messages.render(viewer,
+                delete ? "dialog.list.title-delwarp" : "dialog.list.title-warps"));
         for (Warp warp : warps) {
             String command = (delete ? "/delwarp " : "/warp ") + warp.name;
             viewer.sendMessage(line(warp.name, command, warp.position == null ? "" : warp.position.shortText()));

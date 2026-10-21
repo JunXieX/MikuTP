@@ -4,6 +4,7 @@ import com.google.gson.Gson;
 import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 import com.google.inject.Inject;
+import com.mikumc.mikutp.common.data.PendingTeleport;
 import com.mikumc.mikutp.common.net.ProxyMessages;
 import com.mikumc.mikutp.common.sync.SyncEvent;
 import com.velocitypowered.api.event.Subscribe;
@@ -66,7 +67,7 @@ public final class MikuTPVelocity {
      * Must equal the Gradle {@code version} in the root build script; the CI
      * "Verify versions agree" step fails the build when the two drift apart.
      */
-    public static final String VERSION = "1.6.1";
+    public static final String VERSION = "1.6.2";
 
     private static final MinecraftChannelIdentifier CHANNEL =
             MinecraftChannelIdentifier.create("mikumc", "mikutp");
@@ -75,8 +76,29 @@ public final class MikuTPVelocity {
     /** Cap per-server backlog: a server that stays empty must not grow the queue
      * without bound. Older events are shed — the activation resync re-converges. */
     private static final int MAX_QUEUED_EVENTS = 4096;
+    /** Hard cap on how many events one player's mailbox may hold (oldest shed). */
+    private static final int MAX_MAILBOX_ENTRIES = 32;
+    /** Hard cap on how many distinct players may hold a mailbox at once. */
+    private static final int MAX_MAILBOX_KEYS = 1024;
+    /** Hard cap on how many players may have a pending handoff at once. */
+    private static final int MAX_PENDING_KEYS = 1024;
+    /** How many unanswered TP_NEW copies are kept per player for switch migration. */
+    private static final int MAX_RECENT_REQUESTS = 8;
+    /** Hard cap on how many players may have recent TP_NEW copies at once. */
+    private static final int MAX_RECENT_REQUEST_KEYS = 512;
     private static final long MAILBOX_TTL_MS = 120_000;
     private static final long PENDING_TTL_MS = 300_000;
+    /**
+     * A TP_NEW copy is re-delivered to whatever server the target moves to, so a
+     * request that arrived just before a server switch is not lost. The backend
+     * deduplicates by event id / request id, so re-delivery is safe.
+     */
+    private static final long RECENT_REQUEST_TTL_MS = 120_000;
+    /**
+     * Backlog pump period. Events are drained in batches instead of one message
+     * per publish; 100ms keeps the perceived latency acceptable.
+     */
+    private static final long FLUSH_INTERVAL_MS = 100;
     private static final String CONFIG_FILE = "config.properties";
     /**
      * Folder for this plugin's data. Velocity derives the injected
@@ -99,6 +121,8 @@ public final class MikuTPVelocity {
     private final Map<UUID, PendingEntry> pendingEntries = new ConcurrentHashMap<>();
     /** Request mailboxes for offline players, delivered on their next join. */
     private final Map<UUID, List<MailboxEntry>> mailboxes = new ConcurrentHashMap<>();
+    /** Recent TP_NEW copies, keyed by target uuid; re-delivered after a switch. */
+    private final Map<UUID, List<RecentRequest>> recentRequests = new ConcurrentHashMap<>();
     /** Events queued for servers that currently have no players. */
     private final Map<String, java.util.ArrayDeque<String>> outbound = new ConcurrentHashMap<>();
     /** One monitor per server queue: draining and sending must be atomic with
@@ -107,13 +131,20 @@ public final class MikuTPVelocity {
     private final Map<String, Object> queueLocks = new ConcurrentHashMap<>();
     private volatile String token = "";
     private volatile boolean warnedRejected = false;
+    private volatile boolean warnedSendFailure = false;
+    private volatile boolean warnedMalformed = false;
     /** Periodic expiry sweep; cancelled on shutdown. */
     private com.velocitypowered.api.scheduler.ScheduledTask sweepTask;
+    /** Periodic backlog pump; cancelled on shutdown. */
+    private com.velocitypowered.api.scheduler.ScheduledTask flushTask;
 
-    private record PendingEntry(String payload, long expiry) {
+    private record PendingEntry(String payload, long expiry, String destServer, String anchorServer) {
     }
 
     private record MailboxEntry(String json, long expiry) {
+    }
+
+    private record RecentRequest(String requestId, String json, long expiry) {
     }
 
     @Inject
@@ -138,6 +169,10 @@ public final class MikuTPVelocity {
         // when the plugin unloads.
         sweepTask = server.getScheduler().buildTask(this, this::sweepExpired)
                 .repeat(60, java.util.concurrent.TimeUnit.SECONDS).schedule();
+        // One frame per publish would turn a resync into thousands of messages;
+        // the pump drains every server queue in batches instead.
+        flushTask = server.getScheduler().buildTask(this, this::flushAllQueues)
+                .repeat(FLUSH_INTERVAL_MS, java.util.concurrent.TimeUnit.MILLISECONDS).schedule();
         logger.info("MikuTP hub ready on channel {}", CHANNEL.getId());
     }
 
@@ -148,13 +183,26 @@ public final class MikuTPVelocity {
             sweepTask.cancel();
             sweepTask = null;
         }
+        if (flushTask != null) {
+            flushTask.cancel();
+            flushTask = null;
+        }
         pendingEntries.clear();
         mailboxes.clear();
+        recentRequests.clear();
         outbound.clear();
     }
 
     /** Drops expired entries so long-lived proxies do not accumulate state. */
     private void sweepExpired() {
+        try {
+            sweepExpiredLocked();
+        } catch (Exception e) {
+            logger.warn("MikuTP expiry sweep failed: {}", e.toString());
+        }
+    }
+
+    private void sweepExpiredLocked() {
         long now = System.currentTimeMillis();
         pendingEntries.entrySet().removeIf(entry -> entry.getValue().expiry() <= now);
         mailboxes.entrySet().removeIf(entry -> {
@@ -162,6 +210,13 @@ public final class MikuTPVelocity {
             synchronized (mailbox) {
                 mailbox.removeIf(m -> m.expiry() <= now);
                 return mailbox.isEmpty();
+            }
+        });
+        recentRequests.entrySet().removeIf(entry -> {
+            List<RecentRequest> list = entry.getValue();
+            synchronized (list) {
+                list.removeIf(r -> r.expiry() <= now);
+                return list.isEmpty();
             }
         });
     }
@@ -239,7 +294,16 @@ public final class MikuTPVelocity {
         try {
             handle(message, source);
         } catch (Exception e) {
-            logger.warn("Dropped malformed MikuTP message: {}", e.toString());
+            warnMalformed("message", e);
+        }
+    }
+
+    private void warnMalformed(String what, Exception e) {
+        if (warnedMalformed) {
+            logger.debug("Dropped malformed MikuTP {}: {}", what, e.toString());
+        } else {
+            warnedMalformed = true;
+            logger.warn("Dropped malformed MikuTP {}: {}", what, e.toString());
         }
     }
 
@@ -275,16 +339,24 @@ public final class MikuTPVelocity {
             if (!element.isJsonObject()) {
                 continue;
             }
-            JsonObject op = element.getAsJsonObject();
-            String kind = ProxyMessages.string(op, "k");
-            if (kind == null) {
-                continue;
+            // One malformed op must not drop the rest of the batch.
+            try {
+                handleBusOp(element.getAsJsonObject());
+            } catch (Exception e) {
+                warnMalformed("bus op", e);
             }
-            switch (kind) {
-                case "event" -> routeEvent(parseEvent(op));
-                case "pending" -> storePending(op);
-                default -> logger.debug("Unknown MikuTP bus op {}", kind);
-            }
+        }
+    }
+
+    private void handleBusOp(JsonObject op) {
+        String kind = ProxyMessages.string(op, "k");
+        if (kind == null) {
+            return;
+        }
+        switch (kind) {
+            case "event" -> routeEvent(parseEvent(op));
+            case "pending" -> storePending(op);
+            default -> logger.debug("Unknown MikuTP bus op {}", kind);
         }
     }
 
@@ -312,17 +384,88 @@ public final class MikuTPVelocity {
         } catch (IllegalArgumentException ignored) {
             return;
         }
-        PendingEntry entry = new PendingEntry(payload, System.currentTimeMillis() + PENDING_TTL_MS);
-        pendingEntries.put(id, entry);
-        // The connect request and the pending payload travel on different paths,
-        // so the player may already have arrived when this lands. Hand it over
-        // immediately in that case: waiting for the next connect would apply the
-        // teleport on a server they later visit, or never at all.
-        server.getPlayer(id).flatMap(Player::getCurrentServer).ifPresent(connection -> {
-            if (pendingEntries.remove(id, entry)) {
-                send(connection, ProxyMessages.encodePending(uuid, payload, 0));
+        // Optional destination server. Without it the handoff is only delivered
+        // when the player connects somewhere: the player is usually still on the
+        // source server while the handoff travels, so delivering it to whatever
+        // server they are on right now would lose it on that server.
+        String destServer = ProxyMessages.string(op, "server");
+        // Anchor-only handoffs (/otp) carry no destination server. The connect
+        // request that follows targets the anchor's server, so snapshot it now and
+        // deliver there (a later anchor move must not strand the player elsewhere).
+        String anchorServer = destServer == null ? anchorServerName(pendingAnchorUuid(payload)) : null;
+        PendingEntry entry = new PendingEntry(payload,
+                System.currentTimeMillis() + pendingTtlMillis(op), destServer, anchorServer);
+        putPending(id, entry);
+        // The connect request and the handoff travel on different paths, so the
+        // player may already have arrived. Hand it over immediately only when
+        // the current server *is* the destination.
+        if (destServer != null) {
+            server.getPlayer(id).flatMap(Player::getCurrentServer).ifPresent(connection -> {
+                if (destServer.equals(connection.getServerInfo().getName())
+                        && pendingEntries.remove(id, entry)
+                        && !send(connection, ProxyMessages.encodePending(uuid, payload, 0))) {
+                    pendingEntries.putIfAbsent(id, entry);
+                }
+            });
+        }
+    }
+
+    /**
+     * Reads the optional {@code ttl} of a pending op (seconds) and clamps it, so
+     * the sender's TTL is honoured instead of silently replaced by the default.
+     */
+    private long pendingTtlMillis(JsonObject op) {
+        JsonElement ttl = op.get("ttl");
+        if (ttl == null || !ttl.isJsonPrimitive()) {
+            return PENDING_TTL_MS;
+        }
+        try {
+            long seconds = ttl.getAsLong();
+            return Math.min(PENDING_TTL_MS, Math.max(1_000L, seconds * 1_000L));
+        } catch (Exception e) {
+            return PENDING_TTL_MS;
+        }
+    }
+
+    /** Reads the anchor of an anchor-only handoff; null when absent or malformed. */
+    private String pendingAnchorUuid(String payload) {
+        try {
+            PendingTeleport pending = GSON.fromJson(payload, PendingTeleport.class);
+            return pending == null ? null : pending.anchorUuid;
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    /** Server the anchor is on right now, or null when it cannot be resolved. */
+    private String anchorServerName(String anchorUuid) {
+        if (anchorUuid == null || anchorUuid.isEmpty()) {
+            return null;
+        }
+        return parsePlayer(anchorUuid)
+                .flatMap(Player::getCurrentServer)
+                .map(connection -> connection.getServerInfo().getName())
+                .orElse(null);
+    }
+
+    /** Stores a handoff, keeping the map bounded (oldest expiry goes first). */
+    private void putPending(UUID id, PendingEntry entry) {
+        PendingEntry previous = pendingEntries.put(id, entry);
+        if (previous != null || pendingEntries.size() <= MAX_PENDING_KEYS) {
+            return;
+        }
+        UUID victim = null;
+        long oldest = Long.MAX_VALUE;
+        for (Map.Entry<UUID, PendingEntry> candidate : pendingEntries.entrySet()) {
+            if (candidate.getKey().equals(id) || candidate.getValue().expiry() >= oldest) {
+                continue;
             }
-        });
+            oldest = candidate.getValue().expiry();
+            victim = candidate.getKey();
+        }
+        if (victim != null) {
+            pendingEntries.remove(victim);
+        }
     }
 
     /**
@@ -342,12 +485,16 @@ public final class MikuTPVelocity {
                 if (!deliverToPlayer(event.request.targetUuid, event)) {
                     mailboxAdd(event.request.targetUuid, event);
                 }
+                // Keep a copy: a request that arrives just before the target
+                // switches servers would otherwise be lost with the old server.
+                rememberRecentRequest(event);
             }
             case TP_RESPONDED -> {
                 if (event.request == null) {
                     return;
                 }
                 purgeMailbox(event.request.targetUuid, event.request.id);
+                purgeRecentRequest(event.request.targetUuid, event.request.id);
                 // A requester mid-switch cannot be resolved right now; the mailbox
                 // keeps the answer for their next join instead of dropping it (there
                 // is no other replay path for this event).
@@ -370,13 +517,16 @@ public final class MikuTPVelocity {
                     return;
                 }
                 purgeMailbox(event.request.targetUuid, event.request.id);
+                purgeRecentRequest(event.request.targetUuid, event.request.id);
                 // The requester may also hold a mailboxed TP_RESPONDED for the very
                 // request being withdrawn; delivering it later would teleport them
                 // to a target they already gave up on.
                 purgeMailbox(event.request.requesterUuid, event.request.id);
+                purgeRecentRequest(event.request.requesterUuid, event.request.id);
                 broadcast(event);
             }
-            case HOME_SET, HOME_DELETE, PROFILE, BACK, IGNORE_SET, IGNORE_DELETE, RESYNC_REQUEST -> broadcast(event);
+            case HOME_SET, HOME_DELETE, PROFILE, BACK, IGNORE_SET, IGNORE_DELETE, RESYNC_REQUEST,
+                    PROFILE_REQUEST -> broadcast(event);
         }
     }
 
@@ -395,28 +545,44 @@ public final class MikuTPVelocity {
         if (target.isEmpty()) {
             return false;
         }
-        sendEvents(target.get(), List.of(event));
-        return true;
+        return sendEvents(target.get(), List.of(event));
     }
 
     private void broadcast(SyncEvent event) {
+        // Encode once: every server queue receives the same immutable JSON object.
+        // The queue keeps the encoded form, so the pump never has to
+        // deserialize a SyncEvent and serialize it again.
+        String json = GSON.toJson(event);
         for (RegisteredServer target : server.getAllServers()) {
-            enqueue(target, event);
+            enqueue(target, json);
         }
     }
 
     // ------------------------------------------------------------------ queues
 
-    private void enqueue(RegisteredServer target, SyncEvent event) {
+    private void enqueue(RegisteredServer target, String eventJson) {
         String name = target.getServerInfo().getName();
         java.util.ArrayDeque<String> queue = outbound.computeIfAbsent(name, n -> new java.util.ArrayDeque<>());
         synchronized (lockFor(name)) {
-            queue.addLast(GSON.toJson(event));
+            queue.addLast(eventJson);
             while (queue.size() > MAX_QUEUED_EVENTS) {
                 queue.pollFirst();
             }
         }
-        tryFlush(target);
+        // Drained by flushAllQueues() on a fixed period. Flushing here would emit
+        // one message per event and turn a resync into thousands of frames.
+    }
+
+    /** Periodic backlog pump: drains every server queue in batches. */
+    private void flushAllQueues() {
+        for (RegisteredServer target : server.getAllServers()) {
+            try {
+                tryFlush(target);
+            } catch (Exception e) {
+                logger.warn("MikuTP queue flush for {} failed: {}",
+                        target.getServerInfo().getName(), e.toString());
+            }
+        }
     }
 
     private Object lockFor(String serverName) {
@@ -433,44 +599,69 @@ public final class MikuTPVelocity {
         if (carrier.isEmpty()) {
             return; // empty server: flushed when someone joins
         }
-        Optional<ServerConnection> connection = carrier.get().getCurrentServer();
-        if (connection.isEmpty()) {
-            return;
-        }
         // Drain and send under the queue lock: two senders draining the same
         // queue concurrently could emit their batches in the wrong order, which
         // would leave a HOME_SET/HOME_DELETE pair reversed on the receiver.
         synchronized (lockFor(name)) {
-            List<SyncEvent> batch = takeBatch(queue);
+            // Re-resolve the carrier under the lock: it may have switched servers
+            // since the lookup, and this batch belongs to the queue's own server.
+            Optional<ServerConnection> connection = carrier.get().getCurrentServer();
+            if (connection.isEmpty() || !connection.get().getServerInfo().getName().equals(name)) {
+                return; // carrier moved away: the pump retries with the next one
+            }
+            List<String> batch = takeBatch(queue);
             if (!batch.isEmpty()) {
-                sendEvents(connection.get(), batch);
+                sendEncodedBatch(connection.get(), batch);
             }
         }
     }
 
-    private List<SyncEvent> takeBatch(java.util.ArrayDeque<String> queue) {
-        List<SyncEvent> batch = new ArrayList<>();
+    /**
+     * Polls up to one batch worth of already-encoded event objects, preserving
+     * order. The queue only ever holds JSON produced by Gson, so the pump does
+     * not parse and re-serialize each event.
+     */
+    private List<String> takeBatch(java.util.ArrayDeque<String> queue) {
+        List<String> batch = new ArrayList<>();
         while (!queue.isEmpty() && batch.size() < MAX_EVENTS_PER_BATCH) {
             String json = queue.pollFirst();
-            try {
-                SyncEvent event = GSON.fromJson(json, SyncEvent.class);
-                if (event != null && event.type != null) {
-                    batch.add(event);
-                }
-            } catch (Exception ignored) {
-                // Skip malformed entries.
+            if (json != null && !json.isEmpty()) {
+                batch.add(json);
             }
         }
         return batch;
     }
 
     /** Sends an events batch; each element is an event object, matching the backend parser. */
-    private void sendEvents(ServerConnection connection, List<SyncEvent> events) {
+    private boolean sendEvents(ServerConnection connection, List<SyncEvent> events) {
         List<String> json = new ArrayList<>(events.size());
         for (SyncEvent event : events) {
             json.add(GSON.toJson(event));
         }
-        send(connection, ProxyMessages.encodeEventsBatch(json));
+        return sendEncodedBatch(connection, json);
+    }
+
+    /** Sends one frame for already-encoded event objects. */
+    private boolean sendEncodedBatch(ServerConnection connection, List<String> eventJson) {
+        return send(connection, composeEventsFrame(eventJson));
+    }
+
+    /**
+     * Builds the {@code t=events} frame with the event objects inlined. The objects
+     * come straight from Gson, so joining them yields exactly what
+     * ProxyMessages.encodeEventsBatch produces, without parsing each object back
+     * into a tree. Keep the envelope in sync with that method if it ever changes.
+     */
+    private static String composeEventsFrame(List<String> eventJson) {
+        StringBuilder frame = new StringBuilder(64 + eventJson.size() * 256);
+        frame.append("{\"t\":\"").append(ProxyMessages.TYPE_EVENTS).append("\",\"events\":[");
+        for (int i = 0; i < eventJson.size(); i++) {
+            if (i > 0) {
+                frame.append(',');
+            }
+            frame.append(eventJson.get(i));
+        }
+        return frame.append("]}").toString();
     }
 
     // ------------------------------------------------------------------ player-scoped delivery
@@ -482,9 +673,23 @@ public final class MikuTPVelocity {
         if (connection.isEmpty()) {
             return;
         }
-        flushServerQueues(event.getServer().getServerInfo().getName(), connection.get());
-        deliverPending(uuid, connection.get());
-        deliverMailbox(uuid, connection.get());
+        String serverName = event.getServer().getServerInfo().getName();
+        // Each step is isolated: a failure in one (a blank token, a dead
+        // connection, an oversized frame) must not swallow the handoff and the
+        // mailbox that belong to this join. The backlog pump runs last: it can
+        // emit many frames and must never gate the player-scoped delivery.
+        runIsolated("pending", () -> deliverPending(uuid, connection.get()));
+        runIsolated("mailbox", () -> deliverMailbox(uuid, connection.get()));
+        runIsolated("recent-requests", () -> redeliverRecentRequests(uuid, connection.get()));
+        runIsolated("queue-flush", () -> flushServerQueues(serverName, connection.get()));
+    }
+
+    private void runIsolated(String step, Runnable action) {
+        try {
+            action.run();
+        } catch (Exception e) {
+            logger.warn("MikuTP join step {} failed: {}", step, e.toString());
+        }
     }
 
     /** Flushes the events queued for a server that just became non-empty. */
@@ -501,11 +706,11 @@ public final class MikuTPVelocity {
         // event to trigger another flush would leave the rest stuck. Held under
         // the queue lock so this drain cannot interleave with tryFlush.
         synchronized (lockFor(serverName)) {
-            List<SyncEvent> batch;
+            List<String> batch;
             do {
                 batch = takeBatch(queue);
                 if (!batch.isEmpty()) {
-                    sendEvents(connection, batch);
+                    sendEncodedBatch(connection, batch);
                 }
             } while (!batch.isEmpty() && !queue.isEmpty());
         }
@@ -513,15 +718,29 @@ public final class MikuTPVelocity {
 
     private void deliverPending(UUID uuid, ServerConnection connection) {
         PendingEntry entry = pendingEntries.get(uuid);
+        if (entry == null) {
+            return;
+        }
+        // Every other server keeps the handoff and retries on the next connect;
+        // delivering it anywhere else would consume it on the wrong backend. An
+        // anchor-only handoff is delivered where the connect request was aimed;
+        // when the anchor was offline at handoff time, deliver anyway so the
+        // backend can report the failure.
+        String destServer = entry.destServer() != null ? entry.destServer() : entry.anchorServer();
+        if (destServer != null && !destServer.equals(connection.getServerInfo().getName())) {
+            return;
+        }
         // Conditional remove: storePending() may have handed the same payload to
         // this player concurrently, and delivering it twice would teleport twice.
-        if (entry == null || !pendingEntries.remove(uuid, entry)) {
+        if (!pendingEntries.remove(uuid, entry)) {
             return;
         }
         if (entry.expiry() <= System.currentTimeMillis()) {
             return;
         }
-        send(connection, ProxyMessages.encodePending(uuid.toString(), entry.payload(), 0));
+        if (!send(connection, ProxyMessages.encodePending(uuid.toString(), entry.payload(), 0))) {
+            pendingEntries.putIfAbsent(uuid, entry);
+        }
     }
 
     private void deliverMailbox(UUID uuid, ServerConnection connection) {
@@ -541,8 +760,14 @@ public final class MikuTPVelocity {
         }
         long now = System.currentTimeMillis();
         List<SyncEvent> events = new ArrayList<>();
+        List<MailboxEntry> leftover = new ArrayList<>();
         for (MailboxEntry entry : drained) {
             if (entry.expiry() <= now) {
+                continue;
+            }
+            if (events.size() >= MAX_EVENTS_PER_BATCH) {
+                // One frame per batch: keep the rest for the next join.
+                leftover.add(entry);
                 continue;
             }
             try {
@@ -551,10 +776,34 @@ public final class MikuTPVelocity {
                     events.add(event);
                 }
             } catch (Exception ignored) {
+                // Skip malformed entries.
             }
         }
-        if (!events.isEmpty()) {
-            sendEvents(connection, events);
+        if (!events.isEmpty() && !sendEvents(connection, events)) {
+            // The frame was lost: put everything back for the next attempt.
+            requeueMailbox(uuid, drained);
+            return;
+        }
+        requeueMailbox(uuid, leftover);
+    }
+
+    /** Prepends entries that did not fit into one frame; keeps the mailbox bounded. */
+    private void requeueMailbox(UUID uuid, List<MailboxEntry> entries) {
+        if (entries.isEmpty()) {
+            return;
+        }
+        while (true) {
+            List<MailboxEntry> mailbox = mailboxes.computeIfAbsent(uuid, k -> new ArrayList<>());
+            synchronized (mailbox) {
+                if (mailboxes.get(uuid) != mailbox) {
+                    continue;
+                }
+                mailbox.addAll(0, entries);
+                while (mailbox.size() > MAX_MAILBOX_ENTRIES) {
+                    mailbox.remove(0);
+                }
+                return;
+            }
         }
     }
 
@@ -576,19 +825,63 @@ public final class MikuTPVelocity {
         }
         String json = GSON.toJson(event);
         long expiry = System.currentTimeMillis() + MAILBOX_TTL_MS;
+        boolean newKey = false;
         while (true) {
-            List<MailboxEntry> mailbox = mailboxes.computeIfAbsent(target, k -> new ArrayList<>());
+            List<MailboxEntry> mailbox = mailboxes.get(target);
+            if (mailbox == null) {
+                List<MailboxEntry> fresh = new ArrayList<>();
+                mailbox = mailboxes.putIfAbsent(target, fresh);
+                if (mailbox == null) {
+                    mailbox = fresh;
+                    newKey = true;
+                }
+            }
             synchronized (mailbox) {
                 // delivery detaches the mailbox from the map under this monitor
                 // before draining it; re-check so the entry never lands in a
                 // list that is no longer reachable.
                 if (mailboxes.get(target) != mailbox) {
+                    newKey = false;
                     continue;
                 }
                 mailbox.add(new MailboxEntry(json, expiry));
-                mailbox.removeIf(entry -> entry.expiry() <= System.currentTimeMillis());
-                return;
+                // Bounded mailbox: the oldest entries go first. Expiry is left to
+                // the periodic sweep, so adding never scans the whole list.
+                while (mailbox.size() > MAX_MAILBOX_ENTRIES) {
+                    mailbox.remove(0);
+                }
+                break;
             }
+        }
+        if (newKey) {
+            evictOldestMailboxIfNeeded(target);
+        }
+    }
+
+    /** Keeps the mailbox key space bounded; only runs when a new key was added. */
+    private void evictOldestMailboxIfNeeded(UUID keep) {
+        if (mailboxes.size() <= MAX_MAILBOX_KEYS) {
+            return;
+        }
+        UUID victim = null;
+        long oldest = Long.MAX_VALUE;
+        for (Map.Entry<UUID, List<MailboxEntry>> candidate : mailboxes.entrySet()) {
+            if (candidate.getKey().equals(keep)) {
+                continue;
+            }
+            long newest = Long.MIN_VALUE;
+            synchronized (candidate.getValue()) {
+                for (MailboxEntry entry : candidate.getValue()) {
+                    newest = Math.max(newest, entry.expiry());
+                }
+            }
+            if (newest < oldest) {
+                oldest = newest;
+                victim = candidate.getKey();
+            }
+        }
+        if (victim != null) {
+            mailboxes.remove(victim);
         }
     }
 
@@ -621,6 +914,128 @@ public final class MikuTPVelocity {
             return event != null && event.request != null && event.request.id.equals(requestId);
         } catch (Exception e) {
             return false;
+        }
+    }
+
+    // ------------------------------------------------- recent TP_NEW copies
+
+    /**
+     * Keeps a copy of a TP_NEW so it follows the target to a new server. Without
+     * this, a request delivered to the server the target was leaving is lost: the
+     * backend drops its incoming map on quit and the proxy has no second copy.
+     */
+    private void rememberRecentRequest(SyncEvent event) {
+        if (event.request == null || event.request.targetUuid == null) {
+            return;
+        }
+        UUID target;
+        try {
+            target = UUID.fromString(event.request.targetUuid);
+        } catch (IllegalArgumentException ignored) {
+            return;
+        }
+        String json = GSON.toJson(event);
+        String requestId = event.request.id == null ? "" : event.request.id;
+        long expiry = System.currentTimeMillis() + RECENT_REQUEST_TTL_MS;
+        while (true) {
+            List<RecentRequest> list = recentRequests.computeIfAbsent(target, k -> new ArrayList<>());
+            synchronized (list) {
+                if (recentRequests.get(target) != list) {
+                    continue;
+                }
+                list.add(new RecentRequest(requestId, json, expiry));
+                while (list.size() > MAX_RECENT_REQUESTS) {
+                    list.remove(0);
+                }
+                break;
+            }
+        }
+        trimRecentRequestKeys(target);
+    }
+
+    /** Drops the recent copy of a request that was answered or withdrawn. */
+    private void purgeRecentRequest(String targetUuid, String requestId) {
+        if (targetUuid == null || requestId == null) {
+            return;
+        }
+        UUID target;
+        try {
+            target = UUID.fromString(targetUuid);
+        } catch (IllegalArgumentException ignored) {
+            return;
+        }
+        List<RecentRequest> list = recentRequests.get(target);
+        if (list == null) {
+            return;
+        }
+        synchronized (list) {
+            list.removeIf(entry -> requestId.equals(entry.requestId()));
+            if (list.isEmpty()) {
+                recentRequests.remove(target, list);
+            }
+        }
+    }
+
+    /** Bounded key space for the recent copies; only acts when the cap is exceeded. */
+    private void trimRecentRequestKeys(UUID keep) {
+        if (recentRequests.size() <= MAX_RECENT_REQUEST_KEYS) {
+            return;
+        }
+        UUID victim = null;
+        long oldest = Long.MAX_VALUE;
+        for (Map.Entry<UUID, List<RecentRequest>> candidate : recentRequests.entrySet()) {
+            if (candidate.getKey().equals(keep)) {
+                continue;
+            }
+            long newest = Long.MIN_VALUE;
+            synchronized (candidate.getValue()) {
+                for (RecentRequest entry : candidate.getValue()) {
+                    newest = Math.max(newest, entry.expiry());
+                }
+            }
+            if (newest < oldest) {
+                oldest = newest;
+                victim = candidate.getKey();
+            }
+        }
+        if (victim != null) {
+            recentRequests.remove(victim);
+        }
+    }
+
+    /**
+     * Re-delivers recent TP_NEW events to the server a player just connected to.
+     * The copies stay until their TTL so repeated switches keep working; backends
+     * ignore requests they already answered (event id / request id), so this is
+     * idempotent.
+     */
+    private void redeliverRecentRequests(UUID uuid, ServerConnection connection) {
+        List<RecentRequest> list = recentRequests.get(uuid);
+        if (list == null) {
+            return;
+        }
+        long now = System.currentTimeMillis();
+        List<SyncEvent> events = new ArrayList<>();
+        synchronized (list) {
+            for (RecentRequest entry : list) {
+                if (entry.expiry() <= now) {
+                    continue;
+                }
+                try {
+                    SyncEvent event = GSON.fromJson(entry.json(), SyncEvent.class);
+                    if (event != null && event.type != null) {
+                        events.add(event);
+                    }
+                } catch (Exception ignored) {
+                    // Skip malformed copies.
+                }
+                if (events.size() >= MAX_EVENTS_PER_BATCH) {
+                    break;
+                }
+            }
+        }
+        if (!events.isEmpty()) {
+            sendEvents(connection, events);
         }
     }
 
@@ -714,9 +1129,29 @@ public final class MikuTPVelocity {
         }
     }
 
-    /** Signs and sends one message to a backend. */
-    private void send(ServerConnection connection, String json) {
-        connection.sendPluginMessage(CHANNEL,
-                ProxyMessages.sign(json, token).getBytes(StandardCharsets.UTF_8));
+    /**
+     * Signs and sends one message to a backend. Never throws: a failed send must
+     * not kill a scheduler task or abort the rest of a batch.
+     *
+     * @return true when the frame was handed to the connection
+     */
+    private boolean send(ServerConnection connection, String json) {
+        try {
+            connection.sendPluginMessage(CHANNEL,
+                    ProxyMessages.sign(json, token).getBytes(StandardCharsets.UTF_8));
+            return true;
+        } catch (Exception e) {
+            warnSendFailure(e);
+            return false;
+        }
+    }
+
+    private void warnSendFailure(Exception e) {
+        if (warnedSendFailure) {
+            logger.debug("Failed to send a MikuTP message to a backend: {}", e.toString());
+        } else {
+            warnedSendFailure = true;
+            logger.warn("Failed to send a MikuTP message to a backend: {}", e.toString());
+        }
     }
 }

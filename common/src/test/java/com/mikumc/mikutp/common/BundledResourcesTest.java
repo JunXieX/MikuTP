@@ -40,7 +40,7 @@ class BundledResourcesTest {
                 "common.warmup.started", "common.warmup.countdown", "common.warmup.cancelled-move",
                 "common.warmup.cancelled-damage", "common.teleporting", "common.teleported",
                 "common.teleport-failed", "common.cross-connect-failed", "common.cross-disabled",
-                "common.invalid-name", "common.reload-done",
+                "common.invalid-name", "common.reload-done", "common.reload-failed",
                 "home.limit-reached", "home.set", "home.save-failed", "home.usage", "home.deleted",
                 "home.not-found", "home.empty", "home.going",
                 "warp.set", "warp.deleted", "warp.not-found", "warp.empty", "warp.going", "warp.disabled",
@@ -55,12 +55,13 @@ class BundledResourcesTest {
                 "back.none", "back.going", "dback.none", "dback.going",
                 "outtp.usage", "outtp.none", "otp.usage", "otph.usage",
                 "admin.self", "admin.target-left", "admin.pulled-you", "admin.bring-started",
-                "admin.bring-all-done", "admin.resync-done", "admin.permissions", "admin.permissions-line",
+                "admin.bring-all-done", "admin.resync-done", "admin.commands-need-restart",
+                "admin.permissions", "admin.permissions-line",
                 "admin.info",
                 "dialog.tpa.title", "dialog.tpa.hint", "dialog.tpa.input-label", "dialog.tpa.send",
                 "dialog.tpa.here-send", "dialog.request.title", "dialog.request.body-go",
                 "dialog.request.body-come", "dialog.request.accept", "dialog.request.deny",
-                "dialog.request.block", "dialog.list.title-homes", "dialog.list.title-warps",
+                "dialog.request.block", "dialog.request.block-permanent", "dialog.list.title-homes", "dialog.list.title-warps",
                 "dialog.list.title-delhome", "dialog.list.title-delwarp", "dialog.list.next",
                 "dialog.list.prev", "dialog.list.close", "dialog.name.title", "dialog.name.hint",
                 "dialog.name.input-label", "dialog.name.confirm"
@@ -78,6 +79,8 @@ class BundledResourcesTest {
         assertTrue(bundle.raw("common.warmup.countdown").contains("<seconds>"));
         assertTrue(bundle.raw("home.limit-reached").contains("<limit>"));
         assertTrue(bundle.raw("tpa.hint-chat").contains("<id>"));
+        assertTrue(bundle.raw("common.reload-failed").contains("<error>"),
+                "common.reload-failed must render the <error> placeholder");
     }
 
     private String read(String resource) throws Exception {

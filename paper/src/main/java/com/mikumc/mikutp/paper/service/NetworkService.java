@@ -31,6 +31,17 @@ public final class NetworkService {
     /** How long a proxy round-trip may take before the caller gets a default. */
     private static final long REQUEST_TIMEOUT_MS = 5000;
 
+    /**
+     * Hard cap for one inbound plugin message. Only the proxy legitimately sends
+     * on this channel, so anything bigger is either a broken proxy or a client
+     * spraying garbage at the channel; both are refused before JSON parsing so a
+     * forged payload cannot cost memory and CPU.
+     */
+    private static final int MAX_MESSAGE_BYTES = 2 * 1024 * 1024;
+
+    /** Hard cap for the events carried by one batch; the proxy batches at most 64. */
+    private static final int MAX_EVENTS_PER_MESSAGE = 512;
+
     private final JavaPlugin plugin;
     private final Tasks tasks;
     private final MessageService messages;
@@ -44,6 +55,7 @@ public final class NetworkService {
     private volatile BiConsumer<Player, String> pendingHandler = (player, payload) -> {
     };
     private volatile boolean warnedRejected = false;
+    private volatile boolean warnedOversized = false;
 
     public NetworkService(JavaPlugin plugin, Tasks tasks, MessageService messages, MikuTPConfig config) {
         this.plugin = plugin;
@@ -79,6 +91,15 @@ public final class NetworkService {
         if (!crossServer) {
             return;
         }
+        if (bytes == null || bytes.length == 0) {
+            return;
+        }
+        // Refuse oversized payloads before parsing: this channel is reachable by
+        // clients, and only the proxy legitimately sends anything here.
+        if (bytes.length > MAX_MESSAGE_BYTES) {
+            warnOversized("plugin message", bytes.length);
+            return;
+        }
         com.google.gson.JsonObject o = ProxyMessages.decode(bytes);
         if (o == null) {
             return;
@@ -90,7 +111,13 @@ public final class NetworkService {
         String type = ProxyMessages.type(o);
         if (ProxyMessages.TYPE_EVENTS.equals(type)) {
             if (o.has("events") && o.get("events").isJsonArray()) {
-                for (var element : o.getAsJsonArray("events")) {
+                var events = o.getAsJsonArray("events");
+                if (events.size() > MAX_EVENTS_PER_MESSAGE) {
+                    warnOversized("events batch", events.size());
+                }
+                int accepted = Math.min(events.size(), MAX_EVENTS_PER_MESSAGE);
+                for (int i = 0; i < accepted; i++) {
+                    var element = events.get(i);
                     try {
                         SyncEvent event = com.mikumc.mikutp.common.config.ConfigIO.gson()
                                 .fromJson(element, SyncEvent.class);
@@ -156,6 +183,15 @@ public final class NetworkService {
         }
     }
 
+    /** One-shot warning for payloads that exceed the channel's hard limits. */
+    private void warnOversized(String kind, int size) {
+        if (!warnedOversized) {
+            warnedOversized = true;
+            plugin.getSLF4JLogger().warn("Dropped an oversized {} on {} ({}); "
+                    + "only the proxy may use this channel", kind, ProxyMessages.CHANNEL, size);
+        }
+    }
+
     public void connect(Player carrier, String serverName) {
         send(carrier, ProxyMessages.encodeConnect(carrier.getUniqueId().toString(), serverName));
     }
@@ -173,6 +209,12 @@ public final class NetworkService {
     public CompletableFuture<List<String>> requestPlayerList(Player carrier, String serverName) {
         String id = UUID.randomUUID().toString();
         var future = new CompletableFuture<List<String>>();
+        if (!carrier.isOnline()) {
+            // Without a live carrier the message can never reach the proxy; fail
+            // now instead of making the caller wait for the full round-trip timeout.
+            future.complete(List.of());
+            return future;
+        }
         playerListFutures.put(id, future);
         tasks.asyncDelayed(() -> {
             var pending = playerListFutures.remove(id);
@@ -188,6 +230,10 @@ public final class NetworkService {
     public CompletableFuture<UUID> resolveRemote(Player carrier, String name) {
         String id = UUID.randomUUID().toString();
         var future = new CompletableFuture<UUID>();
+        if (!carrier.isOnline()) {
+            future.complete(null);
+            return future;
+        }
         resolveFutures.put(id, future);
         tasks.asyncDelayed(() -> {
             var pending = resolveFutures.remove(id);

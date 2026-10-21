@@ -40,12 +40,14 @@ public final class WarmupManager {
      * A second start for the same player replaces the pending one (latest wins). */
     public void start(Player player, Runnable onComplete) {
         int seconds = Math.max(0, warmupSeconds.getAsInt());
+        UUID id = player.getUniqueId();
+        // A config reload can switch warmup off while a countdown is still running:
+        // cancel the old one first, otherwise it would fire a second teleport later.
+        drop(id);
         if (seconds <= 0) {
             onComplete.run();
             return;
         }
-        UUID id = player.getUniqueId();
-        drop(id);
         Active a = new Active();
         active.put(id, a);
         long finishAt = System.currentTimeMillis() + seconds * 1000L;
@@ -87,6 +89,13 @@ public final class WarmupManager {
         Active a = active.remove(player);
         if (a != null && a.task != null) {
             a.task.cancel();
+        }
+    }
+
+    /** Cancels every pending countdown; used when the plugin shuts down. */
+    public void shutdown() {
+        for (UUID player : new java.util.ArrayList<>(active.keySet())) {
+            drop(player);
         }
     }
 

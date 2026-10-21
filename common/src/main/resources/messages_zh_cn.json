@@ -14,6 +14,7 @@
   "common.cross-disabled": "<prefix><red>本服务器未启用跨服功能，无法执行该操作。</red>",
   "common.invalid-name": "<prefix><red>名称仅允许字母、数字、下划线与连字符，长度 1-32。</red>",
   "common.reload-done": "<prefix><green>配置与语言文件已重载。</green>",
+  "common.reload-failed": "<prefix><red>配置重载失败，已保留当前配置（文件：<white><error></white>，详情见控制台）。</red>",
 
   "home.limit-reached": "<prefix><red>家的数量已达上限（<white><limit></white>），可删除后重试。</red>",
   "home.set": "<prefix><green>家 <white><name></white> 已保存。</green>",
@@ -75,6 +76,7 @@
   "outtp.none": "<prefix><red>本服没有 <white><player></white> 的下线位置记录。</red>",
   "admin.self": "<prefix><red>不能对自己使用该命令。</red>",
   "admin.resync-done": "<prefix><green>已请求全部服务器重新发布本地数据。</green>",
+  "admin.commands-need-restart": "<prefix><gray>提示：命令名与别名的改动需要重启服务器后生效。</gray>",
   "admin.target-left": "<prefix><red>目标玩家已离开，传送未完成。</red>",
   "admin.pulled-you": "<prefix><yellow>你已被管理员传送到 <white><player></white> 身边。</yellow>",
   "admin.bring-started": "<prefix><gray>正在将 <white><player></white> 传送过来……</gray>",
@@ -95,6 +97,7 @@
   "dialog.request.accept": "✔ 接受",
   "dialog.request.deny": "✘ 拒绝",
   "dialog.request.block": "屏蔽 <minutes> 分钟",
+  "dialog.request.block-permanent": "屏蔽（永久）",
   "dialog.list.title-homes": "你的家",
   "dialog.list.title-warps": "服务器地标",
   "dialog.list.title-delhome": "选择要删除的家",

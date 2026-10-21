@@ -30,8 +30,19 @@ public final class MessageService {
     private volatile MessageBundle bundle;
     private volatile Component prefix;
     private volatile TagResolver prefixResolver;
-    /** Parsed templates keyed by template text; cleared on reload. */
-    private final Map<String, Component> parsedTemplates = new ConcurrentHashMap<>();
+    /**
+     * Parsed templates keyed by template text. Entries carry the reload generation
+     * they were rendered under: a render racing a reload can install an entry built
+     * with the old bundle/resolver after the cache was cleared, and the generation
+     * check makes such an entry invalid instead of leaving a stale message cached
+     * until the next reload.
+     */
+    private final Map<String, CachedTemplate> parsedTemplates = new ConcurrentHashMap<>();
+    /** Bumped at the end of every reload, after the new bundle and resolver are in place. */
+    private volatile long generation;
+
+    private record CachedTemplate(Component component, long generation) {
+    }
 
     public MessageService(MessageBundle bundle, boolean parsePapi, boolean papiAvailable) {
         this.bundle = bundle;
@@ -47,6 +58,9 @@ public final class MessageService {
         this.parsePapi = parsePapi;
         this.prefix = MM.deserialize(newBundle.raw("prefix"));
         this.prefixResolver = TagResolver.resolver(Placeholder.component("prefix", prefix));
+        // The generation is bumped last: a render that read the old generation must
+        // not be able to publish an entry rendered with the old resolver as current.
+        generation++;
         parsedTemplates.clear();
     }
 
@@ -60,9 +74,21 @@ public final class MessageService {
             placeholderApiApplied = true;
         }
         if (pairs.length == 0 && !placeholderApiApplied) {
-            return parsedTemplates.computeIfAbsent(template, text -> MM.deserialize(text, prefixResolver));
+            long current = generation;
+            CachedTemplate cached = parsedTemplates.get(template);
+            if (cached != null && cached.generation() == current) {
+                return cached.component();
+            }
+            Component rendered = MM.deserialize(template, prefixResolver);
+            parsedTemplates.put(template, new CachedTemplate(rendered, current));
+            return rendered;
         }
         return MM.deserialize(template, resolvers(pairs));
+    }
+
+    /** True when the bundle defines {@code key}; lets callers emit optional hints. */
+    public boolean has(String key) {
+        return bundle.has(key);
     }
 
     public void send(CommandSender sender, String key, String... pairs) {

@@ -16,12 +16,18 @@ final class PapiSupport {
     static String parse(Player player, String text) {
         try {
             return PlaceholderAPI.setPlaceholders(player, text);
-        } catch (Exception e) {
+        } catch (Throwable e) {
+            // A broken third-party expansion must never eat the message; some
+            // expansions fail with a LinkageError rather than an Exception.
             return text;
         }
     }
 
     static boolean containsPlaceholders(String text) {
-        return PlaceholderAPI.containsPlaceholders(text);
+        try {
+            return PlaceholderAPI.containsPlaceholders(text);
+        } catch (Throwable e) {
+            return false;
+        }
     }
 }

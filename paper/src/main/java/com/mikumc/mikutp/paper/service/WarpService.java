@@ -236,6 +236,8 @@ public final class WarpService {
     }
 
     private static List<Warp> sorted(List<Warp> warps) {
-        return warps.stream().sorted(Comparator.comparing(w -> w.name.toLowerCase())).toList();
+        return warps.stream()
+                .sorted(Comparator.comparing(w -> w.name.toLowerCase(java.util.Locale.ROOT)))
+                .toList();
     }
 }

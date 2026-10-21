@@ -164,7 +164,12 @@ public final class TeleportService {
         if (destServer != null && !destServer.isBlank() && !destServer.equals(serverId)) {
             // Not our handoff: keep it buffered. The payload is only meant for the
             // destination server, and dropping it here would lose the teleport if
-            // the proxy delivered it slightly early.
+            // the proxy delivered it slightly early. A permanent mismatch means
+            // cross-server.server-id does not match the Velocity server name, which
+            // would otherwise present as "the teleport silently did nothing".
+            plugin.getSLF4JLogger().debug(
+                    "Keeping cross-server handoff for {} (destination={}, this-server={})",
+                    playerUuid, destServer, serverId);
             return;
         }
         arriving.remove(playerUuid, pending);
@@ -180,7 +185,7 @@ public final class TeleportService {
                         return;
                     }
                     Location live = stable.getLocation().clone();
-                    playerTeleportAsync(playerUuid, live, pending.source.name().toLowerCase());
+                    playerTeleportAsync(playerUuid, live, pending.source.name().toLowerCase(java.util.Locale.ROOT));
                 });
                 return;
             }
@@ -197,11 +202,15 @@ public final class TeleportService {
         World world = Bukkit.getWorld(pending.position.world);
         if (world == null) {
             plugin.getSLF4JLogger().warn("Pending teleport targets unknown world {}", pending.position.world);
+            Player arrivingPlayer = onlinePlayers.byId(playerUuid);
+            if (arrivingPlayer != null) {
+                tasks.entity(arrivingPlayer, () -> messages.send(arrivingPlayer, "common.teleport-failed"));
+            }
             return;
         }
         Location target = new Location(world, pending.position.x, pending.position.y,
                 pending.position.z, pending.position.yaw, pending.position.pitch);
-        playerTeleportAsync(playerUuid, target, pending.source.name().toLowerCase());
+        playerTeleportAsync(playerUuid, target, pending.source.name().toLowerCase(java.util.Locale.ROOT));
     }
 
     /**
@@ -250,6 +259,7 @@ public final class TeleportService {
             } catch (Exception e) {
                 plugin.getSLF4JLogger().warn("Failed to read back position", e);
                 cooldowns.clear(id, kind);
+                tasks.entity(player, () -> messages.send(player, "common.teleport-failed"));
                 return;
             }
             if (back == null) {
@@ -315,31 +325,38 @@ public final class TeleportService {
 
     private void storeAndPublish(Player player, String colPrefix, String kind) {
         Position pos = positionOf(player.getLocation());
+        String uuid = player.getUniqueId().toString();
+        // Version stamp published with the event. It only has to be monotonic with
+        // respect to what the other backends already hold; the local row gets its
+        // own stamp from the database.
+        long updatedAt = System.currentTimeMillis();
         tasks.async(() -> {
             try {
-                database.setPosition(player.getUniqueId().toString(), pos, colPrefix);
+                database.setPosition(uuid, pos, colPrefix);
             } catch (Exception e) {
                 plugin.getSLF4JLogger().warn("Failed to save {} position", kind, e);
                 return;
             }
             if (syncBus.crossServer()) {
                 SyncEvent event = SyncEvent.create(SyncEvent.Type.BACK, serverId);
-                event.playerUuid = player.getUniqueId().toString();
+                event.playerUuid = uuid;
                 event.backKind = kind;
                 event.backPosition = pos;
+                event.backUpdatedAt = updatedAt;
                 syncBus.publish(event);
             }
         });
     }
 
     /** Applies a replicated return position from another backend; the write joins
-     * the caller's batched transaction. */
+     * the caller's batched transaction and is rejected when it is older than the
+     * position this backend already holds. */
     public void applySyncBack(SyncEvent event, Database.Tx tx) throws java.sql.SQLException {
         if (event.playerUuid == null || event.backPosition == null) {
             return;
         }
         String prefix = "death".equals(event.backKind) ? Database.DEATH_PREFIX : Database.BACK_PREFIX;
-        tx.setPosition(event.playerUuid, event.backPosition, prefix);
+        tx.setPositionIfNewer(event.playerUuid, event.backPosition, prefix, event.backUpdatedAt);
     }
 
     // ------------------------------------------------------------------ admin commands
@@ -595,7 +612,7 @@ public final class TeleportService {
         }
         Location target = new Location(world, pending.position.x, pending.position.y,
                 pending.position.z, pending.position.yaw, pending.position.pitch);
-        playerTeleportAsync(playerUuid, target, pending.source.name().toLowerCase());
+        playerTeleportAsync(playerUuid, target, pending.source.name().toLowerCase(java.util.Locale.ROOT));
     }
 
     private void dispatchCross(Player player, Position dest, PendingTeleport.Source source, Runnable afterDispatch) {
@@ -627,18 +644,32 @@ public final class TeleportService {
     /** Same as above; {@code onSuccess} runs once the payload is durably stored. */
     public void stashPendingTeleport(UUID playerToTeleport, UUID positionOwner,
                                      PendingTeleport.Source source, Runnable onSuccess) {
+        stashPendingTeleport(playerToTeleport, positionOwner, source, onSuccess, null);
+    }
+
+    /**
+     * Same as above, with an explicit failure callback. A handoff that could not be
+     * stored must not be announced to the requester as an acceptance: the
+     * destination has no payload to apply, so the caller reports the failure
+     * instead of leaving the player waiting for a teleport that will not happen.
+     */
+    public void stashPendingTeleport(UUID playerToTeleport, UUID positionOwner,
+                                     PendingTeleport.Source source,
+                                     Runnable onSuccess, Runnable onFailure) {
+        if (playerToTeleport == null) {
+            runQuietly(onFailure);
+            return;
+        }
         Player owner = onlinePlayers.byId(positionOwner);
         if (owner == null) {
-            // The anchor left before the position could be captured. The caller
-            // uses onSuccess to announce the acceptance, so still run it: silence
-            // here would leave the requester waiting for an answer that never comes.
-            runQuietly(onSuccess);
+            // The anchor left before the position could be captured.
+            runQuietly(onFailure);
             return;
         }
         tasks.entity(owner, () -> {
             Player stable = onlinePlayers.byId(positionOwner);
             if (stable == null) {
-                runQuietly(onSuccess);
+                runQuietly(onFailure);
                 return;
             }
             Position here = positionOf(stable.getLocation());
@@ -650,7 +681,7 @@ public final class TeleportService {
                     runQuietly(onSuccess);
                 } catch (Exception e) {
                     plugin.getSLF4JLogger().warn("Failed to stash cross-server destination", e);
-                    runQuietly(onSuccess);
+                    runQuietly(onFailure);
                 }
             });
         });

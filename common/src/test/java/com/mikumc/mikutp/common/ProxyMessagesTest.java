@@ -94,6 +94,36 @@ class ProxyMessagesTest {
         assertFalse(ProxyMessages.verify(tampered, token));
     }
 
+    /** C-01: a pending handoff may carry the destination server it is meant for. */
+    @Test
+    void pendingOpCarriesDestinationServer() {
+        JsonObject targeted = ProxyMessages.pendingOp("uuid-a", "{}", 300, "survival");
+        assertEquals("pending", targeted.get("k").getAsString());
+        assertEquals("uuid-a", targeted.get("uuid").getAsString());
+        assertEquals("survival", targeted.get("server").getAsString());
+        assertEquals(300, targeted.get("ttl").getAsInt());
+
+        // Without a destination the member must be absent, not null.
+        JsonObject broadcast = ProxyMessages.pendingOp("uuid-a", "{}", 300, null);
+        assertFalse(broadcast.has("server"));
+        assertFalse(ProxyMessages.pendingOp("uuid-a", "{}", 300).has("server"));
+    }
+
+    /** C-01: signing without a token must not throw and must not fake a signature. */
+    @Test
+    void signingWithoutTokenLeavesMessageUntouched() {
+        String plain = ProxyMessages.encodePending("uuid-a", "{}", 300);
+        assertEquals(plain, ProxyMessages.sign(plain, null));
+        assertEquals(plain, ProxyMessages.sign(plain, ""));
+        assertEquals(plain, ProxyMessages.sign(plain, "   "));
+        assertNull(ProxyMessages.sign(null, "token"));
+
+        // The untouched message carries no signature member and cannot verify.
+        JsonObject decoded = ProxyMessages.decode(ProxyMessages.sign(plain, ""));
+        assertFalse(decoded.has(ProxyMessages.SIGNATURE_MEMBER));
+        assertFalse(ProxyMessages.verify(ProxyMessages.decode(decoded.toString()), "token"));
+    }
+
     /** The signature must not depend on member insertion order. */
     @Test
     void signatureIgnoresMemberOrder() {

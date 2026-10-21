@@ -45,10 +45,7 @@ public final class PlayerLifecycle implements Listener {
     public void onJoin(PlayerJoinEvent event) {
         Player player = event.getPlayer();
         UUID id = player.getUniqueId();
-        onlinePlayers.add(player);
-        cooldowns.setBypass(id, player.hasPermission("mikutp.bypass.cooldown"));
-        profiles.onJoin(player);
-        homeService.onJoin(player);
+        refresh(player);
         coordinator.onPlayerJoin();
         // Answers that arrived while this backend still saw the player as absent
         // are replayed first: they may be the acceptance the player is waiting for.
@@ -57,6 +54,25 @@ public final class PlayerLifecycle implements Listener {
         // Applying a buffered handoff moves the player; do it last so no dialog is
         // opened only to be closed by the teleport a moment later.
         teleports.applyPending(id);
+    }
+
+    /**
+     * Rebuilds every piece of per-player runtime state for a player that is
+     * already online. Called from the join handler and again after /mtp reload: a
+     * server reload never fires PlayerJoinEvent, so without this the profile
+     * toggle cache, cooldown bypass and home caches would stay empty.
+     *
+     * <p>Must run on the player's own entity thread.
+     */
+    public void refresh(Player player) {
+        UUID id = player.getUniqueId();
+        onlinePlayers.add(player);
+        cooldowns.setBypass(id, player.hasPermission("mikutp.bypass.cooldown"));
+        profiles.onJoin(player);
+        homeService.onJoin(player);
+        // Request dedupe state (answered/handled request ids) is intentionally not
+        // reset here: the proxy re-delivers a pending TP_NEW after a server switch
+        // and RequestService.onQuit() already dropped the session-local copy.
     }
 
     @EventHandler(priority = EventPriority.MONITOR)

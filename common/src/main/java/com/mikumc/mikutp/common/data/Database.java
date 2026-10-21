@@ -35,6 +35,23 @@ public final class Database implements AutoCloseable {
     /** How long a deletion tombstone is kept. Well beyond any resync dump. */
     private static final long TOMBSTONE_TTL_MS = 7L * 24 * 60 * 60 * 1000;
 
+    /** Deliberate tombstone prune cadence: keeps the table bounded on long uptimes. */
+    private static final int TOMBSTONE_PRUNE_EVERY = 1024;
+
+    /** The only column prefixes {@link #setPosition} accepts (also whitelisted against SQL injection). */
+    private static final Set<String> POSITION_PREFIXES = Set.of(BACK_PREFIX, DEATH_PREFIX, LOGOUT_PREFIX);
+
+    /**
+     * Version-stamp column of one stored position. The stamp is per position
+     * kind, otherwise a death update would invalidate an older /back update.
+     */
+    private static String stampColumn(String colPrefix) {
+        if (!POSITION_PREFIXES.contains(colPrefix)) {
+            throw new IllegalArgumentException("Unsupported stored-position column prefix: " + colPrefix);
+        }
+        return colPrefix + "updated_at";
+    }
+
     /** Supplies pooled connections; implemented by the platform modules. */
     public interface ConnectionProvider extends AutoCloseable {
         Connection acquire() throws SQLException;
@@ -60,6 +77,11 @@ public final class Database implements AutoCloseable {
         /** Stores a return position under {@code colPrefix}; a null position clears it. */
         int setPosition(String uuid, Position pos, String colPrefix) throws SQLException;
 
+        /** Stores a return position only when {@code updatedAt} is at least the
+         * stored version stamp; returns whether the row was written. */
+        boolean setPositionIfNewer(String uuid, Position pos, String colPrefix, long updatedAt)
+                throws SQLException;
+
         int addIgnore(IgnoreEntry entry) throws SQLException;
 
         /** Removes an ignore entry and records a tombstone (same reason as homes). */
@@ -80,6 +102,12 @@ public final class Database implements AutoCloseable {
 
     private final ConnectionProvider provider;
     private final String prefix;
+    /** Guards against nested transactions: with a small pool a nested acquire can
+     *  block until the connection timeout, which is indistinguishable from a hang. */
+    private final ThreadLocal<Boolean> inTransaction = ThreadLocal.withInitial(() -> Boolean.FALSE);
+    /** Counts deletions since the last tombstone prune (keeps the table bounded). */
+    private final java.util.concurrent.atomic.AtomicInteger deletionsSincePrune =
+            new java.util.concurrent.atomic.AtomicInteger();
 
     public Database(ConnectionProvider provider, String prefix) {
         if (prefix != null && !TABLE_PREFIX.matcher(prefix).matches()) {
@@ -91,9 +119,13 @@ public final class Database implements AutoCloseable {
 
     // ------------------------------------------------------------------ schema
 
+    /**
+     * Creates/upgrades the schema. Journal mode is a database property and is
+     * switched to WAL once here; {@code synchronous} is connection-scoped and is
+     * therefore set per connection by the platform pool (not here).
+     */
     public void init() throws SQLException {
-        exec("PRAGMA journal_mode=WAL");
-        exec("PRAGMA synchronous=NORMAL");
+        enableWal();
         exec("""
                 CREATE TABLE IF NOT EXISTS %splayers (
                   uuid VARCHAR(36) NOT NULL PRIMARY KEY,
@@ -138,6 +170,14 @@ public final class Database implements AutoCloseable {
         expected.put("logout_z", "DOUBLE");
         expected.put("logout_yaw", "DOUBLE");
         expected.put("logout_pitch", "DOUBLE");
+        // Version stamps of the stored positions (M-02): per kind, so updates of
+        // one kind cannot invalidate a newer update of the other.
+        expected.put("back_updated_at", "INTEGER NOT NULL DEFAULT 0");
+        expected.put("death_updated_at", "INTEGER NOT NULL DEFAULT 0");
+        expected.put("logout_updated_at", "INTEGER NOT NULL DEFAULT 0");
+        // Set once an authoritative tpa toggle has been stored (M-03); a plain
+        // profile upsert must never claim the toggle is known.
+        expected.put("tpa_known", "INTEGER NOT NULL DEFAULT 0");
         addMissingColumns(prefix + "players", expected);
         exec("""
                 CREATE TABLE IF NOT EXISTS %shomes (
@@ -187,6 +227,7 @@ public final class Database implements AutoCloseable {
                 )""".formatted(prefix));
         index("CREATE INDEX IF NOT EXISTS %sidx_homes_owner ON %shomes (owner_uuid)".formatted(prefix, prefix));
         index("CREATE INDEX IF NOT EXISTS %sidx_players_name ON %splayers (name COLLATE NOCASE)".formatted(prefix, prefix));
+        index("CREATE INDEX IF NOT EXISTS %sidx_warps_server ON %swarps (server)".formatted(prefix, prefix));
         // Tombstones only need to outlive the replication window (a resync dump).
         // Anything older cannot be contradicted by a snapshot that still exists.
         exec("DELETE FROM %stombstones WHERE deleted_at < %d"
@@ -197,7 +238,7 @@ public final class Database implements AutoCloseable {
         try {
             exec(sql);
         } catch (SQLException e) {
-            if (!String.valueOf(e.getMessage()).toLowerCase(Locale.ROOT).contains("exist")) {
+            if (!String.valueOf(e.getMessage()).toLowerCase(Locale.ROOT).contains("already exists")) {
                 throw e;
             }
         }
@@ -226,10 +267,42 @@ public final class Database implements AutoCloseable {
         }
     }
 
+    /**
+     * Switches the database file to WAL and verifies it. WAL is required for the
+     * pool to serve concurrent readers while a writer holds the write lock;
+     * in-memory databases (unit tests) legitimately report "memory".
+     */
+    private void enableWal() throws SQLException {
+        String mode;
+        try (Connection c = provider.acquire();
+             Statement st = c.createStatement();
+             ResultSet rs = st.executeQuery("PRAGMA journal_mode=WAL")) {
+            mode = rs.next() ? rs.getString(1) : null;
+        }
+        if (mode == null || !(mode.equalsIgnoreCase("wal") || mode.equalsIgnoreCase("memory"))) {
+            throw new SQLException("Could not enable SQLite WAL journal mode (got: " + mode
+                    + "). The plugin needs a writable, file-backed database.");
+        }
+    }
+
+    /** Deletes tombstones that are no longer needed to reject stale snapshots. */
+    private void pruneTombstones(Connection connection, long cutoff) throws SQLException {
+        try (PreparedStatement ps = connection.prepareStatement(
+                "DELETE FROM %stombstones WHERE deleted_at < ?".formatted(prefix))) {
+            ps.setLong(1, cutoff);
+            ps.executeUpdate();
+        }
+    }
+
     // ------------------------------------------------------------------ transactions
 
     /** Runs {@code work} on one connection inside a single commit. */
     public <T> T transaction(TxWork<T> work) throws SQLException {
+        if (Boolean.TRUE.equals(inTransaction.get())) {
+            throw new IllegalStateException(
+                    "nested Database.transaction(): use the Tx handle inside the running transaction");
+        }
+        inTransaction.set(Boolean.TRUE);
         try (Connection c = provider.acquire()) {
             boolean autoCommit = c.getAutoCommit();
             c.setAutoCommit(false);
@@ -245,8 +318,15 @@ public final class Database implements AutoCloseable {
                 }
                 throw e;
             } finally {
-                c.setAutoCommit(autoCommit);
+                try {
+                    c.setAutoCommit(autoCommit);
+                } catch (SQLException ignored) {
+                    // Hikari restores autoCommit when the connection returns to the
+                    // pool; a failure here is secondary and must not mask the real cause.
+                }
             }
+        } finally {
+            inTransaction.remove();
         }
     }
 
@@ -279,11 +359,29 @@ public final class Database implements AutoCloseable {
             // Drop the case variants first, keeping the newer row.
             try (PreparedStatement ps = connection.prepareStatement(
                     "DELETE FROM %shomes WHERE owner_uuid = ? AND name = ? COLLATE NOCASE AND name <> ?"
+                            + " AND created_at <= ?").formatted(prefix)) {
+                ps.setString(1, home.ownerUuid);
+                ps.setString(2, home.name);
+                ps.setString(3, home.name);
+                // Only drop a case variant that is not newer than this snapshot: a
+                // stale replicated "base" must never delete the newer legacy "Base".
+                ps.setLong(4, home.createdAt);
+                ps.executeUpdate();
+            }
+            // A newer case variant still owns this name: writing the older snapshot
+            // would create a divergent duplicate (the primary key is case-sensitive),
+            // so the stale snapshot is dropped instead of being inserted.
+            try (PreparedStatement ps = connection.prepareStatement(
+                    "SELECT 1 FROM %shomes WHERE owner_uuid = ? AND name = ? COLLATE NOCASE AND name <> ? LIMIT 1"
                             .formatted(prefix))) {
                 ps.setString(1, home.ownerUuid);
                 ps.setString(2, home.name);
                 ps.setString(3, home.name);
-                ps.executeUpdate();
+                try (ResultSet rs = ps.executeQuery()) {
+                    if (rs.next()) {
+                        return 0;
+                    }
+                }
             }
             try (PreparedStatement ps = connection.prepareStatement("""
                     INSERT INTO %shomes (owner_uuid, name, server, world, x, y, z, yaw, pitch, created_at)
@@ -348,8 +446,8 @@ public final class Database implements AutoCloseable {
             // so any snapshot produced before it is rejected by the upsert guard.
             // The same guard here keeps a late snapshot from undoing a newer flip.
             try (PreparedStatement ps = connection.prepareStatement(
-                    "UPDATE %splayers SET tpa_enabled = ?, last_online = ? WHERE uuid = ? AND last_online <= ?"
-                            .formatted(prefix))) {
+                    "UPDATE %splayers SET tpa_enabled = ?, tpa_known = 1, last_online = ?"
+                            + " WHERE uuid = ? AND last_online <= ?".formatted(prefix))) {
                 ps.setInt(1, enabled ? 1 : 0);
                 ps.setLong(2, at);
                 ps.setString(3, uuid);
@@ -360,15 +458,32 @@ public final class Database implements AutoCloseable {
 
         @Override
         public int setPosition(String uuid, Position pos, String colPrefix) throws SQLException {
-            // One statement instead of the old INSERT-then-UPDATE pair: replicated
-            // positions may arrive before the player's profile row does.
+            return writePosition(uuid, pos, colPrefix, System.currentTimeMillis(), false);
+        }
+
+        @Override
+        public boolean setPositionIfNewer(String uuid, Position pos, String colPrefix, long updatedAt)
+                throws SQLException {
+            return writePosition(uuid, pos, colPrefix, updatedAt, true) > 0;
+        }
+
+        /**
+         * One upsert for a stored position plus its version stamp. A replicated
+         * position may arrive before the player's profile row exists, hence the
+         * placeholder row: name = '' and last_online = 0 never look like a newer
+         * profile to the profile upsert guard.
+         *
+         * <p>{@code newerWins} adds the last-writer-wins guard so a stale snapshot
+         * cannot roll a newer /back or /dback position back.
+         */
+        private int writePosition(String uuid, Position pos, String colPrefix, long updatedAt, boolean newerWins)
+                throws SQLException {
+            String stamp = stampColumn(colPrefix);
             String sql = ("INSERT INTO %splayers (uuid, name, last_online, tpa_enabled, "
                     + colPrefix + "server, " + colPrefix + "world, " + colPrefix + "x, "
-                    + colPrefix + "y, " + colPrefix + "z, " + colPrefix + "yaw, " + colPrefix + "pitch) "
-                    // A placeholder row must never look like a newer profile: an
-                    // empty name stamped with "now" would overwrite the real name
-                    // on every other backend through the profile upsert guard.
-                    + "VALUES (?, '', 0, 1, ?, ?, ?, ?, ?, ?, ?) "
+                    + colPrefix + "y, " + colPrefix + "z, " + colPrefix + "yaw, " + colPrefix + "pitch, "
+                    + stamp + ") "
+                    + "VALUES (?, '', 0, 1, ?, ?, ?, ?, ?, ?, ?, ?) "
                     + "ON CONFLICT(uuid) DO UPDATE SET "
                     + colPrefix + "server = excluded." + colPrefix + "server, "
                     + colPrefix + "world = excluded." + colPrefix + "world, "
@@ -376,7 +491,11 @@ public final class Database implements AutoCloseable {
                     + colPrefix + "y = excluded." + colPrefix + "y, "
                     + colPrefix + "z = excluded." + colPrefix + "z, "
                     + colPrefix + "yaw = excluded." + colPrefix + "yaw, "
-                    + colPrefix + "pitch = excluded." + colPrefix + "pitch").formatted(prefix);
+                    + colPrefix + "pitch = excluded." + colPrefix + "pitch, "
+                    + stamp + " = excluded." + stamp).formatted(prefix);
+            if (newerWins) {
+                sql = sql + " WHERE excluded." + stamp + " >= " + prefix + "players." + stamp;
+            }
             try (PreparedStatement ps = connection.prepareStatement(sql)) {
                 ps.setString(1, uuid);
                 if (pos == null) {
@@ -396,6 +515,7 @@ public final class Database implements AutoCloseable {
                     ps.setDouble(7, pos.yaw);
                     ps.setDouble(8, pos.pitch);
                 }
+                ps.setLong(9, updatedAt);
                 return ps.executeUpdate();
             }
         }
@@ -464,6 +584,10 @@ public final class Database implements AutoCloseable {
                 ps.setLong(4, deletedAt);
                 ps.executeUpdate();
             }
+            if (deletionsSincePrune.incrementAndGet() >= TOMBSTONE_PRUNE_EVERY) {
+                deletionsSincePrune.set(0);
+                pruneTombstones(connection, System.currentTimeMillis() - TOMBSTONE_TTL_MS);
+            }
         }
     }
 
@@ -474,13 +598,15 @@ public final class Database implements AutoCloseable {
     }
 
     public Optional<PlayerProfile> getPlayer(String uuid) throws SQLException {
-        return queryOne("SELECT uuid, name, last_online, tpa_enabled FROM %splayers WHERE uuid = ?".formatted(prefix),
+        return queryOne(
+                "SELECT uuid, name, last_online, tpa_enabled, tpa_known FROM %splayers WHERE uuid = ?"
+                        .formatted(prefix),
                 ps -> ps.setString(1, uuid), Database::readProfile);
     }
 
     public Optional<PlayerProfile> getPlayerByName(String name) throws SQLException {
-        return queryOne(("SELECT uuid, name, last_online, tpa_enabled FROM %splayers WHERE name = ? COLLATE NOCASE "
-                + "ORDER BY last_online DESC LIMIT 1").formatted(prefix),
+        return queryOne(("SELECT uuid, name, last_online, tpa_enabled, tpa_known FROM %splayers"
+                + " WHERE name = ? COLLATE NOCASE ORDER BY last_online DESC LIMIT 1").formatted(prefix),
                 ps -> ps.setString(1, name), Database::readProfile);
     }
 
@@ -491,12 +617,18 @@ public final class Database implements AutoCloseable {
 
     private static PlayerProfile readProfile(ResultSet rs) throws SQLException {
         return new PlayerProfile(rs.getString("uuid"), rs.getString("name"),
-                rs.getLong("last_online"), rs.getInt("tpa_enabled") != 0);
+                rs.getLong("last_online"), rs.getInt("tpa_enabled") != 0, rs.getInt("tpa_known") != 0);
     }
 
-    /** Every known profile on this server, for resync dumps. */
+    /**
+     * Every known profile on this server, for resync dumps. Rows created as a
+     * position placeholder (name = '', last_online = 0) are skipped: they carry no
+     * identity and must not be republished as if they were a player profile.
+     */
     public List<PlayerProfile> listAllProfiles() throws SQLException {
-        return queryList("SELECT uuid, name, last_online, tpa_enabled FROM %splayers".formatted(prefix),
+        return queryList(
+                ("SELECT uuid, name, last_online, tpa_enabled, tpa_known FROM %splayers"
+                        + " WHERE name <> ''").formatted(prefix),
                 Database::readProfile);
     }
 
@@ -504,10 +636,32 @@ public final class Database implements AutoCloseable {
 
     /** Stores a return position under the given column prefix; {@code null} clears it. */
     public void setPosition(String uuid, Position pos, String colPrefix) throws SQLException {
+        // Validate before touching the database so a bad prefix fails loudly.
+        stampColumn(colPrefix);
         runTransaction(tx -> tx.setPosition(uuid, pos, colPrefix));
     }
 
+    /**
+     * Applies a replicated position only when {@code updatedAt} is at least the
+     * stored version stamp, so a stale snapshot cannot roll a newer position back.
+     *
+     * @return true when the row was written
+     */
+    public boolean setPositionIfNewer(String uuid, Position pos, String colPrefix, long updatedAt)
+            throws SQLException {
+        stampColumn(colPrefix);
+        return transaction(tx -> tx.setPositionIfNewer(uuid, pos, colPrefix, updatedAt));
+    }
+
+    /** Version stamp of one stored position; 0 when the row (or stamp) is absent. */
+    public long getPositionUpdatedAt(String uuid, String colPrefix) throws SQLException {
+        String stamp = stampColumn(colPrefix);
+        return queryOne("SELECT " + stamp + " FROM %splayers WHERE uuid = ?".formatted(prefix),
+                ps -> ps.setString(1, uuid), rs -> rs.getLong(1)).orElse(0L);
+    }
+
     public Optional<Position> getPosition(String uuid, String colPrefix) throws SQLException {
+        stampColumn(colPrefix);
         return queryOne(("SELECT " + colPrefix + "server, " + colPrefix + "world, " + colPrefix + "x, "
                 + colPrefix + "y, " + colPrefix + "z, " + colPrefix + "yaw, " + colPrefix + "pitch"
                 + " FROM %splayers WHERE uuid = ?").formatted(prefix),
@@ -517,7 +671,9 @@ public final class Database implements AutoCloseable {
     private static Position readPrefixedPosition(ResultSet rs, String colPrefix) throws SQLException {
         String server = rs.getString(colPrefix + "server");
         String world = rs.getString(colPrefix + "world");
-        if (server == null || world == null) {
+        if (server == null || server.isBlank() || world == null) {
+            // Same normalisation as readPosition(): a blank server means "unknown",
+            // which is "no stored position" for the caller.
             return null;
         }
         return new Position(server, world, rs.getDouble(colPrefix + "x"), rs.getDouble(colPrefix + "y"),
@@ -528,19 +684,30 @@ public final class Database implements AutoCloseable {
     /** Every stored return position on this server, for resync dumps. */
     public List<StoredPositions> listAllStoredPositions() throws SQLException {
         return queryList(("SELECT uuid, back_server, back_world, back_x, back_y, back_z, back_yaw, back_pitch, "
-                + "death_server, death_world, death_x, death_y, death_z, death_yaw, death_pitch "
+                + "death_server, death_world, death_x, death_y, death_z, death_yaw, death_pitch, "
+                + "back_updated_at, death_updated_at "
                 + "FROM %splayers WHERE back_server IS NOT NULL OR death_server IS NOT NULL").formatted(prefix),
                 rs -> new StoredPositions(rs.getString("uuid"),
-                        readPrefixedPosition(rs, BACK_PREFIX), readPrefixedPosition(rs, DEATH_PREFIX)));
+                        readPrefixedPosition(rs, BACK_PREFIX), readPrefixedPosition(rs, DEATH_PREFIX),
+                        rs.getLong("back_updated_at"), rs.getLong("death_updated_at")));
     }
 
-    public record StoredPositions(String uuid, Position back, Position death) {
+    /** Stored positions of one player plus the version stamp of each kind. */
+    public record StoredPositions(String uuid, Position back, Position death,
+                                  long backUpdatedAt, long deathUpdatedAt) {
     }
 
     // ------------------------------------------------------------------ homes
 
-    public void saveHome(Home home) throws SQLException {
-        runTransaction(tx -> tx.saveHome(home));
+    /**
+     * Saves a home.
+     *
+     * @return true when the row was written; false when a newer deletion tombstone
+     *         or a newer stored row rejected the snapshot (the caller must then not
+     *         treat the home as saved).
+     */
+    public boolean saveHome(Home home) throws SQLException {
+        return transaction(tx -> tx.saveHome(home)) > 0;
     }
 
     public boolean deleteHome(String ownerUuid, String name) throws SQLException {
@@ -582,7 +749,10 @@ public final class Database implements AutoCloseable {
     }
 
     public List<Tombstone> listTombstones() throws SQLException {
-        return queryList("SELECT kind, owner, name, deleted_at FROM %stombstones".formatted(prefix),
+        long cutoff = System.currentTimeMillis() - TOMBSTONE_TTL_MS;
+        return queryList(("SELECT kind, owner, name, deleted_at FROM %stombstones"
+                + " WHERE deleted_at >= ?").formatted(prefix),
+                ps -> ps.setLong(1, cutoff),
                 rs -> new Tombstone(rs.getString("kind"), rs.getString("owner"),
                         rs.getString("name"), rs.getLong("deleted_at")));
     }
@@ -597,6 +767,7 @@ public final class Database implements AutoCloseable {
     // ------------------------------------------------------------------ warps
 
     public void saveWarp(Warp warp) throws SQLException {
+        assertNotInTransaction("saveWarp");
         try (Connection c = provider.acquire(); PreparedStatement ps = c.prepareStatement("""
                 INSERT INTO %swarps (name, server, world, x, y, z, yaw, pitch, created_at)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -617,6 +788,7 @@ public final class Database implements AutoCloseable {
     }
 
     public boolean deleteWarp(String name) throws SQLException {
+        assertNotInTransaction("deleteWarp");
         try (Connection c = provider.acquire();
              PreparedStatement ps = c.prepareStatement("DELETE FROM %swarps WHERE name = ?".formatted(prefix))) {
             ps.setString(1, name);
@@ -683,7 +855,19 @@ public final class Database implements AutoCloseable {
         T map(ResultSet rs) throws SQLException;
     }
 
+    /**
+     * Rejects a pooled acquire from inside an open transaction: with a small pool
+     * that would block until the connection timeout instead of failing fast.
+     */
+    private void assertNotInTransaction(String operation) {
+        if (Boolean.TRUE.equals(inTransaction.get())) {
+            throw new IllegalStateException(operation
+                    + " called from inside Database.transaction(); use the Tx handle instead");
+        }
+    }
+
     private <T> Optional<T> queryOne(String sql, Binder binder, RowMapper<T> mapper) throws SQLException {
+        assertNotInTransaction("query");
         try (Connection c = provider.acquire(); PreparedStatement ps = c.prepareStatement(sql)) {
             binder.bind(ps);
             try (ResultSet rs = ps.executeQuery()) {
@@ -699,6 +883,7 @@ public final class Database implements AutoCloseable {
     }
 
     private <T> List<T> queryList(String sql, RowMapper<T> mapper) throws SQLException {
+        assertNotInTransaction("query");
         List<T> out = new ArrayList<>();
         try (Connection c = provider.acquire(); PreparedStatement ps = c.prepareStatement(sql)) {
             try (ResultSet rs = ps.executeQuery()) {
@@ -714,6 +899,7 @@ public final class Database implements AutoCloseable {
     }
 
     private <T> List<T> queryList(String sql, Binder binder, RowMapper<T> mapper) throws SQLException {
+        assertNotInTransaction("query");
         List<T> out = new ArrayList<>();
         try (Connection c = provider.acquire(); PreparedStatement ps = c.prepareStatement(sql)) {
             binder.bind(ps);
@@ -730,6 +916,7 @@ public final class Database implements AutoCloseable {
     }
 
     private int queryCount(String sql, String param) throws SQLException {
+        assertNotInTransaction("query");
         try (Connection c = provider.acquire(); PreparedStatement ps = c.prepareStatement(sql)) {
             ps.setString(1, param);
             try (ResultSet rs = ps.executeQuery()) {

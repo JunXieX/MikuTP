@@ -26,6 +26,21 @@ public final class ProfileService {
     private final OnlinePlayers onlinePlayers;
     private final String serverId;
     private final Map<UUID, Boolean> tpaEnabled = new ConcurrentHashMap<>();
+    /** How many replicated (non-local) toggles are mirrored for placeholder lookups. */
+    private static final int REPLICATED_TOGGLE_CACHE_SIZE = 4096;
+    /**
+     * Toggles replicated from other backends for players this server does not host.
+     * The placeholder layer must answer from memory (it can run on a region thread,
+     * where a SQLite read is not acceptable), and the local cache only covers local
+     * players; this bounded LRU is the fallback between the two.
+     */
+    private final Map<UUID, Boolean> replicatedToggles = java.util.Collections.synchronizedMap(
+            new java.util.LinkedHashMap<UUID, Boolean>(64, 0.75f, true) {
+                @Override
+                protected boolean removeEldestEntry(Map.Entry<UUID, Boolean> eldest) {
+                    return size() > REPLICATED_TOGGLE_CACHE_SIZE;
+                }
+            });
 
     public ProfileService(JavaPlugin plugin, Tasks tasks, Database database, SyncBus syncBus,
                           OnlinePlayers onlinePlayers, String serverId) {
@@ -45,26 +60,47 @@ public final class ProfileService {
         String name = player.getName();
         long now = System.currentTimeMillis();
         tasks.async(() -> {
+            boolean known;
             try {
                 database.upsertPlayer(uuid.toString(), name, now);
-                database.getPlayer(uuid.toString()).ifPresent(p ->
-                        // Do not clobber a toggle the player flipped while this read
-                        // was in flight.
-                        tpaEnabled.putIfAbsent(uuid, p.tpaEnabled));
+                var profile = database.getPlayer(uuid.toString()).orElse(null);
+                known = profile != null && profile.tpaKnown;
+                if (known) {
+                    // Do not clobber a toggle the player flipped while this read
+                    // was in flight.
+                    tpaEnabled.putIfAbsent(uuid, profile.tpaEnabled);
+                }
             } catch (Exception e) {
                 plugin.getSLF4JLogger().warn("Failed to update profile for {}", name, e);
                 return;
             }
-            publishProfile(uuid, name, now, tpaEnabled.getOrDefault(uuid, true));
+            if (known) {
+                publishProfile(uuid, name, now, tpaEnabled.getOrDefault(uuid, true));
+            } else {
+                // This backend has no trustworthy toggle for the player yet (fresh
+                // row, or a replica that never received one). Ask the network
+                // instead of publishing a guessed default: a real snapshot may
+                // already carry "disabled" and must not be overwritten by "enabled".
+                publishProfileRequest(uuid);
+            }
         });
     }
 
     public void onQuit(UUID uuid) {
-        tpaEnabled.remove(uuid);
+        Boolean last = tpaEnabled.remove(uuid);
+        if (last != null) {
+            // Keep the last known value readable for placeholders after the player
+            // leaves this backend (their local cache entry is gone).
+            replicatedToggles.put(uuid, last);
+        }
     }
 
     public boolean isTpaEnabled(UUID uuid) {
-        return tpaEnabled.getOrDefault(uuid, true);
+        Boolean local = tpaEnabled.get(uuid);
+        if (local != null) {
+            return local;
+        }
+        return replicatedToggles.getOrDefault(uuid, true);
     }
 
     /**
@@ -77,6 +113,10 @@ public final class ProfileService {
         Boolean cached = tpaEnabled.get(uuid);
         if (cached != null) {
             return cached;
+        }
+        Boolean replicated = replicatedToggles.get(uuid);
+        if (replicated != null) {
+            return replicated;
         }
         try {
             return database.getPlayer(uuid.toString()).map(p -> p.tpaEnabled).orElse(true);
@@ -125,6 +165,20 @@ public final class ProfileService {
     }
 
     /**
+     * Asks the network to re-announce a profile whose replicated tpa toggle this
+     * backend does not know yet. A backend that does know it answers with a
+     * PROFILE event, so the local row (and the cache) converge without guessing.
+     */
+    private void publishProfileRequest(UUID uuid) {
+        if (!syncBus.crossServer()) {
+            return;
+        }
+        SyncEvent event = SyncEvent.create(SyncEvent.Type.PROFILE_REQUEST, serverId);
+        event.playerUuid = uuid.toString();
+        syncBus.publish(event);
+    }
+
+    /**
      * Applies a replicated profile from another backend; the write joins the
      * caller's batched transaction and only touches the in-memory toggle after
      * that transaction committed. Ordering is enforced in SQL by the profile
@@ -138,12 +192,20 @@ public final class ProfileService {
         tx.upsertPlayer(event.playerUuid, event.playerName, event.lastOnline);
         boolean written = tx.setTpaEnabled(event.playerUuid, event.tpaEnabled, event.lastOnline) > 0;
         UUID uuid = parseUuid(event.playerUuid);
-        // Only mirror the flag for players this backend hosts; touching Bukkit's
-        // player view from the sync applier thread is not allowed on Folia. A
-        // snapshot older than the stored row is rejected in SQL and skipped here
+        // Mirror the flag after the commit: local players feed the live toggle
+        // cache, remote/offline players feed the bounded placeholder mirror. Both
+        // are plain map writes (no Bukkit player access from the applier thread).
+        // A snapshot older than the stored row is rejected in SQL and skipped here
         // as well, so it cannot roll the toggle back.
-        if (written && uuid != null && onlinePlayers.byId(uuid) != null) {
-            afterCommit.accept(() -> tpaEnabled.put(uuid, event.tpaEnabled));
+        if (written && uuid != null) {
+            if (onlinePlayers.byId(uuid) != null) {
+                afterCommit.accept(() -> tpaEnabled.put(uuid, event.tpaEnabled));
+            } else {
+                // Mirror the replicated value so %mikutp_tpa_enabled% is truthful for
+                // players hosted on another backend, without a database read on the
+                // (possibly region) thread that asks for the placeholder.
+                afterCommit.accept(() -> replicatedToggles.put(uuid, event.tpaEnabled));
+            }
         }
     }
 

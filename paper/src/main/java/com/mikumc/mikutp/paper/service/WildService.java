@@ -42,6 +42,8 @@ public final class WildService {
     private final TeleportService teleports;
     private final OnlinePlayers onlinePlayers;
     private final Map<String, java.util.Optional<Tag<Biome>>> tagCache = new ConcurrentHashMap<>();
+    /** Cleared on plugin shutdown so an in-flight retry chain stops immediately. */
+    private volatile boolean running = true;
 
     public WildService(JavaPlugin plugin, Tasks tasks, MikuTPConfig config, MessageService messages,
                        CooldownManager cooldowns, TeleportService teleports, OnlinePlayers onlinePlayers) {
@@ -60,6 +62,9 @@ public final class WildService {
     }
 
     public void start(Player player) {
+        if (!running) {
+            return;
+        }
         if (!config.wild.enabled) {
             messages.send(player, "wild.disabled");
             return;
@@ -131,6 +136,9 @@ public final class WildService {
     private void attempt(Player player, World world, double centerX, double centerZ,
                          long minRadius, long maxRadius, AtomicInteger attempts) {
         tasks.async(() -> {
+            if (!running) {
+                return;
+            }
             if (!online(player)) {
                 return;
             }
@@ -175,6 +183,9 @@ public final class WildService {
     /** Runs on the region thread that owns the candidate chunk. */
     private void evaluate(Player player, World world, int x, int z,
                           double centerX, double centerZ, long minRadius, long maxRadius, AtomicInteger attempts) {
+        if (!running) {
+            return;
+        }
         if (!online(player)) {
             // Abandon the search and refund the cooldown: the player cannot use
             // it, and leaving it burning would punish them on their next login.
@@ -234,6 +245,11 @@ public final class WildService {
             }
         }
         return false;
+    }
+
+    /** Stops the search/retry chain; pending async steps become no-ops. */
+    public void shutdown() {
+        running = false;
     }
 
     private Tag<Biome> loadTag(String name) {

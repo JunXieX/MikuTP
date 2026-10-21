@@ -6,14 +6,25 @@ public final class PlayerProfile {
     public String name;
     public long lastOnline;
     public boolean tpaEnabled;
+    /**
+     * True once this row carries an authoritative tpa toggle (set by
+     * setTpaEnabled). A plain profile upsert never sets it, so a backend that
+     * only knows the identity cannot publish the default value as the truth.
+     */
+    public boolean tpaKnown;
 
     public PlayerProfile() {
     }
 
     public PlayerProfile(String uuid, String name, long lastOnline, boolean tpaEnabled) {
+        this(uuid, name, lastOnline, tpaEnabled, false);
+    }
+
+    public PlayerProfile(String uuid, String name, long lastOnline, boolean tpaEnabled, boolean tpaKnown) {
         this.uuid = uuid;
         this.name = name;
         this.lastOnline = lastOnline;
         this.tpaEnabled = tpaEnabled;
+        this.tpaKnown = tpaKnown;
     }
 }

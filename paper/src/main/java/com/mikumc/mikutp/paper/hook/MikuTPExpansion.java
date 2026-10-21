@@ -55,13 +55,15 @@ public final class MikuTPExpansion extends PlaceholderExpansion {
 
     @Override
     public @Nullable String onRequest(OfflinePlayer player, @NotNull String params) {
-        String key = params.toLowerCase();
+        String key = params.toLowerCase(java.util.Locale.ROOT);
         UUID id = player == null ? null : player.getUniqueId();
         return switch (key) {
             case "homes_used" -> id == null ? "" : String.valueOf(homeService.homes(id).size());
-            case "homes_max" -> player instanceof Player online ? String.valueOf(homeService.cachedLimit(online.getUniqueId())) : "";
+            case "homes_max" -> player instanceof Player online
+                    ? limitText(homeService.cachedLimit(online.getUniqueId()))
+                    : "";
             case "homes_left" -> player instanceof Player online
-                    ? String.valueOf(Math.max(0, homeService.cachedLimit(online.getUniqueId()) - homeService.homes(id).size()))
+                    ? leftText(homeService.cachedLimit(online.getUniqueId()), homeService.homes(id).size())
                     : "";
             case "warps" -> String.valueOf(warpService.warps().size());
             case "tpa_enabled" -> id == null ? "" : String.valueOf(profiles.isTpaEnabled(id));
@@ -73,5 +75,17 @@ public final class MikuTPExpansion extends PlaceholderExpansion {
             case "server_id" -> serverId;
             default -> null;
         };
+    }
+
+    /**
+     * Unlimited home limits are exposed as infinity; printing
+     * Integer.MAX_VALUE on a scoreboard would be meaningless to players.
+     */
+    private static String limitText(int limit) {
+        return limit == Integer.MAX_VALUE ? "∞" : String.valueOf(limit);
+    }
+
+    private static String leftText(int limit, int used) {
+        return limit == Integer.MAX_VALUE ? "∞" : String.valueOf(Math.max(0, limit - used));
     }
 }

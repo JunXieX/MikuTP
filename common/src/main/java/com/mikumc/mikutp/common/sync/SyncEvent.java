@@ -13,7 +13,7 @@ import java.util.UUID;
 public final class SyncEvent {
 
     public enum Type {
-        HOME_SET, HOME_DELETE, PROFILE, BACK, IGNORE_SET, IGNORE_DELETE,
+        HOME_SET, HOME_DELETE, PROFILE, PROFILE_REQUEST, BACK, IGNORE_SET, IGNORE_DELETE,
         TP_NEW, TP_RESPONDED, TP_READY, TP_CANCEL, RESYNC_REQUEST
     }
 
@@ -36,8 +36,15 @@ public final class SyncEvent {
     public boolean tpaEnabled;
     /** "back" or "death". */
     public String backKind;
-    /** Null clears the stored position. */
+    /** Position payload; null means "no position in this event" (ignored by
+     *  receivers — clearing a stored position is not replicated). */
     public Position backPosition;
+    /**
+     * Version stamp of the published position (0 from legacy senders). A receiver
+     * keeps its own copy when this is older than the stored one, so a resync dump
+     * cannot roll /back or /dback back to a stale position.
+     */
+    public long backUpdatedAt;
 
     // IGNORE_SET / IGNORE_DELETE
     public String blockerUuid;

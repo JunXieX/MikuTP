@@ -1,5 +1,6 @@
 package com.mikumc.mikutp.common.config;
 
+import java.util.ArrayList;
 import java.util.List;
 
 /**
@@ -88,7 +89,16 @@ public final class MikuTPConfig {
         }
     }
 
-    /** Copies every top-level section onto this instance so live references see a reload. */
+    /**
+     * Copies every top-level section onto this instance so live references see a
+     * reload.
+     *
+     * <p>Callers must only invoke this with a <em>fully</em> parsed instance (see
+     * ConfigIO.loadStrict): this method copies field by field, so a partially
+     * initialised model would half-apply itself. Parsing and copying are two
+     * separate steps on purpose — a failed parse must leave the running config
+     * completely untouched.
+     */
     public void copyFrom(MikuTPConfig other) {
         this.configVersion = other.configVersion;
         this.storage = other.storage;
@@ -104,6 +114,96 @@ public final class MikuTPConfig {
         this.commands = other.commands;
         this.languageFile = other.languageFile;
         this.parsePlaceholderApi = other.parsePlaceholderApi;
+    }
+
+    /**
+     * Human-readable problems of a freshly parsed config. The platform layer logs
+     * them (and may refuse a reload); nothing here is silently repaired, because a
+     * silently repaired value is the failure mode that is hardest to diagnose.
+     */
+    public List<String> validationProblems() {
+        List<String> problems = new ArrayList<>();
+        if (storage == null || storage.tablePrefix == null) {
+            problems.add("storage.table_prefix 缺失");
+        }
+        boolean crossServerEnabled = sync != null && sync.enabled();
+        if (crossServer == null || crossServer.serverId == null || crossServer.serverId.isBlank()) {
+            problems.add("cross_server.server_id 不能为空：它是同步事件的来源标识");
+        } else if (crossServerEnabled && "server".equals(crossServer.serverId)) {
+            // The receiver drops events whose origin equals its own id, so two backends
+            // left on the default would silently discard each other's state replication.
+            problems.add("cross_server.server_id 仍是默认值 server：跨服模式下每台后端必须使用唯一 id"
+                    + "（与 velocity.toml 的服务器名一致），否则会互相丢弃对方的同步事件");
+        }
+        if (sync == null) {
+            problems.add("sync 段缺失");
+        } else if (sync.enabled() && (sync.token == null || sync.token.isBlank())) {
+            problems.add("sync.mode=VELOCITY 但 sync.token 为空：所有跨服消息都会被拒绝");
+        }
+        if (teleport == null) {
+            problems.add("teleport 段缺失");
+        } else {
+            if (teleport.warmupSeconds < 0) {
+                problems.add("teleport.warmup_seconds 不能为负数");
+            }
+            if (teleport.moveThresholdBlocks < 0) {
+                problems.add("teleport.move_threshold_blocks 不能为负数");
+            }
+            if (teleport.cooldowns == null) {
+                problems.add("teleport.cooldowns 段缺失");
+            } else if (teleport.cooldowns.home < 0 || teleport.cooldowns.warp < 0
+                    || teleport.cooldowns.tpa < 0 || teleport.cooldowns.wild < 0
+                    || teleport.cooldowns.back < 0 || teleport.cooldowns.dback < 0) {
+                problems.add("teleport.cooldowns 不能为负数");
+            }
+        }
+        if (home == null) {
+            problems.add("home 段缺失");
+        } else {
+            if (home.defaultLimit < 0) {
+                problems.add("home.default_limit 不能为负数");
+            }
+            if (home.namePattern == null || home.namePattern.isBlank()) {
+                problems.add("home.name_pattern 不能为空");
+            } else if (!com.mikumc.mikutp.common.util.Validate.isValidPattern(home.namePattern)) {
+                problems.add("home.name_pattern 不是合法正则：" + home.namePattern);
+            }
+        }
+        if (tpa == null) {
+            problems.add("tpa 段缺失");
+        } else {
+            if (tpa.requestExpirySeconds <= 0) {
+                problems.add("tpa.request_expiry_seconds 必须大于 0");
+            }
+            if (tpa.blockDurationMinutes < 0) {
+                problems.add("tpa.block_duration_minutes 不能为负数");
+            }
+        }
+        if (wild == null) {
+            problems.add("wild 段缺失");
+        } else {
+            if (wild.maxRadius <= 0) {
+                problems.add("wild.max_radius 必须大于 0");
+            }
+            if (wild.minRadius < 0 || wild.minRadius > wild.maxRadius) {
+                problems.add("wild.min_radius 必须在 0 与 wild.max_radius 之间");
+            }
+            if (wild.maxAttempts <= 0) {
+                problems.add("wild.max_attempts 必须大于 0");
+            }
+            if (wild.worlds == null || wild.worlds.isEmpty()) {
+                problems.add("wild.worlds 为空：world_mode=LIST 时将没有候选世界");
+            }
+        }
+        if (dialogs == null) {
+            problems.add("dialogs 段缺失");
+        } else if (dialogs.listPageSize <= 0) {
+            problems.add("dialogs.list_page_size 必须大于 0");
+        }
+        if (languageFile == null || languageFile.isBlank()) {
+            problems.add("language_file 不能为空");
+        }
+        return problems;
     }
 
     public static final class Storage {

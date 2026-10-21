@@ -47,7 +47,8 @@ import java.util.function.Consumer;
  */
 public final class RequestService {
 
-    public enum Response { ACCEPT, DENY, BLOCK }
+    /** FAILED is only published by this backend (hand-off could not be stored). */
+    public enum Response { ACCEPT, DENY, BLOCK, FAILED }
 
     private final JavaPlugin plugin;
     private final Tasks tasks;
@@ -73,7 +74,6 @@ public final class RequestService {
     private final Map<UUID, String> lastIncoming = new ConcurrentHashMap<>();
     /** Request ids that were already answered; replayed TP_NEW events must not re-open them. */
     private final BoundedIdSet answeredRequests = new BoundedIdSet();
-    private final BoundedIdSet deliveredEvents = new BoundedIdSet();
     private final BoundedIdSet handledEvents = new BoundedIdSet();
     /** Request ids a client is answering right now; only one answer may win. */
     private final BoundedIdSet claimedRequests = new BoundedIdSet();
@@ -129,8 +129,11 @@ public final class RequestService {
         // Deferred answers die with the session: they describe a request the
         // player was waiting for while offline, and replaying them on a later
         // login of a stale copy would teleport them unexpectedly.
-        // The quitting player's incoming requests are dropped locally: the proxy
-        // mailbox redelivers unanswered requests on rejoin.
+        deferred.remove(player);
+        // The quitting player's incoming requests are dropped locally. Undelivered
+        // requests live in the proxy mailbox; a request that was already delivered
+        // is re-delivered by the proxy when the player switches servers, so a
+        // dropped local copy is not lost.
         Map<String, TpRequest> mine = incoming.remove(player);
         if (mine != null) {
             // Deferred-show marks only make sense while the request is tracked;
@@ -214,6 +217,12 @@ public final class RequestService {
     }
 
     private void proceed(Player requester, UUID targetId, String targetName, boolean here) {
+        // The target lookup may have taken an async hop: a player who quit in the
+        // meantime already had their outgoing request cancelled by onQuit, and a
+        // new one must not be resurrected for them.
+        if (onlinePlayers.byId(requester.getUniqueId()) == null) {
+            return;
+        }
         // All checks passed: burn the cooldown atomically (two /tpa in flight must
         // not both pass), then revoke the previous outgoing request and send.
         long remaining = cooldowns.tryConsume(requester.getUniqueId(), CooldownManager.Kind.TPA);
@@ -298,6 +307,9 @@ public final class RequestService {
     // ------------------------------------------------------------------ responding
 
     public void respond(Player target, String requestId, Response response) {
+        if (featureDisabled(target)) {
+            return;
+        }
         tasks.async(() -> {
             Map<String, TpRequest> mine = incoming.get(target.getUniqueId());
             if (mine == null) {
@@ -338,13 +350,20 @@ public final class RequestService {
             if (tasks.owns(target)) {
                 respondCommon(target, request, response);
             } else {
-                tasks.entity(target, () -> respondCommon(target, request, response));
+                // A retiring entity must not swallow the answer: the player did click
+                // the button, so the hand-off still has to reach the requester.
+                tasks.entity(target,
+                        () -> respondCommon(target, request, response),
+                        () -> respondDetached(target.getUniqueId(), request, response));
             }
         });
     }
 
     /** Responds to the most recent pending request delivered to the player. */
     public void respondLatest(Player target, Response response) {
+        if (featureDisabled(target)) {
+            return;
+        }
         UUID targetId = target.getUniqueId();
         String id = lastIncoming.get(targetId);
         if (id == null) {
@@ -364,6 +383,9 @@ public final class RequestService {
 
     /** Responds to the pending request sent by the given player. */
     public void respondFromPlayer(Player target, String requesterName, Response response) {
+        if (featureDisabled(target)) {
+            return;
+        }
         tasks.async(() -> {
             Map<String, TpRequest> mine = incoming.get(target.getUniqueId());
             if (mine != null) {
@@ -379,50 +401,84 @@ public final class RequestService {
     }
 
     /** Shows the answer to the target and hands the accepted teleport off.
-     * Runs on the target's entity thread: it plays sounds and reads the
-     * requester's live position. */
+     * Runs on the target's entity thread: it plays sounds and touches the dialog. */
     private void respondCommon(Player target, TpRequest request, Response response) {
+        // The request was answered: the dialog must not stay clickable.
+        target.closeDialog();
         effects.click(target);
         switch (response) {
             case ACCEPT -> messages.send(target, "tpa.accepted-target", "player", request.requesterName);
             case DENY -> messages.send(target, "tpa.denied-target", "player", request.requesterName);
             case BLOCK -> messages.send(target, "tpa.blocked-target", "player", request.requesterName,
                     "minutes", blockMinutesLabel());
+            case FAILED -> {
+                // Never produced by an answer; handled for exhaustiveness.
+            }
         }
+        finishResponse(target.getUniqueId(), request, response);
+    }
+
+    /**
+     * Applies an answer whose target session retired before it could run on the
+     * entity thread. Nothing here needs entity state, so the hand-off survives a
+     * quit that raced the click.
+     */
+    private void respondDetached(UUID targetId, TpRequest request, Response response) {
+        finishResponse(targetId, request, response);
+    }
+
+    /** Feedback to the requester and the actual hand-off (local teleport or bus). */
+    private void finishResponse(UUID targetId, TpRequest request, Response response) {
         UUID requesterId = parseUuid(request.requesterUuid);
         Player requester = requesterId == null ? null : onlinePlayers.byId(requesterId);
         if (requester != null) {
             // Both parties are on this server: teleport locally, no bus event needed.
             switch (response) {
                 case ACCEPT -> {
-                    Player mover = request.type == TpRequest.Type.GO ? requester : target;
-                    Player anchor = request.type == TpRequest.Type.GO ? target : requester;
-                    // The label names the destination: the target for GO, the
-                    // requester for COME.
-                    String label = request.type == TpRequest.Type.GO
-                            ? request.targetName : request.requesterName;
                     messages.send(requester, "tpa.accepted-requester", "player", request.targetName);
-                    if (onlinePlayers.byId(mover.getUniqueId()) != null) {
-                        teleports.sendLocalTo(mover, anchor, label, true);
+                    if (request.type == TpRequest.Type.GO) {
+                        Player anchor = onlinePlayers.byId(targetId);
+                        if (anchor != null) {
+                            teleports.sendLocalTo(requester, anchor, request.targetName, true);
+                        }
+                    } else {
+                        // Come-here: the target travels to the requester.
+                        Player mover = onlinePlayers.byId(targetId);
+                        if (mover != null) {
+                            teleports.sendLocalTo(mover, requester, request.requesterName, true);
+                        }
                     }
                 }
                 case DENY -> messages.send(requester, "tpa.denied-requester", "player", request.targetName);
                 case BLOCK -> messages.send(requester, "tpa.blocked-requester", "player", request.targetName);
+                case FAILED -> messages.send(requester, "common.teleport-failed");
             }
             return;
         }
+        finishAccept(targetId, requesterId, request, response);
+    }
+
+    /** The requester is not on this backend: hand the answer to the bus. */
+    private void finishAccept(UUID targetId, UUID requesterId, TpRequest request, Response response) {
         if (!syncBus.crossServer()) {
             return; // requester is gone and there is no cross-server path left
         }
         if (response == Response.ACCEPT && request.type == TpRequest.Type.GO) {
             // The requester travels here; stash our position for their arrival and
             // only announce the acceptance once the payload is durably stored.
-            teleports.stashPendingTeleport(requesterId,
-                    target.getUniqueId(), PendingTeleport.Source.TPA,
-                    () -> publishResponded(request, response));
+            teleports.stashPendingTeleport(requesterId, targetId, PendingTeleport.Source.TPA,
+                    () -> publishResponded(request, response),
+                    () -> publishResponded(request, Response.FAILED));
             return;
         }
         publishResponded(request, response);
+    }
+
+    /** True while the request is still inside its configured lifetime. */
+    private boolean withinLifetime(TpRequest request) {
+        long expiryMs = config.tpa.requestExpirySeconds * 1000L;
+        return request.id != null
+                && request.createdAt + expiryMs >= System.currentTimeMillis();
     }
 
     /** Placeholder text for a block duration; 0 means "until unblocked". */
@@ -457,9 +513,15 @@ public final class RequestService {
         if (featureDisabled(player)) {
             return;
         }
-        boolean next = !profiles.tpaEnabledFor(player.getUniqueId());
-        profiles.setTpaEnabled(player.getUniqueId(), next);
-        messages.send(player, next ? "tpa.toggled-on" : "tpa.toggled-off");
+        // tpaEnabledFor() falls back to a database read when the runtime cache is
+        // cold (right after /reload): that read must not run on the region thread.
+        UUID id = player.getUniqueId();
+        tasks.async(() -> {
+            boolean next = !profiles.tpaEnabledFor(id);
+            profiles.setTpaEnabled(id, next);
+            tasks.entity(player,
+                    () -> messages.send(player, next ? "tpa.toggled-on" : "tpa.toggled-off"));
+        });
     }
 
     public void block(Player blocker, String targetName, boolean permanent) {
@@ -468,9 +530,12 @@ public final class RequestService {
         }
         UUID blockerId = blocker.getUniqueId();
         // 0 (or less) means "until unblocked", the same rule the request dialog's
-        // block button uses through storeIgnore().
+        // block button uses through storeIgnore(). The configured duration is the
+        // single source of truth, so /tpblock no longer silently becomes permanent
+        // when the config asks for a timed block.
         int minutes = config.tpa.blockDurationMinutes;
-        long expiresAt = permanent || minutes <= 0 ? IgnoreEntry.PERMANENT
+        boolean permanentBlock = minutes <= 0;
+        long expiresAt = permanentBlock ? IgnoreEntry.PERMANENT
                 : System.currentTimeMillis() + minutes * 60_000L;
         // resolve() completes synchronously for a local player, so the database
         // write must be pushed onto the async pool explicitly: on Folia a region
@@ -495,7 +560,7 @@ public final class RequestService {
                 event.createdAt = System.currentTimeMillis();
                 syncBus.publish(event);
             }
-            if (permanent) {
+            if (permanentBlock) {
                 messages.send(blocker, "tpa.blocked-permanent-target", "player", opt.get().name());
             } else {
                 messages.send(blocker, "tpa.blocked-target", "player", opt.get().name(),
@@ -642,15 +707,16 @@ public final class RequestService {
         if (request == null || request.id == null || request.targetUuid == null) {
             return;
         }
-        if (event.id != null && !deliveredEvents.add(event.id)) {
-            return;
-        }
         long now = System.currentTimeMillis();
         if (request.status != TpRequest.Status.PENDING
                 || answeredRequests.contains(request.id)
                 || request.createdAt + config.tpa.requestExpirySeconds * 1000L < now) {
             return;
         }
+        // Dedupe by request id, never by event id: the proxy re-delivers the last
+        // pending TP_NEW when the target switches servers (and after the local copy
+        // was dropped on quit), so an event-id guard would hide a still-live request.
+        // trackIncoming() is the request-level idempotency point.
         if (trackIncoming(request)) {
             showToTarget(request);
         }
@@ -776,7 +842,10 @@ public final class RequestService {
             showNow(target, request);
             return;
         }
-        tasks.entity(target, () -> showNow(target, request));
+        // If the session retires before the task runs the request stays tracked, so
+        // remember it for re-delivery on the next join instead of losing it.
+        tasks.entity(target, () -> showNow(target, request),
+                () -> awaitingShow.add(request.id));
     }
 
     /** Renders the request to its target; runs on the target's own thread. */
@@ -814,6 +883,20 @@ public final class RequestService {
         if (event.id == null || !handledEvents.add(event.id)) {
             return;
         }
+        // TP_CANCEL and TP_RESPONDED can cross on the bus: an answer for a request
+        // that was withdrawn, replaced or has already expired must not teleport
+        // anyone.
+        if (!withinLifetime(request) || answeredRequests.contains(request.id)) {
+            return;
+        }
+        if (parsed == Response.ACCEPT) {
+            // The requester must still be waiting for this exact request; a newer
+            // /tpa already revoked it and published TP_CANCEL.
+            TpRequest tracked = requesterId == null ? null : outgoingRequests.get(requesterId);
+            if (tracked == null || !tracked.id.equals(request.id)) {
+                return;
+            }
+        }
         clearOutgoing(request.requesterUuid, request.id);
         tasks.entity(requester, () -> {
             switch (parsed) {
@@ -840,12 +923,14 @@ public final class RequestService {
                                         SyncEvent ready = SyncEvent.create(SyncEvent.Type.TP_READY, serverId);
                                         ready.request = request;
                                         syncBus.publish(ready);
-                                    });
+                                    },
+                                    () -> messages.send(requester, "common.teleport-failed"));
                         }
                     }
                 }
                 case DENY -> messages.send(requester, "tpa.denied-requester", "player", request.targetName);
                 case BLOCK -> messages.send(requester, "tpa.blocked-requester", "player", request.targetName);
+                case FAILED -> messages.send(requester, "common.teleport-failed");
             }
         });
     }
@@ -853,6 +938,11 @@ public final class RequestService {
     private void processReady(SyncEvent event) {
         TpRequest request = event.request;
         if (request == null) {
+            return;
+        }
+        // A ready signal for a request that has already expired must not fire a
+        // teleport on a player who is no longer waiting for it.
+        if (!withinLifetime(request)) {
             return;
         }
         UUID moverId = parseUuid(request.targetUuid);

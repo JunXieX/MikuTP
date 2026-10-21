@@ -43,6 +43,10 @@ public final class HomeService {
     private final Map<UUID, Long> sessions = new ConcurrentHashMap<>();
     /** When each player was last seen leaving; their cache is pruned lazily. */
     private final Map<UUID, Long> departedAt = new ConcurrentHashMap<>();
+    /** Homes removed by a local /delhome: a replicated SET snapshot older than the
+     * removal must never be written back into the cache (the database tombstone
+     * rejects the row, so the cache has to reject it too). */
+    private final Map<UUID, Map<String, Long>> localDeletes = new ConcurrentHashMap<>();
     /** How long a departed player's cached list is kept before being pruned. */
     private static final long DEPARTED_TTL_MS = 5 * 60 * 1000L;
     /** Period of the lazy prune: no thread of its own, driven from onJoin. */
@@ -141,9 +145,15 @@ public final class HomeService {
             // either applied before the drop or after the sweep, never lost in
             // between.
             synchronized (lockFor(id)) {
+                // The player may have joined while we waited for the stripe: the new
+                // session's load must not be discarded by this prune.
+                if (onlinePlayers.byId(id) != null) {
+                    return false;
+                }
                 cache.remove(id);
                 loadedPlayers.remove(id);
                 sessions.remove(id);
+                localDeletes.remove(id);
             }
             return true;
         });
@@ -259,7 +269,14 @@ public final class HomeService {
                             }
                         }
                         Home home = new Home(id.toString(), wanted, positionOf(loc), System.currentTimeMillis());
-                        database.saveHome(home);
+                        if (!database.saveHome(home)) {
+                            // Rejected by a deletion tombstone replicated from another
+                            // backend: nothing was written, so neither the cache nor the
+                            // player may be told the home exists.
+                            messages.send(player, "home.save-failed");
+                            return;
+                        }
+                        clearLocalDelete(id, wanted);
                         cache.put(id, sort(replace(current, home)));
                         messages.send(player, "home.set", "name", wanted);
                         publishHomeSet(home);
@@ -289,11 +306,25 @@ public final class HomeService {
                             break;
                         }
                     }
-                    long deletedAt = System.currentTimeMillis();
-                    if (match == null || !database.deleteHome(id.toString(), match.name)) {
+                    if (match == null) {
                         messages.send(player, "home.not-found", "name", wanted);
                         return;
                     }
+                    long deletedAt = System.currentTimeMillis();
+                    // Call the deleting write only when the database still holds the
+                    // row: Database.deleteHome always records a tombstone, and a
+                    // tombstone for a row that never existed here would block a
+                    // slightly older replication of that home forever.
+                    if (database.getHome(id.toString(), match.name).isEmpty()
+                            || !database.deleteHome(id.toString(), match.name)) {
+                        // The cache was ahead of the database (e.g. a remote delete was
+                        // applied in between): drop the stale entry, but write no tombstone.
+                        cache.put(id, sort(current.stream()
+                                .filter(h -> !h.name.equalsIgnoreCase(wanted)).toList()));
+                        messages.send(player, "home.not-found", "name", wanted);
+                        return;
+                    }
+                    markLocalDelete(id, match.name, deletedAt);
                     cache.put(id, sort(current.stream()
                             .filter(h -> !h.name.equalsIgnoreCase(wanted)).toList()));
                     messages.send(player, "home.deleted", "name", wanted);
@@ -355,9 +386,19 @@ public final class HomeService {
             afterCommit.accept(() -> {
                 synchronized (lockFor(owner)) {
                     List<Home> current = cache.get(owner);
-                    if (current != null) {
-                        cache.put(owner, sort(replace(current, home)));
+                    if (current == null) {
+                        return;
                     }
+                    // A /delhome that committed after this snapshot was taken must
+                    // win: the database tombstone rejects the replicated row, so
+                    // writing it into the cache would leave the two diverged.
+                    Long deletedAt = localDeletes
+                            .getOrDefault(owner, Map.of())
+                            .get(home.name.toLowerCase(java.util.Locale.ROOT));
+                    if (deletedAt != null && deletedAt >= home.createdAt) {
+                        return;
+                    }
+                    cache.put(owner, sort(replace(current, home)));
                 }
             });
         }
@@ -448,7 +489,23 @@ public final class HomeService {
     }
 
     private static List<Home> sort(List<Home> homes) {
-        return homes.stream().sorted(Comparator.comparing(h -> h.name.toLowerCase())).toList();
+        return homes.stream()
+                .sorted(Comparator.comparing(h -> h.name.toLowerCase(java.util.Locale.ROOT)))
+                .toList();
+    }
+
+    /** Records that {@code name} was deleted locally at {@code deletedAt}. */
+    private void markLocalDelete(UUID owner, String name, long deletedAt) {
+        localDeletes.computeIfAbsent(owner, key -> new ConcurrentHashMap<>())
+                .merge(name.toLowerCase(java.util.Locale.ROOT), deletedAt, Math::max);
+    }
+
+    /** A locally created/updated home supersedes any recorded local deletion. */
+    private void clearLocalDelete(UUID owner, String name) {
+        Map<String, Long> stamps = localDeletes.get(owner);
+        if (stamps != null) {
+            stamps.remove(name.toLowerCase(java.util.Locale.ROOT));
+        }
     }
 
     private Position positionOf(Location loc) {
