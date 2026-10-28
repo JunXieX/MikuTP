@@ -29,10 +29,11 @@ import java.util.function.Consumer;
 public final class VelocitySyncBus implements SyncBus {
 
     private static final int FLUSH_INTERVAL_MS = 150;
-    /** 48 ops stay below Bukkit's 32767-byte plugin-message cap even for the largest
-     * event kind (measured: 48 TP_CANCEL ops ≈31,173B = 827B under the 32,000
-     * budget / 1,594B under the 32,767 cap; 48 TP_NEW ≈31,029B). Anything that still
-     * exceeds MAX_FRAME_BYTES is split defensively below. */
+    /** How many ops one frame normally carries. The authoritative limit is the byte
+     * budget below: {@code send} re-checks the encoded size and splits a batch that
+     * still exceeds it, so this only decides how many event objects travel together.
+     * Events are inlined (no escaping pass), which keeps the largest kinds well
+     * inside the cap at this count. */
     private static final int MAX_OPS_PER_BATCH = 48;
     /** Bukkit caps one plugin message at 32767 bytes; stay clear of the edge. */
     private static final int MAX_FRAME_BYTES = 32_000;
@@ -82,7 +83,7 @@ public final class VelocitySyncBus implements SyncBus {
 
     @Override
     public void publish(SyncEvent event) {
-        enqueue(ProxyMessages.eventOp(ConfigIO.gson().toJson(event)));
+        enqueue(ProxyMessages.eventOp(event));
     }
 
     @Override

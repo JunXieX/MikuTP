@@ -5,6 +5,7 @@ import com.google.gson.JsonArray;
 import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
+import com.mikumc.mikutp.common.sync.SyncEvent;
 
 import javax.crypto.Mac;
 import javax.crypto.spec.SecretKeySpec;
@@ -157,12 +158,44 @@ public final class ProxyMessages {
         return o.toString();
     }
 
-    /** Bus op carrying one sync event. */
-    public static JsonObject eventOp(String eventJson) {
+    /**
+     * Bus op carrying one sync event. The event is inlined as an object instead of
+     * being embedded as an escaped JSON string: the string form needs one extra
+     * escaping pass (about a tenth of the op) and cost the proxy a second parse of
+     * the same text. Building the tree straight from the event also removes the
+     * serialize/parse round trip the string form required on this side.
+     */
+    public static JsonObject eventOp(SyncEvent event) {
         JsonObject op = new JsonObject();
         op.addProperty("k", "event");
-        op.addProperty("e", eventJson);
+        op.add("e", GSON.toJsonTree(event));
         return op;
+    }
+
+    /**
+     * Reads the event of a bus op. Current senders inline the object; the escaped
+     * string form of a backend that predates the inlined encoding is still accepted,
+     * so the proxy can be upgraded before the backends are.
+     *
+     * @return null when the op carries no usable event (a malformed event must not
+     *         abort the rest of its batch)
+     */
+    public static SyncEvent event(JsonObject op) {
+        JsonElement element = op.get("e");
+        if (element == null) {
+            return null;
+        }
+        try {
+            if (element.isJsonObject()) {
+                return GSON.fromJson(element, SyncEvent.class);
+            }
+            if (element.isJsonPrimitive()) {
+                return GSON.fromJson(element.getAsString(), SyncEvent.class);
+            }
+        } catch (Exception ignored) {
+            // Malformed event: the caller drops it.
+        }
+        return null;
     }
 
     /**

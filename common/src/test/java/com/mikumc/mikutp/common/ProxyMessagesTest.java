@@ -76,6 +76,33 @@ class ProxyMessagesTest {
         assertEquals(1.0, parsed.homePosition.x);
     }
 
+    /** Bus events travel inlined; the reader still accepts the escaped legacy form. */
+    @Test
+    void busEventIsInlinedAndLegacyStringStillReadable() {
+        SyncEvent event = SyncEvent.create(SyncEvent.Type.HOME_SET, "s1");
+        event.ownerUuid = "uuid-a";
+        event.homeName = "base";
+        event.homePosition = new Position("s1", "world", 1, 2, 3, 0f, 0f);
+
+        JsonObject inlined = ProxyMessages.eventOp(event);
+        assertTrue(inlined.get("e").isJsonObject(), "the event must travel as an object");
+        SyncEvent read = ProxyMessages.event(inlined);
+        assertEquals(SyncEvent.Type.HOME_SET, read.type);
+        assertEquals("base", read.homeName);
+
+        // A backend that predates the inlined form still sends the escaped string.
+        JsonObject legacy = new JsonObject();
+        legacy.addProperty("k", "event");
+        legacy.addProperty("e", ConfigIO.gson().toJson(event));
+        assertEquals("base", ProxyMessages.event(legacy).homeName);
+
+        // Garbage in the member is dropped instead of throwing.
+        JsonObject broken = new JsonObject();
+        broken.addProperty("e", "not json");
+        assertNull(ProxyMessages.event(broken));
+        assertNull(ProxyMessages.event(new JsonObject()));
+    }
+
     @Test
     void signatureRoundTripsAndRejectsTampering() {
         String token = "shared-secret";
