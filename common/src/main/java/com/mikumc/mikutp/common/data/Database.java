@@ -248,23 +248,13 @@ public final class Database implements AutoCloseable {
                   deleted_at BIGINT NOT NULL,
                   PRIMARY KEY (kind, owner, name)
                 )""".formatted(prefix));
-        index("CREATE INDEX IF NOT EXISTS %sidx_homes_owner ON %shomes (owner_uuid)".formatted(prefix, prefix));
-        index("CREATE INDEX IF NOT EXISTS %sidx_players_name ON %splayers (name COLLATE NOCASE)".formatted(prefix, prefix));
-        index("CREATE INDEX IF NOT EXISTS %sidx_warps_server ON %swarps (server)".formatted(prefix, prefix));
+        exec("CREATE INDEX IF NOT EXISTS %sidx_homes_owner ON %shomes (owner_uuid)".formatted(prefix, prefix));
+        exec("CREATE INDEX IF NOT EXISTS %sidx_players_name ON %splayers (name COLLATE NOCASE)".formatted(prefix, prefix));
+        exec("CREATE INDEX IF NOT EXISTS %sidx_warps_server ON %swarps (server)".formatted(prefix, prefix));
         // Tombstones only need to outlive the replication window (a resync dump).
         // Anything older cannot be contradicted by a snapshot that still exists.
         exec("DELETE FROM %stombstones WHERE deleted_at < %d"
                 .formatted(prefix, System.currentTimeMillis() - TOMBSTONE_TTL_MS));
-    }
-
-    private void index(String sql) throws SQLException {
-        try {
-            exec(sql);
-        } catch (SQLException e) {
-            if (!String.valueOf(e.getMessage()).toLowerCase(Locale.ROOT).contains("already exists")) {
-                throw e;
-            }
-        }
     }
 
     /** Adds only the columns the live table does not already have (no exception churn). */
@@ -441,12 +431,31 @@ public final class Database implements AutoCloseable {
         public boolean deleteHomeAndTombstone(String ownerUuid, String name, long deletedAt) throws SQLException {
             // Local /delhome: row delete and tombstone commit (or roll back) together,
             // so a crash between them can neither lose the delete nor the stamp.
-            int removed = deleteHomeRows(ownerUuid, name, deletedAt);
+            //
+            // The stamp is raised above the row it removes: a home written by a
+            // backend whose clock runs ahead carries a createdAt in the future, and
+            // the plain "created_at < deletedAt" guard would then keep it alive while
+            // the player is told the home does not exist. Raising the stamp stays
+            // monotonic, so peers still order the deletion correctly.
+            long deletedStamp = Math.max(deletedAt, newestHomeCreatedAt(ownerUuid, name) + 1L);
+            int removed = deleteHomeRows(ownerUuid, name, deletedStamp);
             if (removed == 0) {
                 return false; // no row here: a tombstone would block an older replication
             }
-            recordDeletion("home", ownerUuid, name, deletedAt);
+            recordDeletion("home", ownerUuid, name, deletedStamp);
             return true;
+        }
+
+        /** Newest creation stamp of one stored home, 0 when there is no such row. */
+        private long newestHomeCreatedAt(String ownerUuid, String name) throws SQLException {
+            try (PreparedStatement ps = connection.prepareStatement(
+                    "SELECT MAX(created_at) FROM %shomes WHERE owner_uuid = ? AND name = ?".formatted(prefix))) {
+                ps.setString(1, ownerUuid);
+                ps.setString(2, name);
+                try (ResultSet rs = ps.executeQuery()) {
+                    return rs.next() ? rs.getLong(1) : 0L;
+                }
+            }
         }
 
         /** Deletes only rows older than {@code deletedAt}; a re-created home survives. */
@@ -482,9 +491,10 @@ public final class Database implements AutoCloseable {
         public int setTpaEnabled(String uuid, boolean enabled, long at) throws SQLException {
             // Ordering uses the dedicated toggle stamp, never last_online: an older
             // toggle snapshot is rejected even when the identity is newer (and a
-            // newer toggle is accepted even when last_online is further ahead).
-            // last_online only moves forward, so a late toggle can never roll the
-            // profile order back.
+            // newer toggle is accepted even when last_online is further ahead). The
+            // identity clock is deliberately left alone here — a toggle is not a
+            // login, and letting it advance last_online would make a peer's toggle
+            // stamp able to reject later name updates.
             //
             // Equal stamps need a deterministic tiebreak. With a plain "<=", two
             // backends writing opposite values in the same millisecond would accept
@@ -493,8 +503,7 @@ public final class Database implements AutoCloseable {
             // to "disabled" - the privacy-safe direction - and an equal-stamp repeat
             // of the same value writes nothing.
             try (PreparedStatement ps = connection.prepareStatement(
-                    ("UPDATE %splayers SET tpa_enabled = ?, tpa_known = 1, tpa_updated_at = ?,"
-                            + " last_online = CASE WHEN last_online < ? THEN ? ELSE last_online END"
+                    ("UPDATE %splayers SET tpa_enabled = ?, tpa_known = 1, tpa_updated_at = ?"
                             + " WHERE uuid = ?"
                             + " AND (tpa_updated_at < ?"
                             + "      OR (tpa_updated_at = ? AND tpa_enabled = 1 AND ? = 0))")
@@ -502,12 +511,10 @@ public final class Database implements AutoCloseable {
                 int flag = enabled ? 1 : 0;
                 ps.setInt(1, flag);
                 ps.setLong(2, at);
-                ps.setLong(3, at);
+                ps.setString(3, uuid);
                 ps.setLong(4, at);
-                ps.setString(5, uuid);
-                ps.setLong(6, at);
-                ps.setLong(7, at);
-                ps.setInt(8, flag);
+                ps.setLong(5, at);
+                ps.setInt(6, flag);
                 return ps.executeUpdate();
             }
         }

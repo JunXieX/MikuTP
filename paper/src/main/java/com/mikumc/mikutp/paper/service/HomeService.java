@@ -272,7 +272,12 @@ public final class HomeService {
                         // Pre-lowercase rows from older versions: remove case variants first.
                         for (Home existing : current) {
                             if (!existing.name.equals(wanted) && existing.name.equalsIgnoreCase(wanted)) {
-                                database.deleteHome(id.toString(), existing.name);
+                                // Only a row that really exists earns a tombstone: the
+                                // cache can be ahead of the database here, and a
+                                // tombstone for a missing row would block a slightly
+                                // older replication of that spelling.
+                                database.deleteHomeAndTombstone(id.toString(), existing.name,
+                                        System.currentTimeMillis());
                             }
                         }
                         Home home = new Home(id.toString(), wanted, positionOf(loc), System.currentTimeMillis());
@@ -468,7 +473,7 @@ public final class HomeService {
                 return;
             }
             messages.send(player, "home.going", "name", home.name);
-            teleports.send(player, home.position, PendingTeleport.Source.HOME, home.name, null);
+            teleports.send(player, home.position, PendingTeleport.Source.HOME, home.name);
         });
     }
 

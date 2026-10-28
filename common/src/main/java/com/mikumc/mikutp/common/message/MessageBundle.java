@@ -22,7 +22,7 @@ public final class MessageBundle {
     private volatile Map<String, String> overrides = Map.of();
 
     public MessageBundle(String bundledDefaults) {
-        this.bundled = parse(new StringReader(bundledDefaults), Map.of());
+        this.bundled = parse(new StringReader(bundledDefaults));
     }
 
     /**
@@ -36,7 +36,7 @@ public final class MessageBundle {
             return true;
         }
         try (Reader reader = Files.newBufferedReader(file, StandardCharsets.UTF_8)) {
-            overrides = parse(reader, bundled);
+            overrides = parse(reader);
             return true;
         } catch (Exception e) {
             // Keep the bundled layer; the caller decides whether to surface it.
@@ -58,11 +58,16 @@ public final class MessageBundle {
         return overrides.containsKey(key) || bundled.containsKey(key);
     }
 
-    private static Map<String, String> parse(Reader reader, Map<String, String> fallback) {
+    /**
+     * Parses a bundle. A root that is not a JSON object is a broken bundle, not an
+     * empty one: returning an empty map here would silently fall back to the
+     * bundled texts instead of reporting the file the operator has to fix.
+     */
+    private static Map<String, String> parse(Reader reader) {
         Map<String, String> parsed = new HashMap<>();
         com.google.gson.JsonElement root = com.google.gson.JsonParser.parseReader(reader);
         if (!root.isJsonObject()) {
-            return fallback;
+            throw new IllegalArgumentException("message bundle root must be a JSON object");
         }
         for (Map.Entry<String, com.google.gson.JsonElement> e : root.getAsJsonObject().entrySet()) {
             if (!e.getValue().isJsonPrimitive()) {

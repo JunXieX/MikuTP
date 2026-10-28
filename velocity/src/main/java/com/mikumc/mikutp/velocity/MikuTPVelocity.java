@@ -67,7 +67,7 @@ public final class MikuTPVelocity {
      * Must equal the Gradle {@code version} in the root build script; the CI
      * "Verify versions agree" step fails the build when the two drift apart.
      */
-    public static final String VERSION = "1.7.0";
+    public static final String VERSION = "1.8.0";
 
     private static final MinecraftChannelIdentifier CHANNEL =
             MinecraftChannelIdentifier.create("mikumc", "mikutp");
@@ -78,6 +78,12 @@ public final class MikuTPVelocity {
     /** Cap per-server backlog: a server that stays empty must not grow the queue
      * without bound. Older events are shed — the activation resync re-converges. */
     private static final int MAX_QUEUED_EVENTS = 4096;
+    /** A batch that a connection keeps refusing is dropped instead of blocking its
+     * server's queue behind a frame that can never be delivered. */
+    private static final int MAX_SEND_ATTEMPTS = 3;
+    /** Character budget of one frame, so a pathological batch stays well below the
+     * packet limit instead of being rejected as a whole. */
+    private static final int MAX_FRAME_CHARS = 64 * 1024;
     /** Hard cap on how many events one player's mailbox may hold (oldest shed). */
     private static final int MAX_MAILBOX_ENTRIES = 32;
     /** Hard cap on how many distinct players may hold a mailbox at once. */
@@ -125,8 +131,8 @@ public final class MikuTPVelocity {
     private final Map<UUID, List<MailboxEntry>> mailboxes = new ConcurrentHashMap<>();
     /** Recent TP_NEW copies, keyed by target uuid; re-delivered after a switch. */
     private final Map<UUID, List<RecentRequest>> recentRequests = new ConcurrentHashMap<>();
-    /** Events queued for servers that currently have no players. */
-    private final Map<String, java.util.ArrayDeque<String>> outbound = new ConcurrentHashMap<>();
+    /** Events queued for a server, each with the number of send attempts it survived. */
+    private final Map<String, java.util.ArrayDeque<QueuedEvent>> outbound = new ConcurrentHashMap<>();
     /** One monitor per server queue: draining and sending must be atomic with
      * respect to each other, otherwise two senders can emit batches out of order
      * and a HOME_SET/HOME_DELETE pair lands reversed. */
@@ -137,6 +143,8 @@ public final class MikuTPVelocity {
     private volatile boolean warnedMalformed = false;
     /** One-shot warning for a handoff dropped after the destination refused it. */
     private volatile boolean warnedDroppedHandoff = false;
+    /** One-shot warning for queued events dropped after too many refused sends. */
+    private volatile boolean warnedDroppedEvents = false;
     /** Periodic expiry sweep; cancelled on shutdown. */
     private com.velocitypowered.api.scheduler.ScheduledTask sweepTask;
     /** Periodic backlog pump; cancelled on shutdown. */
@@ -147,6 +155,10 @@ public final class MikuTPVelocity {
     }
 
     private record MailboxEntry(String json, long expiry) {
+    }
+
+    /** One queued event object plus how many send attempts it already survived. */
+    private record QueuedEvent(String json, int attempts) {
     }
 
     private record RecentRequest(String requestId, String json, long expiry) {
@@ -434,21 +446,21 @@ public final class MikuTPVelocity {
                 System.currentTimeMillis() + pendingTtlMillis(op), destServer, anchorUuid, anchorServer);
         putPending(id, entry);
         // The connect request and the handoff travel on different paths, so the
-        // player may already have arrived. Hand it over immediately only when
-        // the current server *is* the destination.
-        if (destServer != null) {
-            server.getPlayer(id).flatMap(Player::getCurrentServer).ifPresent(connection -> {
-                if (destServer.equals(connection.getServerInfo().getName())
-                        && pendingEntries.remove(id, entry)
-                        && !send(connection, ProxyMessages.encodePending(uuid, payload, 0))) {
-                    // The player is already on the destination but the frame was
-                    // refused (closed/retired connection). Re-queueing would only
-                    // retry on a later ServerConnected, which is not guaranteed and
-                    // could fire on an unrelated switch, so drop it and surface it.
-                    warnDroppedHandoff(id);
-                }
-            });
-        }
+        // player may already have arrived. Hand it over immediately when their
+        // current server is the destination this entry is waiting for — for an
+        // anchor-only handoff (/otp) that is derived from the anchor instead of from
+        // a stored destination, so the same check covers both kinds.
+        server.getPlayer(id).flatMap(Player::getCurrentServer).ifPresent(connection -> {
+            if (isPendingDestination(entry, connection.getServerInfo().getName())
+                    && pendingEntries.remove(id, entry)
+                    && !send(connection, ProxyMessages.encodePending(uuid, payload, 0))) {
+                // The player is already on the destination but the frame was
+                // refused (closed/retired connection). Re-queueing would only
+                // retry on a later ServerConnected, which is not guaranteed and
+                // could fire on an unrelated switch, so drop it and surface it.
+                warnDroppedHandoff(id);
+            }
+        });
     }
 
     /**
@@ -603,9 +615,9 @@ public final class MikuTPVelocity {
 
     private void enqueue(RegisteredServer target, String eventJson) {
         String name = target.getServerInfo().getName();
-        java.util.ArrayDeque<String> queue = outbound.computeIfAbsent(name, n -> new java.util.ArrayDeque<>());
+        java.util.ArrayDeque<QueuedEvent> queue = outbound.computeIfAbsent(name, n -> new java.util.ArrayDeque<>());
         synchronized (lockFor(name)) {
-            queue.addLast(eventJson);
+            queue.addLast(new QueuedEvent(eventJson, 1));
             while (queue.size() > MAX_QUEUED_EVENTS) {
                 queue.pollFirst();
             }
@@ -632,7 +644,7 @@ public final class MikuTPVelocity {
 
     private void tryFlush(RegisteredServer target) {
         String name = target.getServerInfo().getName();
-        java.util.ArrayDeque<String> queue = outbound.get(name);
+        java.util.ArrayDeque<QueuedEvent> queue = outbound.get(name);
         if (queue == null || queue.isEmpty()) {
             return;
         }
@@ -650,27 +662,76 @@ public final class MikuTPVelocity {
             if (connection.isEmpty() || !connection.get().getServerInfo().getName().equals(name)) {
                 return; // carrier moved away: the pump retries with the next one
             }
-            List<String> batch = takeBatch(queue);
-            if (!batch.isEmpty()) {
-                sendEncodedBatch(connection.get(), batch);
-            }
+            flushInto(queue, connection.get());
         }
     }
 
     /**
-     * Polls up to one batch worth of already-encoded event objects, preserving
-     * order. The queue only ever holds JSON produced by Gson, so the pump does
-     * not parse and re-serialize each event.
+     * Drains one batch into {@code connection}; a refused frame goes back to the
+     * queue. Returns false when nothing could be sent (or the queue was empty).
      */
-    private List<String> takeBatch(java.util.ArrayDeque<String> queue) {
-        List<String> batch = new ArrayList<>();
+    private boolean flushInto(java.util.ArrayDeque<QueuedEvent> queue, ServerConnection connection) {
+        List<QueuedEvent> batch = takeBatch(queue);
+        if (batch.isEmpty()) {
+            return false;
+        }
+        if (sendEncodedBatch(connection, jsonOf(batch))) {
+            return true;
+        }
+        requeueEvents(queue, batch);
+        return false;
+    }
+
+    /**
+     * Polls up to one batch worth of already-encoded event objects, preserving
+     * order. The queue only ever holds JSON produced by Gson, so the pump does not
+     * parse and re-serialize each event. The char budget keeps a single frame well
+     * inside the packet limit even for a pathological batch.
+     */
+    private List<QueuedEvent> takeBatch(java.util.ArrayDeque<QueuedEvent> queue) {
+        List<QueuedEvent> batch = new ArrayList<>();
+        int chars = 0;
         while (!queue.isEmpty() && batch.size() < MAX_EVENTS_PER_BATCH) {
-            String json = queue.pollFirst();
-            if (json != null && !json.isEmpty()) {
-                batch.add(json);
+            QueuedEvent event = queue.peekFirst();
+            if (batch.size() >= 1 && chars + event.json().length() > MAX_FRAME_CHARS) {
+                break;
             }
+            batch.add(queue.pollFirst());
+            chars += event.json().length();
         }
         return batch;
+    }
+
+    /**
+     * Puts a refused batch back at the head, counting attempts. A batch that keeps
+     * being refused (a half-dead connection) is dropped after
+     * {@link #MAX_SEND_ATTEMPTS} tries: retrying forever would block every later
+     * event of that server behind a frame that can never be delivered.
+     */
+    private void requeueEvents(java.util.ArrayDeque<QueuedEvent> queue, List<QueuedEvent> batch) {
+        int dropped = 0;
+        for (int i = batch.size() - 1; i >= 0; i--) {
+            QueuedEvent event = batch.get(i);
+            if (event.attempts() >= MAX_SEND_ATTEMPTS) {
+                dropped++;
+                continue;
+            }
+            queue.addFirst(new QueuedEvent(event.json(), event.attempts() + 1));
+        }
+        while (queue.size() > MAX_QUEUED_EVENTS) {
+            queue.pollFirst();
+        }
+        if (dropped > 0) {
+            warnDroppedEvents(dropped);
+        }
+    }
+
+    private List<String> jsonOf(List<QueuedEvent> events) {
+        List<String> json = new ArrayList<>(events.size());
+        for (QueuedEvent event : events) {
+            json.add(event.json());
+        }
+        return json;
     }
 
     /** Sends an events batch; each element is an event object, matching the backend parser. */
@@ -723,7 +784,7 @@ public final class MikuTPVelocity {
         // Never remove the queue from the map: enqueue may already hold a
         // reference to this list, and detaching it would orphan that event.
         // Queues are therefore permanent and bounded by the server count.
-        java.util.ArrayDeque<String> queue = outbound.get(serverName);
+        java.util.ArrayDeque<QueuedEvent> queue = outbound.get(serverName);
         if (queue == null) {
             return;
         }
@@ -734,12 +795,9 @@ public final class MikuTPVelocity {
         // cannot interleave with tryFlush.
         synchronized (lockFor(serverName)) {
             for (int frame = 0; frame < MAX_JOIN_FRAMES; frame++) {
-                List<String> batch = takeBatch(queue);
-                if (batch.isEmpty()) {
-                    return;
-                }
-                sendEncodedBatch(connection, batch);
-                if (queue.isEmpty()) {
+                // A refused frame is requeued for the next carrier instead of being
+                // dropped, and ends this drain.
+                if (!flushInto(queue, connection) || queue.isEmpty()) {
                     return;
                 }
             }
@@ -1263,6 +1321,16 @@ public final class MikuTPVelocity {
             warnedDroppedHandoff = true;
             logger.warn("Dropped a cross-server handoff for {}: the destination connection refused the frame; "
                     + "that teleport will not be applied", player);
+        }
+    }
+
+    private void warnDroppedEvents(int count) {
+        if (warnedDroppedEvents) {
+            logger.debug("Dropped {} queued MikuTP event(s) after {} refused sends", count, MAX_SEND_ATTEMPTS);
+        } else {
+            warnedDroppedEvents = true;
+            logger.warn("Dropped {} queued MikuTP event(s) after {} refused sends; "
+                    + "the next resync restores the full state", count, MAX_SEND_ATTEMPTS);
         }
     }
 

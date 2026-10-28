@@ -32,6 +32,11 @@ public final class WarmupManager {
         this.warmupSeconds = warmupSeconds;
     }
 
+    /** Monotonic milliseconds: a wall-clock step must not stretch or cut a countdown. */
+    private static long now() {
+        return System.nanoTime() / 1_000_000L;
+    }
+
     public boolean isWarming(UUID player) {
         return active.containsKey(player);
     }
@@ -50,9 +55,9 @@ public final class WarmupManager {
         }
         Active a = new Active();
         active.put(id, a);
-        long finishAt = System.currentTimeMillis() + seconds * 1000L;
+        long finishAt = now() + seconds * 1000L;
         a.task = tasks.entityRepeat(player, task -> {
-            long remaining = finishAt - System.currentTimeMillis();
+            long remaining = finishAt - now();
             if (remaining <= 0) {
                 task.cancel();
                 if (active.remove(id, a)) {

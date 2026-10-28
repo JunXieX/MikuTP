@@ -12,7 +12,6 @@ import org.bukkit.World;
 import org.bukkit.block.Biome;
 import org.bukkit.block.Block;
 import org.bukkit.entity.Player;
-import org.bukkit.plugin.java.JavaPlugin;
 
 import java.util.EnumSet;
 import java.util.Map;
@@ -34,7 +33,6 @@ public final class WildService {
             Material.CAMPFIRE, Material.SOUL_CAMPFIRE, Material.POWDER_SNOW,
             Material.POINTED_DRIPSTONE, Material.SWEET_BERRY_BUSH, Material.WITHER_ROSE);
 
-    private final JavaPlugin plugin;
     private final Tasks tasks;
     private final MikuTPConfig config;
     private final MessageService messages;
@@ -42,12 +40,22 @@ public final class WildService {
     private final TeleportService teleports;
     private final OnlinePlayers onlinePlayers;
     private final Map<String, java.util.Optional<Tag<Biome>>> tagCache = new ConcurrentHashMap<>();
+    /**
+     * Last failed search per player (monotonic ms). A failed search refunds the
+     * cooldown, which is fair, but on a world where the biome filter rejects nearly
+     * every candidate that refund would let a player restart the search — and its
+     * chunk generation — without limit.
+     */
+    private final Map<UUID, Long> lastFailure = new ConcurrentHashMap<>();
+    /** Minimum gap between two searches after one failed. */
+    private static final long FAILED_RETRY_BACKOFF_MS = 5_000L;
+    /** Cap for the failure map; entries older than the backoff are dropped. */
+    private static final int MAX_FAILURE_ENTRIES = 1024;
     /** Cleared on plugin shutdown so an in-flight retry chain stops immediately. */
     private volatile boolean running = true;
 
-    public WildService(JavaPlugin plugin, Tasks tasks, MikuTPConfig config, MessageService messages,
+    public WildService(Tasks tasks, MikuTPConfig config, MessageService messages,
                        CooldownManager cooldowns, TeleportService teleports, OnlinePlayers onlinePlayers) {
-        this.plugin = plugin;
         this.tasks = tasks;
         this.config = config;
         this.messages = messages;
@@ -61,6 +69,11 @@ public final class WildService {
         return onlinePlayers.byId(player.getUniqueId()) != null;
     }
 
+    /** Monotonic milliseconds: a wall-clock step must not lift the retry backoff. */
+    private static long now() {
+        return System.nanoTime() / 1_000_000L;
+    }
+
     public void start(Player player) {
         if (!running) {
             return;
@@ -70,6 +83,17 @@ public final class WildService {
             return;
         }
         UUID id = player.getUniqueId();
+        long at = now();
+        Long failedAt = lastFailure.get(id);
+        if (failedAt != null && at - failedAt < FAILED_RETRY_BACKOFF_MS) {
+            // The cooldown was refunded after that failure; this keeps a failing
+            // world from being searched (and chunk-generated) in a tight loop.
+            messages.send(player, "wild.failed");
+            return;
+        }
+        if (lastFailure.size() > MAX_FAILURE_ENTRIES) {
+            lastFailure.entrySet().removeIf(entry -> at - entry.getValue() >= FAILED_RETRY_BACKOFF_MS);
+        }
         // Atomic check-and-burn, same as /home and /warp: a separate remaining()
         // check would let two /rtp commands in flight both start a search.
         long remaining = cooldowns.tryConsume(id, CooldownManager.Kind.WILD);
@@ -174,6 +198,7 @@ public final class WildService {
 
     private void giveUp(Player player) {
         UUID id = player.getUniqueId();
+        lastFailure.put(id, now());
         cooldowns.clear(id, CooldownManager.Kind.WILD);
         // Called from the async search loop and from region threads alike:
         // messages must be sent from the player's own thread on Folia.
@@ -204,7 +229,7 @@ public final class WildService {
             // hand the message and the teleport back to the player's own thread.
             tasks.entity(player, () -> {
                 messages.send(player, "wild.searching-done");
-                teleports.send(player, spot, PendingTeleport.Source.WILD, label, null);
+                teleports.send(player, spot, PendingTeleport.Source.WILD, label);
             });
             return;
         }

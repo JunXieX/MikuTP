@@ -8,7 +8,6 @@ import java.util.List;
 import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /** Guards paper-plugin.yml: the declared permissions, loader and dependencies
  * must stay in sync with the code (PermissionNodes, MikuTPLoader). */

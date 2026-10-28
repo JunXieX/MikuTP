@@ -29,6 +29,15 @@ public final class CooldownManager {
         }
     }
 
+    /**
+     * Monotonic milliseconds. Cooldowns are pure in-memory state, so a wall-clock
+     * step (NTP correction, VM snapshot restore) must not be able to lock a player
+     * out until the clock catches up again.
+     */
+    private static long now() {
+        return System.nanoTime() / 1_000_000L;
+    }
+
     /** Remaining seconds before {@code kind} may be used again; 0 when ready. */
     public long remaining(UUID player, Kind kind) {
         if (bypass.contains(player)) {
@@ -42,7 +51,7 @@ public final class CooldownManager {
         if (end == null) {
             return 0;
         }
-        long rest = end - System.currentTimeMillis();
+        long rest = end - now();
         if (rest <= 0) {
             return 0;
         }
@@ -65,15 +74,15 @@ public final class CooldownManager {
         if (seconds <= 0) {
             return 0; // this action has no cooldown configured
         }
-        long now = System.currentTimeMillis();
+        long at = now();
         Map<Kind, Long> map = until.computeIfAbsent(player, k -> new ConcurrentHashMap<>());
         long[] blocked = {0};
         map.compute(kind, (k, end) -> {
-            if (end != null && end > now) {
-                blocked[0] = (end - now + 999L) / 1000L;
+            if (end != null && end > at) {
+                blocked[0] = (end - at + 999L) / 1000L;
                 return end;
             }
-            return now + seconds * 1000L;
+            return at + seconds * 1000L;
         });
         return blocked[0];
     }

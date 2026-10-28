@@ -207,13 +207,18 @@ public final class WarpService {
                 return;
             }
             messages.send(player, "warp.going", "name", warp.name);
-            teleports.send(player, warp.position, PendingTeleport.Source.WARP, warp.name, null);
+            teleports.send(player, warp.position, PendingTeleport.Source.WARP, warp.name);
         });
+    }
+
+    /** False when /warp, /setwarp and /delwarp are switched off. */
+    public boolean isEnabled() {
+        return config.warp.enabled;
     }
 
     /** True (and tells the player) when the warp feature is switched off. */
     private boolean disabled(Player player) {
-        if (config.warp.enabled) {
+        if (isEnabled()) {
             return false;
         }
         messages.send(player, "warp.disabled");

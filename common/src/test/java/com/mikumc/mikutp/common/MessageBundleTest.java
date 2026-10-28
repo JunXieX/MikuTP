@@ -58,6 +58,17 @@ class MessageBundleTest {
         assertEquals("<prefix>saved <name>", bundle.raw("home.set"));
     }
 
+    /** A bundle whose root is not an object cannot be applied and must be reported. */
+    @Test
+    void nonObjectOverrideIsReportedAsFailure() throws Exception {
+        Path file = dir.resolve("array.json");
+        Files.writeString(file, "[1, 2]", StandardCharsets.UTF_8);
+
+        MessageBundle bundle = new MessageBundle(BUNDLED);
+        assertFalse(bundle.loadOverrides(file), "a non-object bundle root must be reported");
+        assertEquals("<prefix>saved <name>", bundle.raw("home.set"));
+    }
+
     /** Reloading replaces the override layer atomically instead of mutating the map. */
     @Test
     void secondOverrideReplacesTheFirst() throws Exception {

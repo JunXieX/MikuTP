@@ -203,11 +203,6 @@ public final class ProfileService {
         }
     }
 
-    /** Toggles the flag, stamping it with the local wall clock. */
-    public void setTpaEnabled(UUID uuid, boolean enabled) {
-        setTpaEnabled(uuid, enabled, System.currentTimeMillis());
-    }
-
     /**
      * Toggles the replicated flag with a caller-supplied monotonic stamp.
      *
@@ -227,10 +222,12 @@ public final class ProfileService {
         long identityStamp = System.currentTimeMillis();
         tasks.async(() -> {
             // Upsert first: a toggle that races the join-time profile write must not
-            // be lost to an UPDATE that matched no row yet.
+            // be lost to an UPDATE that matched no row yet. Only a known name is
+            // written: an empty one would overwrite the stored identity of that uuid.
             try {
-                String knownName = name == null ? "" : name;
-                database.upsertPlayer(uuid.toString(), knownName, identityStamp);
+                if (name != null) {
+                    database.upsertPlayer(uuid.toString(), name, identityStamp);
+                }
             } catch (Exception e) {
                 plugin.getSLF4JLogger().warn("Failed to persist the profile of {}", uuid, e);
                 rollbackToggle(uuid, enabled, previous);

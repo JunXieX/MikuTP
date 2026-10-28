@@ -36,7 +36,7 @@ MikuTP 是一套面向 Paper / Folia / Velocity 的多功能传送插件：家�
 
 ### 单服务器（默认，零依赖）
 
-1. 把 `MikuTP-Paper-1.7.0.jar` 放入 `plugins/`，重启。
+1. 把 `MikuTP-Paper-1.8.0.jar` 放入 `plugins/`，重启。
 2. 完成。数据存储在 `plugins/MikuTP/data.db`（SQLite），无需任何外部服务。
 
 ### 跨服网络（Velocity）
@@ -86,7 +86,7 @@ MikuTP 是一套面向 Paper / Folia / Velocity 的多功能传送插件：家�
 
 **不带参数时的行为**：菜单型命令（`/home`、`/delhome`、`/warp`、`/delwarp`、`/setwarp`、`/tpa`、`/tpahere`）会弹出对应的对话框菜单（`dialogs.enabled: false` 时改为可点击聊天菜单）；`/tpblock`、`/tpunblock` 不带参数时列出当前屏蔽名单；`/wild`、`/back`、`/dback`、`/tpatoggle` 不带参数时直接执行对应动作。
 
-**热重载边界**：`/mtp reload` 只重载 `config.yml` 与语言文件；**命令名/别名的改动需要重启服务器**才生效。
+**热重载边界**：`/mtp reload` 只重载 `config.yml` 与语言文件；**命令别名的改动需要重启服务器**才生效。
 
 ## 权限
 

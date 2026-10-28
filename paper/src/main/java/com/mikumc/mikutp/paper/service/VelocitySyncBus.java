@@ -180,7 +180,11 @@ public final class VelocitySyncBus implements SyncBus {
      * lookup uses the plugin's own registry: this runs on the async flush thread,
      * where Folia does not allow iterating Bukkit's player view. */
     private void sendEncoded(byte[] payload, List<QueuedOp> ops) {
-        int attempt = ops.stream().mapToInt(QueuedOp::attempt).max().orElse(1);
+        int highestAttempt = 1;
+        for (QueuedOp op : ops) {
+            highestAttempt = Math.max(highestAttempt, op.attempt());
+        }
+        final int attempt = highestAttempt;
         Player carrier = stickyCarrierPlayer();
         if (carrier == null) {
             requeue(ops, false);

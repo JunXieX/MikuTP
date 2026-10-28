@@ -19,6 +19,12 @@ public final class PendingTeleport {
      * position instead of the stored coordinates (admin goto / pulls).
      */
     public String anchorUuid;
+    /**
+     * Human label of the destination for the arrival message (home name, target
+     * player, ...). Null from older senders; the arrival then falls back to the
+     * source name.
+     */
+    public String label;
 
     public PendingTeleport() {
     }

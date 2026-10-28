@@ -71,6 +71,9 @@ public final class MikuTPPlugin extends JavaPlugin {
         // softdepend loads PlaceholderAPI before us when present; isPluginEnabled also
         // covers the case where it exists but failed to enable.
         papiAvailable = getServer().getPluginManager().isPluginEnabled("PlaceholderAPI");
+        // Created before the message layer: MessageService needs the scheduler to
+        // deliver a message onto the player's thread when its caller is an async one.
+        tasks = new Tasks(this);
         try {
             config = parseConfig();
             messages = createMessageService(config);
@@ -96,7 +99,6 @@ public final class MikuTPPlugin extends JavaPlugin {
             return;
         }
 
-        tasks = new Tasks(this);
         effects = new Effects(config.teleport.sounds);
         cooldowns = new CooldownManager(this::cooldownSeconds);
         onlinePlayers = new OnlinePlayers();
@@ -113,7 +115,7 @@ public final class MikuTPPlugin extends JavaPlugin {
         warpService = new WarpService(this, tasks, config, database, messages, cooldowns, teleports);
         requestService = new RequestService(this, tasks, config, database, messages, effects, cooldowns,
                 teleports, profiles, network, syncBus, onlinePlayers);
-        wildService = new WildService(this, tasks, config, messages, cooldowns, teleports, onlinePlayers);
+        wildService = new WildService(tasks, config, messages, cooldowns, teleports, onlinePlayers);
         coordinator = new SyncCoordinator(this, tasks, config, database, syncBus,
                 homeService, profiles, teleports, requestService);
 
@@ -286,6 +288,11 @@ public final class MikuTPPlugin extends JavaPlugin {
         String oldServerId = String.valueOf(config.crossServer.serverId);
         String oldPrefix = String.valueOf(config.storage.tablePrefix);
         String oldLanguage = String.valueOf(config.languageFile);
+        if (tasks.isShuttingDown()) {
+            // A refused async task would never answer the command callback.
+            done.accept(false);
+            return;
+        }
         tasks.async(() -> {
             MikuTPConfig parsed;
             MessageBundle bundle;
@@ -308,11 +315,7 @@ public final class MikuTPPlugin extends JavaPlugin {
                 // service parses the MiniMessage prefix exactly like MessageService.reload
                 // does, so a malformed prefix rejects the reload instead of leaving the
                 // config applied while the message layer still holds the old prefix.
-                // Constructing the service parses the MiniMessage prefix exactly like
-                // MessageService.reload(); a malformed prefix therefore rejects the reload
-                // before any live state is swapped (R3-05: MiniMessage never returns null,
-                // so the former null check was dead code).
-                new MessageService(bundle, parsed.parsePlaceholderApi, papiAvailable);
+                new MessageService(tasks, bundle, parsed.parsePlaceholderApi, papiAvailable);
             } catch (Exception e) {
                 // Keep the running configuration intact and report the failure.
                 getSLF4JLogger().error("Reload failed; the running configuration was kept: {}", e.toString());
@@ -365,7 +368,6 @@ public final class MikuTPPlugin extends JavaPlugin {
                 tasks.entity(player, () -> lifecycle.refresh(player));
             }
         }
-        coordinator.seedActivePlayers(onlinePlayers.snapshot().size());
     }
 
     /** Parses config.yml, creating the commented default on first start. */
@@ -392,7 +394,7 @@ public final class MikuTPPlugin extends JavaPlugin {
     }
 
     private MessageService createMessageService(MikuTPConfig cfg) throws IOException {
-        return new MessageService(loadBundle(cfg.languageFile), cfg.parsePlaceholderApi, papiAvailable);
+        return new MessageService(tasks, loadBundle(cfg.languageFile), cfg.parsePlaceholderApi, papiAvailable);
     }
 
     /** Logs semantic config problems (bad pattern, negative cooldowns, blank token, ...).

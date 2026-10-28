@@ -517,6 +517,7 @@ public final class RequestService {
             // The requester travels here; stash our position for their arrival and
             // only announce the acceptance once the payload is durably stored.
             teleports.stashPendingTeleport(requesterId, targetId, PendingTeleport.Source.TPA,
+                    request.targetName,
                     () -> publishResponded(request, response),
                     () -> publishResponded(request, Response.FAILED));
             return;
@@ -985,7 +986,7 @@ public final class RequestService {
                         if (anchor != null) {
                             teleports.sendLocalTo(requester, anchor, request.targetName, true);
                         } else {
-                            teleports.dispatchToAnchor(requester, request.targetUuid, null);
+                            teleports.dispatchToAnchor(requester, request.targetUuid);
                         }
                     } else {
                         // Come-here: the target travels. Stash our live position for the
@@ -993,7 +994,7 @@ public final class RequestService {
                         UUID moverId = parseUuid(request.targetUuid);
                         if (moverId != null) {
                             teleports.stashPendingTeleport(moverId, requesterId,
-                                    PendingTeleport.Source.TPA_HERE,
+                                    PendingTeleport.Source.TPA_HERE, request.requesterName,
                                     () -> {
                                         SyncEvent ready = SyncEvent.create(SyncEvent.Type.TP_READY, serverId);
                                         ready.request = request;
@@ -1045,7 +1046,7 @@ public final class RequestService {
             if (anchor != null) {
                 teleports.sendLocalTo(mover, anchor, request.requesterName, true);
             } else {
-                teleports.dispatchToAnchor(mover, request.requesterUuid, null);
+                teleports.dispatchToAnchor(mover, request.requesterUuid);
             }
         });
     }

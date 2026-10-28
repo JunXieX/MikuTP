@@ -2,7 +2,6 @@ package com.mikumc.mikutp.paper.service;
 
 import io.papermc.paper.threadedregions.scheduler.ScheduledTask;
 import org.bukkit.Bukkit;
-import org.bukkit.Location;
 import org.bukkit.entity.Player;
 import org.bukkit.plugin.Plugin;
 
@@ -114,6 +113,7 @@ public final class Tasks {
         return inFlight.get() == 0;
     }
 
+    /** True once {@link #beginShutdown()} ran: {@link #async} then silently drops work. */
     public boolean isShuttingDown() {
         return shuttingDown;
     }
@@ -143,23 +143,15 @@ public final class Tasks {
         }
     }
 
-    /** Runs once per tick on the player's region thread until the consumer cancels it. */
-    public ScheduledTask entityRepeat(Player player, Consumer<ScheduledTask> run, long initialDelayTicks, long periodTicks) {
-        return player.getScheduler().runAtFixedRate(plugin, run, null, initialDelayTicks, periodTicks);
-    }
-
     /**
-     * Like {@link #entityRepeat}, but {@code retired} runs when the entity is
-     * removed before the task could fire, so callers can clean up their own
-     * bookkeeping. Returns null when the scheduler is already retired.
+     * Runs once per tick on the player's region thread until the consumer cancels
+     * it. {@code retired} runs when the entity is removed before the task could
+     * fire, so callers can clean up their own bookkeeping. Returns null when the
+     * scheduler is already retired.
      */
     public ScheduledTask entityRepeat(Player player, Consumer<ScheduledTask> run, Runnable retired,
                                       long initialDelayTicks, long periodTicks) {
         return player.getScheduler().runAtFixedRate(plugin, run, retired, initialDelayTicks, periodTicks);
-    }
-
-    public void region(Location location, Runnable run) {
-        Bukkit.getRegionScheduler().run(plugin, location, task -> run.run());
     }
 
     public void region(org.bukkit.World world, int chunkX, int chunkZ, Runnable run) {

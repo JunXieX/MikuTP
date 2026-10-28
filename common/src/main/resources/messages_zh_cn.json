@@ -65,8 +65,10 @@
   "wild.disabled": "<prefix><red>随机传送功能当前已关闭。</red>",
   "wild.failed": "<prefix><red>尝试多次仍未找到安全地点，请稍后再试。</red>",
 
+  "back.disabled": "<prefix><red>/back 当前已关闭。</red>",
   "back.none": "<prefix><red>没有记录到可以返回的位置。</red>",
   "back.going": "<prefix><gray>正在返回上次传送的位置……</gray>",
+  "dback.disabled": "<prefix><red>/dback 当前已关闭。</red>",
   "dback.none": "<prefix><red>没有记录到死亡地点。</red>",
   "dback.going": "<prefix><gray>正在返回死亡地点……</gray>",
 
@@ -76,7 +78,7 @@
   "outtp.none": "<prefix><red>本服没有 <white><player></white> 的下线位置记录。</red>",
   "admin.self": "<prefix><red>不能对自己使用该命令。</red>",
   "admin.resync-done": "<prefix><green>已请求全部服务器重新发布本地数据。</green>",
-  "admin.commands-need-restart": "<prefix><gray>提示：命令名与别名的改动需要重启服务器后生效。</gray>",
+  "admin.commands-need-restart": "<prefix><gray>提示：命令别名的改动需要重启服务器后生效。</gray>",
   "admin.target-left": "<prefix><red>目标玩家已离开，传送未完成。</red>",
   "admin.pulled-you": "<prefix><yellow>你已被管理员传送到 <white><player></white> 身边。</yellow>",
   "admin.bring-started": "<prefix><gray>正在将 <white><player></white> 传送过来……</gray>",

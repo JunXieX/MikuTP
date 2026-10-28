@@ -213,7 +213,9 @@ public final class CommandRegistry {
         return playerRoot("sethome", "mikutp.home.set",
                 player -> {
                     if (dialogsEnabled()) {
-                        dialogs.showNameInput(player, "dialog.name.title", name -> homeService.set(player, name));
+                        // Opening a dialog touches the player: render it on their thread.
+                        tasks.entity(player, () -> dialogs.showNameInput(player, "dialog.name.title",
+                                name -> homeService.set(player, name)));
                     } else {
                         // Without dialogs the name has to come from the command itself.
                         messages.send(player, "home.usage");
@@ -265,7 +267,8 @@ public final class CommandRegistry {
         return playerRoot("setwarp", "mikutp.warp.manage",
                 player -> {
                     if (dialogsEnabled()) {
-                        dialogs.showNameInput(player, "dialog.name.title", name -> warpService.set(player, name));
+                        tasks.entity(player, () -> dialogs.showNameInput(player, "dialog.name.title",
+                                name -> warpService.set(player, name)));
                     } else {
                         // Without dialogs the name has to come from the command itself.
                         messages.send(player, "warp.usage");
@@ -290,6 +293,11 @@ public final class CommandRegistry {
      * player's own thread to render.
      */
     private void openWarpMenu(Player player, boolean delete) {
+        // A list of warps that every click refuses is worse than the plain notice.
+        if (!warpService.isEnabled()) {
+            messages.send(player, "warp.disabled");
+            return;
+        }
         if (warpService.isLoaded()) {
             showWarpMenu(player, delete);
             return;
@@ -331,7 +339,8 @@ public final class CommandRegistry {
         return playerRoot("tpa", "mikutp.tpa",
                 player -> {
                     if (dialogsEnabled()) {
-                        dialogs.showTpaTarget(player, false, name -> requestService.send(player, name, false));
+                        tasks.entity(player, () -> dialogs.showTpaTarget(player, false,
+                                name -> requestService.send(player, name, false)));
                     } else {
                         messages.send(player, "tpa.usage");
                     }
@@ -344,7 +353,8 @@ public final class CommandRegistry {
         return playerRoot("tpahere", "mikutp.tpa",
                 player -> {
                     if (dialogsEnabled()) {
-                        dialogs.showTpaTarget(player, true, name -> requestService.send(player, name, true));
+                        tasks.entity(player, () -> dialogs.showTpaTarget(player, true,
+                                name -> requestService.send(player, name, true)));
                     } else {
                         messages.send(player, "tpahere.usage");
                     }
@@ -547,8 +557,7 @@ public final class CommandRegistry {
         LiteralArgumentBuilder<CommandSourceStack> root = Commands.literal("mtp")
                 .requires(src -> src.getSender().hasPermission("mikutp.admin"))
                 .executes(ctx -> {
-                    ctx.getSource().getSender().sendMessage(messages.render(ctx.getSource().getSender(),
-                            "admin.info", "info", infoSupplier.get()));
+                    messages.send(ctx.getSource().getSender(), "admin.info", "info", infoSupplier.get());
                     return 1;
                 });
         root.then(Commands.literal("reload").executes(ctx -> {
@@ -557,14 +566,14 @@ public final class CommandRegistry {
             // rather than claiming success before anything was read.
             reloadAction.reload(ok -> tasks.global(() -> {
                 if (Boolean.TRUE.equals(ok)) {
-                    sender.sendMessage(messages.render(sender, "common.reload-done"));
-                    // Commands are registered once at startup: config.yml changes to
-                    // names/aliases can only take effect after a restart.
+                    messages.send(sender, "common.reload-done");
+                    // Command literals are registered once at startup: config.yml
+                    // changes to aliases can only take effect after a restart.
                     if (messages.has("admin.commands-need-restart")) {
-                        sender.sendMessage(messages.render(sender, "admin.commands-need-restart"));
+                        messages.send(sender, "admin.commands-need-restart");
                     }
                 } else {
-                    sender.sendMessage(messages.render(sender, "common.reload-failed", "error", "config.yml"));
+                    messages.send(sender, "common.reload-failed", "error", "config.yml");
                 }
             }));
             return 1;
@@ -573,7 +582,7 @@ public final class CommandRegistry {
             CommandSender sender = ctx.getSource().getSender();
             // Report what actually happened: single-server mode has nothing to resync.
             boolean dispatched = resyncAction.getAsBoolean();
-            sender.sendMessage(messages.render(sender, dispatched ? "admin.resync-done" : "common.cross-disabled"));
+            messages.send(sender, dispatched ? "admin.resync-done" : "common.cross-disabled");
             return 1;
         }));
         root.then(Commands.literal("permissions").executes(ctx -> {
@@ -586,28 +595,23 @@ public final class CommandRegistry {
                             org.bukkit.permissions.PermissionDefault.valueOf(node.def().toUpperCase(java.util.Locale.ROOT))));
                 }
             }
-            sender.sendMessage(messages.render(sender, "admin.permissions", "count", String.valueOf(permissions.size())));
+            messages.send(sender, "admin.permissions", "count", String.valueOf(permissions.size()));
             for (var permission : permissions) {
-                sender.sendMessage(messages.render(sender, "admin.permissions-line",
+                messages.send(sender, "admin.permissions-line",
                         "node", permission.getName(),
                         "default", permission.getDefault().toString().toLowerCase(),
-                        "description", permission.getDescription() == null ? "" : permission.getDescription()));
+                        "description", permission.getDescription() == null ? "" : permission.getDescription());
             }
             return 1;
         }));
         root.then(Commands.literal("info").executes(ctx -> {
-            ctx.getSource().getSender().sendMessage(messages.render(ctx.getSource().getSender(),
-                    "admin.info", "info", infoSupplier.get()));
+            messages.send(ctx.getSource().getSender(), "admin.info", "info", infoSupplier.get());
             return 1;
         }));
         return root.build();
     }
 
     // ------------------------------------------------------------------ helpers
-
-    private interface PlayerChecks {
-        boolean allowed(CommandSender sender);
-    }
 
     private LiteralCommandNode<CommandSourceStack> playerRoot(String name, String permission,
                                                               Consumer<Player> noArg,

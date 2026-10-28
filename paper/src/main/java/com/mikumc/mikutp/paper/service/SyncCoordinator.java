@@ -53,7 +53,6 @@ public final class SyncCoordinator {
      * cannot both pass the check and publish two full dumps. */
     private final java.util.concurrent.atomic.AtomicLong lastDump =
             new java.util.concurrent.atomic.AtomicLong(0L);
-    private final AtomicInteger activePlayers = new AtomicInteger();
     /** Serialises flushes so the periodic task cannot interleave with a drain. */
     private final java.util.concurrent.atomic.AtomicBoolean flushing =
             new java.util.concurrent.atomic.AtomicBoolean(false);
@@ -104,15 +103,16 @@ public final class SyncCoordinator {
         // Drain what is left so a clean stop does not lose replicated state.
         // The callback API is not cancellable, so an in-flight flush can still
         // hold the flag: wait for it instead of abandoning the queue, then drain
-        // what it left behind. The wait is explicitly capped because this runs on
-        // the disabling thread (the global region thread on Folia): a long stall
-        // here would hold up the whole shutdown.
+        // what it left behind. This runs on the disabling thread (the global region
+        // thread on Folia), so every iteration — flushes included — is checked
+        // against one shared deadline: a single unfinished resync can hold hundreds
+        // of thousands of writes, and draining all of them would stall the stop.
         long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(SHUTDOWN_FLUSH_BUDGET_MS);
-        for (int attempt = 0; attempt < 100 && !pendingWrites.isEmpty(); attempt++) {
+        while (!pendingWrites.isEmpty()) {
+            if (System.nanoTime() > deadline) {
+                break;
+            }
             if (flushing.get()) {
-                if (System.nanoTime() > deadline) {
-                    break;
-                }
                 try {
                     Thread.sleep(SHUTDOWN_FLUSH_POLL_MS);
                 } catch (InterruptedException e) {
@@ -153,23 +153,16 @@ public final class SyncCoordinator {
         return true;
     }
 
-    /** Called on join: the first player after a quiet period triggers a resync. */
-    public void onPlayerJoin() {
-        // Increment unconditionally so the counter stays symmetric with
-        // onPlayerQuit; only the resync itself depends on cross-server mode.
-        if (activePlayers.incrementAndGet() == 1 && syncBus.crossServer()) {
+    /**
+     * Called on join with the number of players this backend now hosts: the first
+     * player after a quiet period triggers a resync. Deriving the condition from the
+     * registry instead of a counter keeps it correct across /mtp reload, which has to
+     * seed a counter from a snapshot that joins and quits race with.
+     */
+    public void onPlayerJoin(int online) {
+        if (online == 1 && syncBus.crossServer()) {
             publishResync();
         }
-    }
-
-    public void onPlayerQuit() {
-        activePlayers.decrementAndGet();
-    }
-
-    /** Seeds the presence counter with players already online at enable time, so
-     * a reload does not mistake the next join for the first one. */
-    public void seedActivePlayers(int count) {
-        activePlayers.set(Math.max(0, count));
     }
 
     private void publishResync() {
@@ -354,6 +347,7 @@ public final class SyncCoordinator {
             plugin.getSLF4JLogger().warn("Batched apply of {} replicated changes failed, retrying individually",
                     batch.size(), e);
             int dropped = 0;
+            Exception firstFailure = null;
             for (PendingWrite write : batch) {
                 // Each retry keeps only its own cache updates: a successful one is
                 // published right away, a failed one contributes nothing, so the
@@ -364,13 +358,20 @@ public final class SyncCoordinator {
                 } catch (Exception single) {
                     dropped++;
                     stagedCacheUpdates.clear();
-                    plugin.getSLF4JLogger().warn("Dropped one replicated change", single);
+                    // A systemic failure (full disk, locked database) fails every
+                    // entry of the batch; logging each stack would turn one bad
+                    // batch into thousands of lines per flush. The count plus the
+                    // first cause is what the operator needs.
+                    if (firstFailure == null) {
+                        firstFailure = single;
+                    }
                     continue;
                 }
                 runStagedCacheUpdates();
             }
             if (dropped > 0) {
-                plugin.getSLF4JLogger().warn("Dropped {} of {} replicated changes", dropped, batch.size());
+                plugin.getSLF4JLogger().warn("Dropped {} of {} replicated changes",
+                        dropped, batch.size(), firstFailure);
             }
         }
     }
@@ -384,8 +385,12 @@ public final class SyncCoordinator {
             }
         }
         stagedCacheUpdates.clear();
-        // The queue drained below its cap: re-arm the one-shot warning.
-        shedWrites.set(0);
+        // Re-arm the one-shot warning only once the queue is really back under its
+        // cap; re-arming after every successful batch would repeat the warning every
+        // flush for as long as the overflow lasts.
+        if (queuedWrites.get() < MAX_PENDING_WRITES) {
+            shedWrites.set(0);
+        }
     }
 
     /** Publishes this server's full local state; rate-limited to tame event storms. */

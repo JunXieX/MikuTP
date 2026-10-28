@@ -23,6 +23,9 @@ import java.util.UUID;
 public final class TeleportService {
 
     private static final int PENDING_TTL_SECONDS = 300;
+    /** Bound for buffered handoffs; a handoff whose player left before it was applied
+     * never gets applied, so the map is swept instead of growing forever. */
+    private static final int MAX_BUFFERED_ARRIVALS = 512;
     /** Request flows only need a minute: the acceptance is applied within the warmup
      * + server-switch window, and a stale handoff must not fire on a later switch. */
     private static final int REQUEST_PENDING_TTL_SECONDS = 60;
@@ -66,13 +69,9 @@ public final class TeleportService {
         return warmups;
     }
 
-    /**
-     * Sends a player to a stored position, local or remote. Safe to call from
-     * any thread. {@code afterDispatch} runs on the player's entity thread once
-     * a cross-server transfer has been handed to the proxy.
-     */
-    public void send(Player player, Position dest, PendingTeleport.Source source, String label, Runnable afterDispatch) {
-        tasks.entity(player, () -> begin(player, dest, source, label, afterDispatch));
+    /** Sends a player to a stored position, local or remote. Safe to call from any thread. */
+    public void send(Player player, Position dest, PendingTeleport.Source source, String label) {
+        tasks.entity(player, () -> begin(player, dest, source, label));
     }
 
     /**
@@ -132,6 +131,9 @@ public final class TeleportService {
                     pending.playerUuid, id);
             return;
         }
+        if (arriving.size() >= MAX_BUFFERED_ARRIVALS) {
+            arriving.entrySet().removeIf(entry -> expired(entry.getValue()));
+        }
         arriving.put(id, pending);
         // The proxy can deliver this after PlayerJoinEvent already ran; applying
         // right away keeps the handoff from waiting for the player's next login.
@@ -146,6 +148,12 @@ public final class TeleportService {
      * when a player disconnects between delivery and application. */
     public void forgetArrival(UUID player) {
         arriving.remove(player);
+    }
+
+    /** Label for the arrival message: the destination's name when the sender knew it. */
+    private static String arrivalLabel(PendingTeleport pending) {
+        return pending.label != null && !pending.label.isBlank()
+                ? pending.label : pending.source.name().toLowerCase(java.util.Locale.ROOT);
     }
 
     /** A buffered handoff is only useful while it is fresh. */
@@ -202,7 +210,7 @@ public final class TeleportService {
                         return;
                     }
                     Location live = stable.getLocation().clone();
-                    playerTeleportAsync(playerUuid, live, pending.source.name().toLowerCase(java.util.Locale.ROOT));
+                    playerTeleportAsync(playerUuid, live, arrivalLabel(pending));
                 });
                 return;
             }
@@ -227,7 +235,7 @@ public final class TeleportService {
         }
         Location target = new Location(world, pending.position.x, pending.position.y,
                 pending.position.z, pending.position.yaw, pending.position.pitch);
-        playerTeleportAsync(playerUuid, target, pending.source.name().toLowerCase(java.util.Locale.ROOT));
+        playerTeleportAsync(playerUuid, target, arrivalLabel(pending));
     }
 
     /**
@@ -235,26 +243,29 @@ public final class TeleportService {
      * {@code anchorUuid}; the destination position comes from the pending
      * teleport the acceptor's side stashed. Used by cross-server tpa.
      */
-    public void dispatchToAnchor(Player mover, String anchorUuid, Runnable afterDispatch) {
-        tasks.entity(mover, () -> {
-            startWarmup(mover, () -> {
-                recordBack(mover);
-                network.connectAnchor(mover, mover.getUniqueId().toString(), anchorUuid);
-                if (afterDispatch != null) {
-                    afterDispatch.run();
-                }
-            });
-        });
+    public void dispatchToAnchor(Player mover, String anchorUuid) {
+        tasks.entity(mover, () -> startWarmup(mover, () -> {
+            recordBack(mover);
+            network.connectAnchor(mover, mover.getUniqueId().toString(), anchorUuid);
+        }));
     }
 
     /** /back entry point; the cooldown only burns when a position exists. */
     public void goBack(Player player) {
+        if (!config.back.enabled) {
+            messages.send(player, "back.disabled");
+            return;
+        }
         goHistory(player, CooldownManager.Kind.BACK, Database.BACK_PREFIX, "back.none", "back.going",
                 PendingTeleport.Source.BACK);
     }
 
     /** /dback entry point; the cooldown only burns when a position exists. */
     public void goDeathBack(Player player) {
+        if (!config.back.enabled || !config.back.deathEnabled) {
+            messages.send(player, "dback.disabled");
+            return;
+        }
         goHistory(player, CooldownManager.Kind.DBACK, Database.DEATH_PREFIX, "dback.none", "dback.going",
                 PendingTeleport.Source.DEATH);
     }
@@ -285,7 +296,7 @@ public final class TeleportService {
                 return;
             }
             messages.send(player, goingKey);
-            send(player, back, source, back.world, null);
+            send(player, back, source, back.world);
         });
     }
 
@@ -308,7 +319,7 @@ public final class TeleportService {
                 return;
             }
             messages.send(admin, "back.going");
-            send(admin, logout, PendingTeleport.Source.ADMIN, logout.world, null);
+            send(admin, logout, PendingTeleport.Source.ADMIN, logout.world);
         });
     }
 
@@ -422,6 +433,7 @@ public final class TeleportService {
                     PendingTeleport pending = new PendingTeleport(admin.getUniqueId().toString(),
                             new Position(null, "", 0, 0, 0, 0f, 0f), PendingTeleport.Source.ADMIN,
                             System.currentTimeMillis(), record.uuid().toString());
+                    pending.label = record.name();
                     syncBus.pendingStore(admin.getUniqueId(), pending, PENDING_TTL_SECONDS);
                     tasks.entity(admin, () -> network.connectAnchor(admin,
                             admin.getUniqueId().toString(), record.uuid().toString()));
@@ -524,6 +536,7 @@ public final class TeleportService {
                 PendingTeleport pending = new PendingTeleport(victim.toString(), here,
                         PendingTeleport.Source.ADMIN, System.currentTimeMillis(),
                         admin.getUniqueId().toString());
+                pending.label = onlinePlayers.nameOf(admin.getUniqueId());
                 syncBus.pendingStore(victim, pending, PENDING_TTL_SECONDS);
                 tasks.entity(stable, () -> network.connectAnchor(stable,
                         victim.toString(), stable.getUniqueId().toString()));
@@ -548,7 +561,7 @@ public final class TeleportService {
         };
     }
 
-    private void begin(Player player, Position dest, PendingTeleport.Source source, String label, Runnable afterDispatch) {
+    private void begin(Player player, Position dest, PendingTeleport.Source source, String label) {
         boolean local = dest.server == null || dest.server.isBlank() || dest.server.equals(serverId);
         if (local) {
             World world = dest.world == null ? null : Bukkit.getWorld(dest.world);
@@ -577,7 +590,7 @@ public final class TeleportService {
         messages.send(player, "common.teleporting", "target", label);
         startWarmup(player, () -> {
             recordBack(player);
-            dispatchCross(player, dest, source, afterDispatch);
+            dispatchCross(player, dest, source, label);
         });
     }
 
@@ -593,10 +606,6 @@ public final class TeleportService {
     }
 
     private void teleportNow(Player player, Location target, String label) {
-        if (target == null) {
-            messages.send(player, "common.teleport-failed");
-            return;
-        }
         UUID id = player.getUniqueId();
         player.teleportAsync(target).thenAccept(ok -> reportTeleport(id, ok, label));
     }
@@ -642,22 +651,18 @@ public final class TeleportService {
         }
         Location target = new Location(world, pending.position.x, pending.position.y,
                 pending.position.z, pending.position.yaw, pending.position.pitch);
-        playerTeleportAsync(playerUuid, target, pending.source.name().toLowerCase(java.util.Locale.ROOT));
+        playerTeleportAsync(playerUuid, target, arrivalLabel(pending));
     }
 
-    private void dispatchCross(Player player, Position dest, PendingTeleport.Source source, Runnable afterDispatch) {
+    private void dispatchCross(Player player, Position dest, PendingTeleport.Source source, String label) {
         UUID uuid = player.getUniqueId();
         tasks.async(() -> {
             try {
                 Position stamped = new Position(dest.server, dest.world, dest.x, dest.y, dest.z, dest.yaw, dest.pitch);
                 PendingTeleport pending = new PendingTeleport(uuid.toString(), stamped, source, System.currentTimeMillis());
+                pending.label = label;
                 syncBus.pendingStore(uuid, pending, PENDING_TTL_SECONDS);
-                tasks.entity(player, () -> {
-                    network.connect(player, dest.server);
-                    if (afterDispatch != null) {
-                        afterDispatch.run();
-                    }
-                });
+                tasks.entity(player, () -> network.connect(player, dest.server));
             } catch (Exception e) {
                 plugin.getSLF4JLogger().warn("Cross-server dispatch failed", e);
                 tasks.entity(player, () -> messages.send(player, "common.teleport-failed"));
@@ -665,26 +670,18 @@ public final class TeleportService {
         });
     }
 
-    /** Captures {@code positionOwner}'s live position and stores it as the
-     * pending teleport of {@code playerToTeleport} (used by the request flow). */
-    public void stashPendingTeleport(UUID playerToTeleport, UUID positionOwner, PendingTeleport.Source source) {
-        stashPendingTeleport(playerToTeleport, positionOwner, source, null);
-    }
-
-    /** Same as above; {@code onSuccess} runs once the payload is durably stored. */
-    public void stashPendingTeleport(UUID playerToTeleport, UUID positionOwner,
-                                     PendingTeleport.Source source, Runnable onSuccess) {
-        stashPendingTeleport(playerToTeleport, positionOwner, source, onSuccess, null);
-    }
-
     /**
-     * Same as above, with an explicit failure callback. A handoff that could not be
-     * stored must not be announced to the requester as an acceptance: the
-     * destination has no payload to apply, so the caller reports the failure
-     * instead of leaving the player waiting for a teleport that will not happen.
+     * Captures {@code positionOwner}'s live position and stores it as the pending
+     * teleport of {@code playerToTeleport} (used by the request flow).
+     * {@code label} names the destination in the arrival message.
+     *
+     * <p>{@code onFailure} exists because a handoff that could not be stored must
+     * not be announced to the requester as an acceptance: the destination has no
+     * payload to apply, so the caller reports the failure instead of leaving the
+     * player waiting for a teleport that will not happen.
      */
     public void stashPendingTeleport(UUID playerToTeleport, UUID positionOwner,
-                                     PendingTeleport.Source source,
+                                     PendingTeleport.Source source, String label,
                                      Runnable onSuccess, Runnable onFailure) {
         if (playerToTeleport == null) {
             runQuietly(onFailure);
@@ -707,6 +704,7 @@ public final class TeleportService {
                 try {
                     PendingTeleport pending = new PendingTeleport(playerToTeleport.toString(), here,
                             source, System.currentTimeMillis(), positionOwner.toString());
+                    pending.label = label;
                     syncBus.pendingStore(playerToTeleport, pending, pendingTtlSeconds(source));
                     runQuietly(onSuccess);
                 } catch (Exception e) {

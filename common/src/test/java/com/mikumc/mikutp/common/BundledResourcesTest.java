@@ -52,7 +52,7 @@ class BundledResourcesTest {
                 "tpa.target-toggled", "tpa.expired-requester", "tpa.toggled-on", "tpa.toggled-off",
                 "tpa.block-list", "tpa.block-list-empty", "tpa.unblocked", "tpa.not-blocked", "tpa.disabled",
                 "wild.searching", "wild.searching-done", "wild.disabled", "wild.failed",
-                "back.none", "back.going", "dback.none", "dback.going",
+                "back.disabled", "back.none", "back.going", "dback.disabled", "dback.none", "dback.going",
                 "outtp.usage", "outtp.none", "otp.usage", "otph.usage",
                 "admin.self", "admin.target-left", "admin.pulled-you", "admin.bring-started",
                 "admin.bring-all-done", "admin.resync-done", "admin.commands-need-restart",

@@ -72,6 +72,11 @@ public final class OnlinePlayers {
         return null;
     }
 
+    /** Number of tracked players. */
+    public int size() {
+        return players.size();
+    }
+
     /** Snapshot of the tracked players; safe to iterate from any thread. */
     public List<Player> snapshot() {
         List<Player> out = new ArrayList<>(players.size());

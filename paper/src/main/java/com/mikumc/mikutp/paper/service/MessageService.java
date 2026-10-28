@@ -25,6 +25,7 @@ public final class MessageService {
 
     private static final MiniMessage MM = MiniMessage.miniMessage();
 
+    private final Tasks tasks;
     private final boolean papiAvailable;
     private volatile boolean parsePapi;
     private volatile MessageBundle bundle;
@@ -44,7 +45,8 @@ public final class MessageService {
     private record CachedTemplate(Component component, long generation) {
     }
 
-    public MessageService(MessageBundle bundle, boolean parsePapi, boolean papiAvailable) {
+    public MessageService(Tasks tasks, MessageBundle bundle, boolean parsePapi, boolean papiAvailable) {
+        this.tasks = tasks;
         this.bundle = bundle;
         this.parsePapi = parsePapi;
         this.papiAvailable = papiAvailable;
@@ -91,16 +93,22 @@ public final class MessageService {
         return bundle.has(key);
     }
 
+    /**
+     * Sends a message from any thread. Rendering (PlaceholderAPI included) and
+     * delivery belong on the player's own thread: commands and entity callbacks
+     * already run there and stay synchronous, while a caller coming from a database
+     * callback is rescheduled instead of resolving placeholders off-region.
+     */
     public void send(CommandSender sender, String key, String... pairs) {
+        if (sender instanceof Player player && !tasks.owns(player)) {
+            tasks.entity(player, () -> sender.sendMessage(render(sender, key, pairs)));
+            return;
+        }
         sender.sendMessage(render(sender, key, pairs));
     }
 
     public void actionBar(Player player, String key, String... pairs) {
         player.sendActionBar(render(player, key, pairs));
-    }
-
-    public Component prefix() {
-        return prefix;
     }
 
     private TagResolver resolvers(String... pairs) {
