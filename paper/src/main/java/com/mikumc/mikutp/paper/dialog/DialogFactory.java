@@ -42,7 +42,7 @@ public final class DialogFactory {
                          java.util.function.IntSupplier blockDurationMinutes) {
         this.tasks = tasks;
         this.messages = messages;
-        this.pageSize = () -> Math.max(4, pageSize.getAsInt());
+        this.pageSize = pageSize;
         this.blockDurationMinutes = blockDurationMinutes;
     }
 
@@ -224,11 +224,15 @@ public final class DialogFactory {
         if (pages <= 1) {
             return;
         }
+        // The reopen renders the next page and shows it: like every other callback in
+        // this class it must run on the viewer's own thread.
         if (current > 1) {
-            buttons.add(actionButton(messages.render(viewer, "dialog.list.prev"), 150, () -> reopen.accept(current - 1)));
+            buttons.add(actionButton(messages.render(viewer, "dialog.list.prev"), 150,
+                    () -> tasks.entity(viewer, () -> reopen.accept(current - 1))));
         }
         if (current < pages) {
-            buttons.add(actionButton(messages.render(viewer, "dialog.list.next"), 150, () -> reopen.accept(current + 1)));
+            buttons.add(actionButton(messages.render(viewer, "dialog.list.next"), 150,
+                    () -> tasks.entity(viewer, () -> reopen.accept(current + 1))));
         }
     }
 }

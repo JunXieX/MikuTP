@@ -372,7 +372,7 @@ public final class ProfileService {
                     new PlayerRecord(online.getUniqueId(), resolved == null ? name : resolved, true)));
         }
         CompletableFuture<Optional<PlayerRecord>> future = new CompletableFuture<>();
-        tasks.async(() -> {
+        boolean scheduled = tasks.async(() -> {
             try {
                 future.complete(database.getPlayerByName(name)
                         .map(p -> new PlayerRecord(UUID.fromString(p.uuid), p.name, false)));
@@ -381,6 +381,10 @@ public final class ProfileService {
                 future.complete(Optional.empty());
             }
         });
+        if (!scheduled) {
+            // Refused during shutdown: answer instead of leaving the command waiting.
+            future.complete(Optional.empty());
+        }
         return future;
     }
 

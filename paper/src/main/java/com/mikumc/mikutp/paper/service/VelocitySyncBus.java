@@ -55,8 +55,9 @@ public final class VelocitySyncBus implements SyncBus {
 
     private final ConcurrentLinkedDeque<QueuedOp> outbound = new ConcurrentLinkedDeque<>();
     /** Mirrors {@code outbound.size()}; guarded by the queue monitor so it can
-     * never drift from the real depth. */
-    private int queuedOps;
+     * never drift from the real depth. Volatile because a bulk publisher reads it
+     * as a backpressure hint without taking the lock. */
+    private volatile int queuedCount;
     /** Carrier kept across flushes while it stays online, so consecutive batches
      * ride one connection and reach the proxy in order. */
     private volatile UUID stickyCarrier;
@@ -92,6 +93,11 @@ public final class VelocitySyncBus implements SyncBus {
     }
 
     @Override
+    public int queuedOps() {
+        return queuedCount;
+    }
+
+    @Override
     public void pendingStore(UUID player, PendingTeleport pending, int ttlSeconds) {
         // The proxy must know where the handoff applies: without the destination it
         // hands the payload to whichever server the player is still connected to
@@ -121,12 +127,12 @@ public final class VelocitySyncBus implements SyncBus {
         int depth;
         synchronized (outbound) {
             outbound.addLast(new QueuedOp(op, 1));
-            depth = ++queuedOps;
+            depth = ++queuedCount;
             while (depth > MAX_QUEUED_OPS) {
                 if (outbound.pollFirst() == null) {
                     break;
                 }
-                depth = --queuedOps;
+                depth = --queuedCount;
             }
         }
     }
@@ -143,7 +149,7 @@ public final class VelocitySyncBus implements SyncBus {
                 if (op == null) {
                     break;
                 }
-                queuedOps--;
+                queuedCount--;
                 ops.add(op);
             }
         }
@@ -193,8 +199,8 @@ public final class VelocitySyncBus implements SyncBus {
         }
         // A retired scheduler (entity removed before the task ran) means the carrier
         // is gone: the retired callback puts the batch back instead of letting it
-        // vanish. A failing send is classified instead of blindly requeued: an
-        // oversized frame can never succeed and would loop forever (V-R3-01).
+        // vanish. A failing send is retried a bounded number of times, so a frame
+        // that can never be delivered cannot loop forever.
         try {
             tasks.entity(carrier, () -> {
                 if (!carrier.isOnline()) {
@@ -214,9 +220,9 @@ public final class VelocitySyncBus implements SyncBus {
         }
     }
 
-    /** Drops poison pills (size failures / too many attempts) instead of looping. */
+    /** Drops a batch that has been refused too often instead of looping on it. */
     private void handleSendFailure(List<QueuedOp> ops, int attempt, Exception e) {
-        if (isSizeFailure(e) || attempt >= MAX_SEND_ATTEMPTS) {
+        if (attempt >= MAX_SEND_ATTEMPTS) {
             plugin.getSLF4JLogger().warn("Dropping {} sync op(s) after attempt {}: {}",
                     ops.size(), attempt, e.toString());
             return;
@@ -224,19 +230,6 @@ public final class VelocitySyncBus implements SyncBus {
         plugin.getSLF4JLogger().warn("Failed to send a sync batch ({} ops, attempt {}); re-queueing",
                 ops.size(), attempt, e);
         requeue(ops, true);
-    }
-
-    private static boolean isSizeFailure(Throwable e) {
-        if (e instanceof IllegalArgumentException) {
-            return true;
-        }
-        String message = e.getMessage();
-        if (message == null) {
-            return false;
-        }
-        String lower = message.toLowerCase(java.util.Locale.ROOT);
-        return lower.contains("too big") || lower.contains("too large") || lower.contains("maximum")
-                || lower.contains("length") || lower.contains("size");
     }
 
     private static List<com.google.gson.JsonObject> jsonOf(List<QueuedOp> ops) {
@@ -272,13 +265,13 @@ public final class VelocitySyncBus implements SyncBus {
                 QueuedOp op = ops.get(i);
                 outbound.addFirst(retry ? new QueuedOp(op.json(), op.attempt() + 1) : op);
             }
-            queuedOps += ops.size();
+            queuedCount += ops.size();
             // A retry must not push the queue past the same bound enqueue() uses.
-            while (queuedOps > MAX_QUEUED_OPS) {
+            while (queuedCount > MAX_QUEUED_OPS) {
                 if (outbound.pollLast() == null) {
                     break;
                 }
-                queuedOps--;
+                queuedCount--;
             }
         }
     }

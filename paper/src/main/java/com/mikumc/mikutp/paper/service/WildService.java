@@ -12,6 +12,7 @@ import org.bukkit.World;
 import org.bukkit.block.Biome;
 import org.bukkit.block.Block;
 import org.bukkit.entity.Player;
+import org.bukkit.plugin.java.JavaPlugin;
 
 import java.util.EnumSet;
 import java.util.Map;
@@ -33,13 +34,18 @@ public final class WildService {
             Material.CAMPFIRE, Material.SOUL_CAMPFIRE, Material.POWDER_SNOW,
             Material.POINTED_DRIPSTONE, Material.SWEET_BERRY_BUSH, Material.WITHER_ROSE);
 
+    private final JavaPlugin plugin;
     private final Tasks tasks;
     private final MikuTPConfig config;
     private final MessageService messages;
     private final CooldownManager cooldowns;
     private final TeleportService teleports;
     private final OnlinePlayers onlinePlayers;
-    private final Map<String, java.util.Optional<Tag<Biome>>> tagCache = new ConcurrentHashMap<>();
+    /** Resolved tags by config name. A name that does not resolve is not cached: a
+     * datapack loaded later can still make it valid. */
+    private final Map<String, Tag<Biome>> tagCache = new ConcurrentHashMap<>();
+    /** Names already reported as unknown, so a bad config warns once, not per attempt. */
+    private final Set<String> warnedTags = ConcurrentHashMap.newKeySet();
     /**
      * Last failed search per player (monotonic ms). A failed search refunds the
      * cooldown, which is fair, but on a world where the biome filter rejects nearly
@@ -54,8 +60,9 @@ public final class WildService {
     /** Cleared on plugin shutdown so an in-flight retry chain stops immediately. */
     private volatile boolean running = true;
 
-    public WildService(Tasks tasks, MikuTPConfig config, MessageService messages,
+    public WildService(JavaPlugin plugin, Tasks tasks, MikuTPConfig config, MessageService messages,
                        CooldownManager cooldowns, TeleportService teleports, OnlinePlayers onlinePlayers) {
+        this.plugin = plugin;
         this.tasks = tasks;
         this.config = config;
         this.messages = messages;
@@ -257,8 +264,7 @@ public final class WildService {
 
     private boolean blockedBiome(Biome biome) {
         for (String tagName : config.wild.blockedBiomeTags) {
-            Tag<Biome> tag = tagCache.computeIfAbsent(tagName.toLowerCase(),
-                    name -> java.util.Optional.ofNullable(loadTag(name))).orElse(null);
+            Tag<Biome> tag = tagFor(tagName);
             if (tag != null && tag.isTagged(biome)) {
                 return true;
             }
@@ -270,6 +276,29 @@ public final class WildService {
             }
         }
         return false;
+    }
+
+    /**
+     * Resolves a configured biome tag. An unknown name is reported instead of being
+     * cached as "no such tag": otherwise a typo silently disables the whole filter,
+     * which only shows up as players landing in oceans.
+     */
+    private Tag<Biome> tagFor(String name) {
+        String key = name.toLowerCase(java.util.Locale.ROOT);
+        Tag<Biome> cached = tagCache.get(key);
+        if (cached != null) {
+            return cached;
+        }
+        Tag<Biome> loaded = loadTag(key);
+        if (loaded == null) {
+            if (warnedTags.add(key)) {
+                plugin.getSLF4JLogger().warn(
+                        "Unknown biome tag '{}' in wild.blocked_biome_tags; that filter does nothing", name);
+            }
+            return null;
+        }
+        tagCache.put(key, loaded);
+        return loaded;
     }
 
     /** Stops the search/retry chain; pending async steps become no-ops. */

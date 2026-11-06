@@ -37,6 +37,19 @@ public final class SyncCoordinator {
     private static final long SHUTDOWN_FLUSH_POLL_MS = 25;
     /** How often a PROFILE_REQUEST for the same player is answered, at most. */
     private static final long PROFILE_ANNOUNCE_DEBOUNCE_MS = 2_000;
+    /** Transport backlog above which a state dump waits instead of piling on. */
+    private static final int DUMP_BACKLOG_LIMIT = 2048;
+    /** Longest a dump waits for that backlog: a server that stays empty cannot drain it. */
+    private static final long DUMP_BACKLOG_BUDGET_MS = 120_000;
+    private static final long DUMP_BACKLOG_PAUSE_MS = 25;
+    /**
+     * Pause between two dump records (~100 records per second). One proxy connection
+     * to a backend carries about 30 KB per frame, so several backends dumping at full
+     * speed at once outrun the fan-out and the transport starts shedding rows. This
+     * rate fits a handful of backends at once and finishes a 10k-record dump in about
+     * two minutes, in the background.
+     */
+    private static final long DUMP_RECORD_PAUSE_MS = 10;
 
     private final JavaPlugin plugin;
     private final Tasks tasks;
@@ -66,6 +79,9 @@ public final class SyncCoordinator {
     /** Cache updates produced by the batch currently being applied. Only the
      * flush thread touches this; they run after the transaction committed. */
     private final java.util.Deque<Runnable> stagedCacheUpdates = new java.util.ArrayDeque<>();
+    /** Set while a dump is running: a paced dump lasts long enough to overlap a second request. */
+    private final java.util.concurrent.atomic.AtomicBoolean dumping =
+            new java.util.concurrent.atomic.AtomicBoolean(false);
     /** Last time a PROFILE_REQUEST for a player was answered; keeps joins from storming. */
     private final java.util.concurrent.ConcurrentHashMap<String, Long> profileAnnouncements =
             new java.util.concurrent.ConcurrentHashMap<>();
@@ -154,13 +170,12 @@ public final class SyncCoordinator {
     }
 
     /**
-     * Called on join with the number of players this backend now hosts: the first
-     * player after a quiet period triggers a resync. Deriving the condition from the
-     * registry instead of a counter keeps it correct across /mtp reload, which has to
-     * seed a counter from a snapshot that joins and quits race with.
+     * Called on join with whether this was the first tracked player: the first player
+     * after a quiet period triggers a resync. The registry answers that atomically, so
+     * two players joining at once cannot both miss it (a size comparison could).
      */
-    public void onPlayerJoin(int online) {
-        if (online == 1 && syncBus.crossServer()) {
+    public void onPlayerJoin(boolean firstPlayer) {
+        if (firstPlayer && syncBus.crossServer()) {
             publishResync();
         }
     }
@@ -405,98 +420,152 @@ public final class SyncCoordinator {
         if (!lastDump.compareAndSet(previous, now)) {
             return; // another thread just claimed this window
         }
+        if (!dumping.compareAndSet(false, true)) {
+            plugin.getSLF4JLogger().debug("Skipped a requested state dump: one is already running");
+            return;
+        }
         tasks.async(() -> {
             try {
-                for (var home : database.listAllHomes()) {
-                    SyncEvent event = SyncEvent.create(SyncEvent.Type.HOME_SET, serverId);
-                    event.ownerUuid = home.ownerUuid;
-                    event.homeName = home.name;
-                    event.homePosition = home.position;
-                    event.homeCreatedAt = home.createdAt;
-                    publishQuietly(event);
-                }
-                for (var profile : database.listAllProfiles()) {
-                    // Identity rows are always republished: a backend that never saw
-                    // this player still needs the name row to resolve them by name.
-                    // Placeholder rows (created by a replicated position, name "")
-                    // carry no identity and are skipped.
-                    if (profile.name == null || profile.name.isBlank()) {
-                        continue;
-                    }
-                    SyncEvent event = SyncEvent.create(SyncEvent.Type.PROFILE, serverId);
-                    event.playerUuid = profile.uuid;
-                    event.playerName = profile.name;
-                    event.lastOnline = profile.lastOnline;
-                    event.tpaEnabled = profile.tpaEnabled;
-                    // The toggle carries its own clock and a known flag; receivers
-                    // only apply it when known, so a guessed default can never
-                    // overwrite the value the owning backend already has.
-                    event.tpaKnown = profile.tpaKnown;
-                    event.tpaUpdatedAt = profile.tpaUpdatedAt;
-                    publishQuietly(event);
-                }
-                for (var stored : database.listAllStoredPositions()) {
-                    // Carry the per-position update stamps: the receiving side only
-                    // overwrites a row when the replicated stamp is not older, so a
-                    // dump without a stamp could not propagate positions at all.
-                    publishBack(stored.uuid(), "back", stored.back(), stored.backUpdatedAt());
-                    publishBack(stored.uuid(), "death", stored.death(), stored.deathUpdatedAt());
-                }
-                for (var ignore : database.listAllIgnores()) {
-                    SyncEvent event = SyncEvent.create(SyncEvent.Type.IGNORE_SET, serverId);
-                    event.blockerUuid = ignore.blockerUuid;
-                    event.blockedUuid = ignore.blockedUuid;
-                    event.expiresAt = ignore.expiresAt;
-                    event.createdAt = ignore.createdAt;
-                    publishQuietly(event);
-                }
-                // Deletions are part of the state: a backend that was offline when
-                // a home or block was removed would otherwise keep (and re-publish)
-                // the vanished row. Tombstones make the dump self-healing.
-                for (var tombstone : database.listTombstones()) {
-                    SyncEvent event = SyncEvent.create(
-                            "home".equals(tombstone.kind()) ? SyncEvent.Type.HOME_DELETE : SyncEvent.Type.IGNORE_DELETE,
-                            serverId);
-                    if ("home".equals(tombstone.kind())) {
-                        event.ownerUuid = tombstone.owner();
-                        event.homeName = tombstone.name();
-                    } else {
-                        event.blockerUuid = tombstone.owner();
-                        event.blockedUuid = tombstone.name();
-                    }
-                    event.deletedAt = tombstone.deletedAt();
-                    publishQuietly(event);
-                }
+                dumpRecords();
             } catch (Exception e) {
                 plugin.getSLF4JLogger().warn("State dump failed", e);
+            } finally {
+                dumping.set(false);
             }
         });
     }
 
+    /** Publishes every locally held record once, in a stable order. */
+    private void dumpRecords() throws java.sql.SQLException {
+        for (var home : database.listAllHomes()) {
+            SyncEvent event = SyncEvent.create(SyncEvent.Type.HOME_SET, serverId);
+            event.ownerUuid = home.ownerUuid;
+            event.homeName = home.name;
+            event.homePosition = home.position;
+            event.homeCreatedAt = home.createdAt;
+            if (!publishDumpRecord(event)) {
+                return;
+            }
+        }
+        for (var profile : database.listAllProfiles()) {
+            // Identity rows are always republished: a backend that never saw
+            // this player still needs the name row to resolve them by name.
+            // Placeholder rows (created by a replicated position, name "")
+            // carry no identity and are skipped.
+            if (profile.name == null || profile.name.isBlank()) {
+                continue;
+            }
+            SyncEvent event = SyncEvent.create(SyncEvent.Type.PROFILE, serverId);
+            event.playerUuid = profile.uuid;
+            event.playerName = profile.name;
+            event.lastOnline = profile.lastOnline;
+            event.tpaEnabled = profile.tpaEnabled;
+            // The toggle carries its own clock and a known flag; receivers
+            // only apply it when known, so a guessed default can never
+            // overwrite the value the owning backend already has.
+            event.tpaKnown = profile.tpaKnown;
+            event.tpaUpdatedAt = profile.tpaUpdatedAt;
+            if (!publishDumpRecord(event)) {
+                return;
+            }
+        }
+        for (var stored : database.listAllStoredPositions()) {
+            // Carry the per-position update stamps: the receiving side only
+            // overwrites a row when the replicated stamp is not older, so a
+            // dump without a stamp could not propagate positions at all.
+            if (!publishBack(stored.uuid(), "back", stored.back(), stored.backUpdatedAt())
+                    || !publishBack(stored.uuid(), "death", stored.death(), stored.deathUpdatedAt())) {
+                return;
+            }
+        }
+        for (var ignore : database.listAllIgnores()) {
+            SyncEvent event = SyncEvent.create(SyncEvent.Type.IGNORE_SET, serverId);
+            event.blockerUuid = ignore.blockerUuid;
+            event.blockedUuid = ignore.blockedUuid;
+            event.expiresAt = ignore.expiresAt;
+            event.createdAt = ignore.createdAt;
+            if (!publishDumpRecord(event)) {
+                return;
+            }
+        }
+        // Deletions are part of the state: a backend that was offline when
+        // a home or block was removed would otherwise keep (and re-publish)
+        // the vanished row. Tombstones make the dump self-healing.
+        for (var tombstone : database.listTombstones()) {
+            SyncEvent event = SyncEvent.create(
+                    "home".equals(tombstone.kind()) ? SyncEvent.Type.HOME_DELETE : SyncEvent.Type.IGNORE_DELETE,
+                    serverId);
+            if ("home".equals(tombstone.kind())) {
+                event.ownerUuid = tombstone.owner();
+                event.homeName = tombstone.name();
+            } else {
+                event.blockerUuid = tombstone.owner();
+                event.blockedUuid = tombstone.name();
+            }
+            event.deletedAt = tombstone.deletedAt();
+            if (!publishDumpRecord(event)) {
+                return;
+            }
+        }
+    }
+
     /**
-     * Publishes one replayed record. A single record that cannot be serialized or
-     * queued must not abort the rest of the dump: a partial dump silently leaves
-     * the network with half the state.
+     * Publishes one replayed record, waiting while the transport backlog is at its
+     * limit. A dump published faster than the queue drains makes the transport shed
+     * the snapshot rows the other side is still missing — and because every dump uses
+     * the same order, the next one loses the same rows again. Returns false when the
+     * backlog did not drain within the budget (no player online to carry it), which
+     * ends this dump; the next resync retries.
+     *
+     * <p>A record that cannot be serialized or queued is dropped on its own instead of
+     * aborting the rest.
      */
-    private void publishQuietly(SyncEvent event) {
+    private boolean publishDumpRecord(SyncEvent event) {
+        if (shuttingDown) {
+            // The transport is about to close and close() drains the queue: a paced
+            // dump would keep publishing into it for another minute.
+            return false;
+        }
+        long waited = 0L;
+        while (syncBus.queuedOps() > DUMP_BACKLOG_LIMIT) {
+            if (waited >= DUMP_BACKLOG_BUDGET_MS) {
+                plugin.getSLF4JLogger().warn("State dump stopped after {}s of transport backlog ({} queued); "
+                        + "it runs again on the next resync", waited / 1000L, syncBus.queuedOps());
+                return false;
+            }
+            try {
+                Thread.sleep(DUMP_BACKLOG_PAUSE_MS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return false;
+            }
+            waited += DUMP_BACKLOG_PAUSE_MS;
+        }
+        try {
+            Thread.sleep(DUMP_RECORD_PAUSE_MS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return false;
+        }
         try {
             syncBus.publish(event);
         } catch (Exception e) {
             plugin.getSLF4JLogger().warn("Dropped one resync record ({} for {})",
                     event.type, event.playerUuid, e);
         }
+        return true;
     }
 
-    private void publishBack(String uuid, String kind, com.mikumc.mikutp.common.data.Position position,
-                             long updatedAt) {
+    private boolean publishBack(String uuid, String kind, com.mikumc.mikutp.common.data.Position position,
+                                long updatedAt) {
         if (position == null) {
-            return;
+            return true;
         }
         SyncEvent event = SyncEvent.create(SyncEvent.Type.BACK, serverId);
         event.playerUuid = uuid;
         event.backKind = kind;
         event.backPosition = position;
         event.backUpdatedAt = updatedAt;
-        publishQuietly(event);
+        return publishDumpRecord(event);
     }
 }

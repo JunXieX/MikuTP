@@ -13,6 +13,8 @@ public final class CooldownManager {
     }
 
     private final Map<UUID, Map<Kind, Long>> until = new ConcurrentHashMap<>();
+    /** Players whose cooldowns are tracked; a quit keeps live ones, so it is swept. */
+    private static final int MAX_TRACKED_PLAYERS = 4096;
     private final Set<UUID> bypass = ConcurrentHashMap.newKeySet();
     private final java.util.function.ToIntFunction<Kind> secondsFor;
 
@@ -36,6 +38,16 @@ public final class CooldownManager {
      */
     private static long now() {
         return System.nanoTime() / 1_000_000L;
+    }
+
+    /** Drops tracked players whose cooldowns all expired; only runs past the cap. */
+    private void pruneExpired() {
+        long at = now();
+        until.entrySet().removeIf(entry -> {
+            Map<Kind, Long> map = entry.getValue();
+            map.entrySet().removeIf(kind -> kind.getValue() <= at);
+            return map.isEmpty();
+        });
     }
 
     /** Remaining seconds before {@code kind} may be used again; 0 when ready. */
@@ -74,6 +86,9 @@ public final class CooldownManager {
         if (seconds <= 0) {
             return 0; // this action has no cooldown configured
         }
+        if (until.size() > MAX_TRACKED_PLAYERS) {
+            pruneExpired();
+        }
         long at = now();
         Map<Kind, Long> map = until.computeIfAbsent(player, k -> new ConcurrentHashMap<>());
         long[] blocked = {0};
@@ -87,10 +102,23 @@ public final class CooldownManager {
         return blocked[0];
     }
 
-    /** Clears every cooldown and the cached bypass flag (called on quit). */
+    /**
+     * Drops the cached bypass flag and whatever already expired, keeping cooldowns
+     * that are still running: wiping them on quit would let a player reset every
+     * cooldown by reconnecting. A player who quits with a live cooldown keeps a small
+     * entry until it expires; the map is swept past its cap.
+     */
     public void clear(UUID player) {
-        until.remove(player);
         bypass.remove(player);
+        Map<Kind, Long> map = until.get(player);
+        if (map == null) {
+            return;
+        }
+        long at = now();
+        map.entrySet().removeIf(entry -> entry.getValue() <= at);
+        if (map.isEmpty()) {
+            until.remove(player);
+        }
     }
 
     public void clear(UUID player, Kind kind) {

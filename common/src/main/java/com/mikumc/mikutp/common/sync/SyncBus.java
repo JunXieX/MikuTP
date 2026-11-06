@@ -25,6 +25,14 @@ public interface SyncBus extends AutoCloseable {
     boolean crossServer();
 
     /**
+     * Number of events queued for transport (to the proxy, which fans them out). A
+     * bulk publisher uses it as backpressure: publishing faster than the transport
+     * drains lets the queue reach its cap and shed the very snapshot rows that are
+     * still missing on the other side.
+     */
+    int queuedOps();
+
+    /**
      * Hands a pending teleport to the proxy. The proxy keeps it in memory and
      * delivers it to the destination backend as soon as {@code player} connects
      * there, where it is applied on join.

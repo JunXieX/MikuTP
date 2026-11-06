@@ -31,6 +31,11 @@ public final class LoopbackSyncBus implements SyncBus {
     }
 
     @Override
+    public int queuedOps() {
+        return 0; // delivery is in-process, nothing is ever queued
+    }
+
+    @Override
     public void pendingStore(UUID player, PendingTeleport pending, int ttlSeconds) {
     }
 

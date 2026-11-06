@@ -67,12 +67,13 @@ public final class MikuTPVelocity {
      * Must equal the Gradle {@code version} in the root build script; the CI
      * "Verify versions agree" step fails the build when the two drift apart.
      */
-    public static final String VERSION = "1.9.0";
+    public static final String VERSION = "1.10.0";
 
     private static final MinecraftChannelIdentifier CHANNEL =
             MinecraftChannelIdentifier.create("mikumc", "mikutp");
     private static final Gson GSON = new Gson();
-    private static final int MAX_EVENTS_PER_BATCH = 64;
+    /** Count limit per frame; the byte budget above is what really bounds a batch. */
+    private static final int MAX_EVENTS_PER_BATCH = 256;
     /** Frames drained synchronously on join; the periodic pump handles the rest. */
     private static final int MAX_JOIN_FRAMES = 8;
     /** Cap per-server backlog: a server that stays empty must not grow the queue
@@ -81,9 +82,14 @@ public final class MikuTPVelocity {
     /** A batch that a connection keeps refusing is dropped instead of blocking its
      * server's queue behind a frame that can never be delivered. */
     private static final int MAX_SEND_ATTEMPTS = 3;
-    /** Character budget of one frame, so a pathological batch stays well below the
-     * packet limit instead of being rejected as a whole. */
-    private static final int MAX_FRAME_CHARS = 64 * 1024;
+    /**
+     * Byte budget of one frame. A backend receives plugin messages as a serverbound
+     * custom payload, which the protocol caps at 32767 bytes: a bigger frame is
+     * rejected (and can drop the carrier's connection), so batches are filled by
+     * bytes, not by count. The margin leaves room for the frame envelope and the
+     * signature.
+     */
+    private static final int MAX_FRAME_BYTES = 31_000;
     /** Hard cap on how many events one player's mailbox may hold (oldest shed). */
     private static final int MAX_MAILBOX_ENTRIES = 32;
     /** Hard cap on how many distinct players may hold a mailbox at once. */
@@ -145,6 +151,8 @@ public final class MikuTPVelocity {
     private volatile boolean warnedDroppedHandoff = false;
     /** One-shot warning for queued events dropped after too many refused sends. */
     private volatile boolean warnedDroppedEvents = false;
+    /** One-shot warning for events shed because a server's backlog hit its cap. */
+    private volatile boolean warnedShedEvents = false;
     /** Periodic expiry sweep; cancelled on shutdown. */
     private com.velocitypowered.api.scheduler.ScheduledTask sweepTask;
     /** Periodic backlog pump; cancelled on shutdown. */
@@ -606,8 +614,16 @@ public final class MikuTPVelocity {
         java.util.ArrayDeque<QueuedEvent> queue = outbound.computeIfAbsent(name, n -> new java.util.ArrayDeque<>());
         synchronized (lockFor(name)) {
             queue.addLast(new QueuedEvent(eventJson, 1));
+            int shed = 0;
+            // Shed the newest, not the oldest: the head of the queue is the part that
+            // is already in flight, and a receiver that misses the tail converges again
+            // on the next resync instead of losing the leading snapshot rows every time.
             while (queue.size() > MAX_QUEUED_EVENTS) {
-                queue.pollFirst();
+                queue.pollLast();
+                shed++;
+            }
+            if (shed > 0) {
+                warnShedEvents(name, shed);
             }
         }
         // Drained by flushAllQueues() on a fixed period. Flushing here would emit
@@ -673,21 +689,33 @@ public final class MikuTPVelocity {
     /**
      * Polls up to one batch worth of already-encoded event objects, preserving
      * order. The queue only ever holds JSON produced by Gson, so the pump does not
-     * parse and re-serialize each event. The char budget keeps a single frame well
-     * inside the packet limit even for a pathological batch.
+     * parse and re-serialize each event. The budget is in UTF-8 bytes because that
+     * is what the packet limit counts; one event is always taken so a single
+     * oversized event cannot stall its queue.
      */
     private List<QueuedEvent> takeBatch(java.util.ArrayDeque<QueuedEvent> queue) {
         List<QueuedEvent> batch = new ArrayList<>();
-        int chars = 0;
+        int bytes = 0;
         while (!queue.isEmpty() && batch.size() < MAX_EVENTS_PER_BATCH) {
             QueuedEvent event = queue.peekFirst();
-            if (batch.size() >= 1 && chars + event.json().length() > MAX_FRAME_CHARS) {
+            int eventBytes = utf8Length(event.json()) + 1; // + the separating comma
+            if (batch.size() >= 1 && bytes + eventBytes > MAX_FRAME_BYTES) {
                 break;
             }
             batch.add(queue.pollFirst());
-            chars += event.json().length();
+            bytes += eventBytes;
         }
         return batch;
+    }
+
+    /** UTF-8 length without allocating the byte array. */
+    private static int utf8Length(String text) {
+        int bytes = 0;
+        for (int i = 0; i < text.length(); i++) {
+            char c = text.charAt(i);
+            bytes += c < 0x80 ? 1 : c < 0x800 ? 2 : 3;
+        }
+        return bytes;
     }
 
     /**
@@ -707,7 +735,7 @@ public final class MikuTPVelocity {
             queue.addFirst(new QueuedEvent(event.json(), event.attempts() + 1));
         }
         while (queue.size() > MAX_QUEUED_EVENTS) {
-            queue.pollFirst();
+            queue.pollLast();
         }
         if (dropped > 0) {
             warnDroppedEvents(dropped);
@@ -722,13 +750,24 @@ public final class MikuTPVelocity {
         return json;
     }
 
-    /** Sends an events batch; each element is an event object, matching the backend parser. */
+    /** Sends event objects in as many frames as the byte budget needs. */
     private boolean sendEvents(ServerConnection connection, List<SyncEvent> events) {
-        List<String> json = new ArrayList<>(events.size());
+        List<String> frame = new ArrayList<>();
+        int bytes = 0;
         for (SyncEvent event : events) {
-            json.add(GSON.toJson(event));
+            String json = GSON.toJson(event);
+            int eventBytes = utf8Length(json) + 1;
+            if (!frame.isEmpty() && bytes + eventBytes > MAX_FRAME_BYTES) {
+                if (!sendEncodedBatch(connection, frame)) {
+                    return false;
+                }
+                frame = new ArrayList<>();
+                bytes = 0;
+            }
+            frame.add(json);
+            bytes += eventBytes;
         }
-        return sendEncodedBatch(connection, json);
+        return frame.isEmpty() || sendEncodedBatch(connection, frame);
     }
 
     /** Sends one frame for already-encoded event objects; an empty batch sends nothing. */
@@ -1292,6 +1331,13 @@ public final class MikuTPVelocity {
      * @return true when the frame was handed to the connection
      */
     private boolean send(ServerConnection connection, String json) {
+        if (token == null || token.isBlank()) {
+            // Signing without a token leaves the frame unsigned and the connection
+            // accepts it, so reporting success would drain every queue into frames
+            // the backends reject. Refuse instead: the batches stay queued and the
+            // startup error names the file to fix.
+            return false;
+        }
         try {
             connection.sendPluginMessage(CHANNEL,
                     ProxyMessages.sign(json, token).getBytes(StandardCharsets.UTF_8));
@@ -1309,6 +1355,17 @@ public final class MikuTPVelocity {
             warnedDroppedHandoff = true;
             logger.warn("Dropped a cross-server handoff for {}: the destination connection refused the frame; "
                     + "that teleport will not be applied", player);
+        }
+    }
+
+    private void warnShedEvents(String serverName, int count) {
+        if (warnedShedEvents) {
+            logger.debug("Shed {} queued event(s) for {}: its backlog is at the cap", count, serverName);
+        } else {
+            warnedShedEvents = true;
+            logger.warn("Shed {} queued event(s) for {}: its backlog is at the cap. "
+                    + "The next resync restores the state; check whether that server stays empty.",
+                    count, serverName);
         }
     }
 

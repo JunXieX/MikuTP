@@ -26,20 +26,27 @@ public final class Tasks {
         this.plugin = plugin;
     }
 
-    public void async(Runnable run) {
+    /**
+     * Queues async work and reports whether it was accepted. Callers that answer a
+     * request from the task (a future, a command callback) must check the result:
+     * during shutdown the work is refused and would otherwise never answer.
+     */
+    public boolean async(Runnable run) {
         // Increment before the flag check: a task admitted just before shutdown must
         // still be seen by the bounded drain, otherwise it could run after storage
         // closes (I-R3-02).
         inFlight.incrementAndGet();
         if (shuttingDown) {
             inFlight.decrementAndGet();
-            return;
+            return false;
         }
         try {
             Bukkit.getAsyncScheduler().runNow(plugin, task -> runGuarded(run));
+            return true;
         } catch (RuntimeException e) {
             // Only reachable in the check/disable race; the work is dropped anyway.
             inFlight.decrementAndGet();
+            return false;
         }
     }
 
@@ -136,11 +143,7 @@ public final class Tasks {
      * touch this player directly instead of hopping onto its scheduler.
      */
     public boolean owns(Player player) {
-        try {
-            return Bukkit.isOwnedByCurrentRegion(player);
-        } catch (Throwable ignored) {
-            return false;
-        }
+        return Bukkit.isOwnedByCurrentRegion(player);
     }
 
     /**

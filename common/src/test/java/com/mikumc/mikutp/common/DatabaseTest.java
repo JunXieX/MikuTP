@@ -199,7 +199,7 @@ class DatabaseTest {
         long created = System.currentTimeMillis() - 60_000;
         database.saveHome(new Home("uuid-a", "base", new Position("s1", "world", 1, 1, 1, 0f, 0f), created));
 
-        assertTrue(database.deleteHomeAndTombstone("uuid-a", "base", System.currentTimeMillis()));
+        assertTrue(database.deleteHomeAndTombstone("uuid-a", "base", System.currentTimeMillis()) > 0);
         assertTrue(database.getHome("uuid-a", "base").isEmpty());
         // The tombstone was written with it: replaying the old snapshot is rejected.
         assertFalse(database.saveHome(new Home("uuid-a", "base",
@@ -207,10 +207,47 @@ class DatabaseTest {
         assertEquals(1, database.listTombstones().size());
     }
 
+    /** Deletion matches a legacy spelling of the same home, exactly like the identity does. */
+    @Test
+    void deleteMatchesLegacyCaseVariant() throws Exception {
+        assertTrue(database.saveHome(new Home("uuid-a", "Base",
+                new Position("s1", "world", 1, 1, 1, 0f, 0f), 1_000L)));
+
+        // Deleting the normalized spelling removes the legacy row...
+        long stamp = database.deleteHomeAndTombstone("uuid-a", "base", System.currentTimeMillis());
+        assertTrue(stamp > 0);
+        assertTrue(database.getHome("uuid-a", "base").isEmpty());
+        assertEquals(1, database.listTombstones().size());
+
+        // ... and its tombstone blocks a replay under either spelling.
+        assertFalse(database.saveHome(new Home("uuid-a", "Base",
+                new Position("s1", "world", 1, 1, 1, 0f, 0f), 999L)));
+        assertFalse(database.saveHome(new Home("uuid-a", "base",
+                new Position("s1", "world", 1, 1, 1, 0f, 0f), 999L)));
+    }
+
+    /** A row written by a backend whose clock runs ahead is still deletable here. */
+    @Test
+    void deleteHomeCoversRowWrittenByAFasterClock() throws Exception {
+        long future = System.currentTimeMillis() + 3_600_000L;
+        assertTrue(database.saveHome(new Home("uuid-a", "base",
+                new Position("s1", "world", 1, 1, 1, 0f, 0f), future)));
+
+        // The deletion stamp is raised above the row it removes...
+        long stamp = database.deleteHomeAndTombstone("uuid-a", "base", System.currentTimeMillis());
+        assertTrue(stamp > future, "the delete stamp must outrank the row it removed");
+        assertTrue(database.getHome("uuid-a", "base").isEmpty());
+        assertEquals(stamp, database.listTombstones().get(0).deletedAt());
+
+        // ... so replaying that very snapshot cannot resurrect the home.
+        assertFalse(database.saveHome(new Home("uuid-a", "base",
+                new Position("s1", "world", 1, 1, 1, 0f, 0f), future)));
+    }
+
     /** Deleting a home this backend does not have must not leave a blocking tombstone. */
     @Test
     void deleteHomeAndTombstoneWithoutRowWritesNoTombstone() throws Exception {
-        assertFalse(database.deleteHomeAndTombstone("uuid-a", "ghost", System.currentTimeMillis()));
+        assertEquals(0L, database.deleteHomeAndTombstone("uuid-a", "ghost", System.currentTimeMillis()));
         assertTrue(database.listTombstones().isEmpty());
 
         // No tombstone means an older replication of that name is still accepted.
@@ -225,7 +262,7 @@ class DatabaseTest {
         database.saveHome(new Home("uuid-a", "base", new Position("s1", "world", 1, 1, 1, 0f, 0f), 1_000L));
 
         assertThrows(java.sql.SQLException.class, () -> database.runTransaction(tx -> {
-            assertTrue(tx.deleteHomeAndTombstone("uuid-a", "base", 2_000L));
+            assertTrue(tx.deleteHomeAndTombstone("uuid-a", "base", 2_000L) > 0);
             throw new java.sql.SQLException("boom");
         }));
 

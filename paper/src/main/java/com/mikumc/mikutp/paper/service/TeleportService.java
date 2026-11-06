@@ -665,6 +665,9 @@ public final class TeleportService {
                 tasks.entity(player, () -> network.connect(player, dest.server));
             } catch (Exception e) {
                 plugin.getSLF4JLogger().warn("Cross-server dispatch failed", e);
+                // Nothing left this server: give the cooldown back like the local
+                // failure branches do.
+                cooldowns.clear(uuid, cooldownKindOf(source));
                 tasks.entity(player, () -> messages.send(player, "common.teleport-failed"));
             }
         });

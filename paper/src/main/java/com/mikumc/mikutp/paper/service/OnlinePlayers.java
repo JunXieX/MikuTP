@@ -27,8 +27,10 @@ public final class OnlinePlayers {
 
     private final Map<UUID, Entry> players = new ConcurrentHashMap<>();
 
-    public void add(Player player) {
-        players.put(player.getUniqueId(), new Entry(player, player.getName()));
+    /** Tracks the player and reports whether they were not tracked yet — the first
+     * player of a quiet period, which is what triggers the activation resync. */
+    public boolean add(Player player) {
+        return players.put(player.getUniqueId(), new Entry(player, player.getName())) == null;
     }
 
     public void remove(UUID player) {

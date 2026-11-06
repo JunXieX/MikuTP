@@ -12,6 +12,7 @@ import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.TimeUnit;
 import java.util.function.BiConsumer;
 import java.util.function.Consumer;
 
@@ -205,23 +206,23 @@ public final class NetworkService {
         send(carrier, ProxyMessages.encodeConnectAnchor(playerToMove, anchorUuid));
     }
 
-    /** Asks the proxy for the online players of one server, or the whole network when null. */
+    /**
+     * Asks the proxy for the online players of one server, or the whole network when
+     * null. The future completes on its own timeout: a scheduled timeout task would
+     * be refused while the plugin disables and leave the caller waiting forever.
+     */
     public CompletableFuture<List<String>> requestPlayerList(Player carrier, String serverName) {
         String id = UUID.randomUUID().toString();
         var future = new CompletableFuture<List<String>>();
+        future.completeOnTimeout(List.of(), REQUEST_TIMEOUT_MS, TimeUnit.MILLISECONDS);
+        playerListFutures.put(id, future);
+        future.whenComplete((answer, error) -> playerListFutures.remove(id));
         if (!carrier.isOnline()) {
-            // Without a live carrier the message can never reach the proxy; fail
-            // now instead of making the caller wait for the full round-trip timeout.
+            // Without a live carrier the message can never reach the proxy; fail now
+            // instead of making the caller wait for the full round-trip timeout.
             future.complete(List.of());
             return future;
         }
-        playerListFutures.put(id, future);
-        tasks.asyncDelayed(() -> {
-            var pending = playerListFutures.remove(id);
-            if (pending != null && !pending.isDone()) {
-                pending.complete(List.of());
-            }
-        }, REQUEST_TIMEOUT_MS);
         send(carrier, ProxyMessages.encodeListPlayers(id, serverName));
         return future;
     }
@@ -230,17 +231,13 @@ public final class NetworkService {
     public CompletableFuture<UUID> resolveRemote(Player carrier, String name) {
         String id = UUID.randomUUID().toString();
         var future = new CompletableFuture<UUID>();
+        future.completeOnTimeout(null, REQUEST_TIMEOUT_MS, TimeUnit.MILLISECONDS);
+        resolveFutures.put(id, future);
+        future.whenComplete((answer, error) -> resolveFutures.remove(id));
         if (!carrier.isOnline()) {
             future.complete(null);
             return future;
         }
-        resolveFutures.put(id, future);
-        tasks.asyncDelayed(() -> {
-            var pending = resolveFutures.remove(id);
-            if (pending != null && !pending.isDone()) {
-                pending.complete(null);
-            }
-        }, REQUEST_TIMEOUT_MS);
         send(carrier, ProxyMessages.encodeResolvePlayer(id, name));
         return future;
     }

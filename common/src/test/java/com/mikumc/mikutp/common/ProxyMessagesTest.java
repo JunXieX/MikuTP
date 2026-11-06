@@ -121,6 +121,24 @@ class ProxyMessagesTest {
         assertFalse(ProxyMessages.verify(tampered, token));
     }
 
+    /** A bus frame carrying an inlined event must sign and verify like any other. */
+    @Test
+    void signedBusFrameWithInlinedEventVerifies() {
+        SyncEvent event = SyncEvent.create(SyncEvent.Type.HOME_SET, "s1");
+        event.ownerUuid = "uuid-a";
+        event.homeName = "base";
+        event.homePosition = new Position("s1", "world", 1, 2, 3, 0f, 0f);
+
+        String frame = ProxyMessages.encodeBusBatch(List.of(ProxyMessages.eventOp(event)));
+        String signed = ProxyMessages.sign(frame, "shared-secret");
+        assertTrue(ProxyMessages.verify(ProxyMessages.decode(signed), "shared-secret"));
+
+        JsonObject decoded = ProxyMessages.decode(signed);
+        JsonObject op = decoded.getAsJsonArray("m").get(0).getAsJsonObject();
+        assertEquals("base", ProxyMessages.event(op).homeName);
+        assertFalse(ProxyMessages.verify(ProxyMessages.decode(signed), "other-token"));
+    }
+
     /** C-01: a pending handoff may carry the destination server it is meant for. */
     @Test
     void pendingOpCarriesDestinationServer() {

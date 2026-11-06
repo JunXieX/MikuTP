@@ -69,8 +69,10 @@ public final class Database implements AutoCloseable {
         int deleteHome(String ownerUuid, String name, long deletedAt) throws SQLException;
 
         /** Deletes a home and records its tombstone in the same transaction, but
-         * only when a row was actually removed. Returns whether a row was deleted. */
-        boolean deleteHomeAndTombstone(String ownerUuid, String name, long deletedAt) throws SQLException;
+         * only when a row was actually removed. Returns the deletion stamp that was
+         * stored (raised above the removed row), or 0 when nothing was deleted — the
+         * caller must replicate that stamp, not the value it passed in. */
+        long deleteHomeAndTombstone(String ownerUuid, String name, long deletedAt) throws SQLException;
 
         int upsertPlayer(String uuid, String name, long now) throws SQLException;
 
@@ -253,8 +255,13 @@ public final class Database implements AutoCloseable {
         exec("CREATE INDEX IF NOT EXISTS %sidx_warps_server ON %swarps (server)".formatted(prefix, prefix));
         // Tombstones only need to outlive the replication window (a resync dump).
         // Anything older cannot be contradicted by a snapshot that still exists.
-        exec("DELETE FROM %stombstones WHERE deleted_at < %d"
-                .formatted(prefix, System.currentTimeMillis() - TOMBSTONE_TTL_MS));
+        // Expired blocks are state nobody reads any more: dropping them keeps the
+        // table — and every resync dump that republishes it — bounded.
+        long now = System.currentTimeMillis();
+        try (Connection c = provider.acquire()) {
+            pruneTombstones(c, now - TOMBSTONE_TTL_MS);
+            pruneExpiredIgnores(c, now);
+        }
     }
 
     /** Adds only the columns the live table does not already have (no exception churn). */
@@ -307,9 +314,33 @@ public final class Database implements AutoCloseable {
         }
     }
 
+    /**
+     * Deletes block entries whose duration already ended. This is not a replicated
+     * deletion: readers filter by {@code expires_at} anyway, so the rows only cost
+     * space and resync bandwidth.
+     */
+    private void pruneExpiredIgnores(Connection connection, long now) throws SQLException {
+        try (PreparedStatement ps = connection.prepareStatement(
+                "DELETE FROM %signores WHERE expires_at <> ? AND expires_at < ?".formatted(prefix))) {
+            ps.setLong(1, IgnoreEntry.PERMANENT);
+            ps.setLong(2, now);
+            ps.executeUpdate();
+        }
+    }
+
     // ------------------------------------------------------------------ transactions
 
-    /** Runs {@code work} on one connection inside a single commit. */
+    /**
+     * Runs {@code work} on one connection inside a single commit.
+     *
+     * <p>The transaction starts with {@code BEGIN IMMEDIATE} instead of the driver's
+     * deferred begin: several writes read before they write (the tombstone and
+     * case-variant checks), and a deferred transaction that upgrades its read
+     * snapshot to a write lock fails immediately with SQLITE_BUSY_SNAPSHOT when
+     * another connection committed in between — the busy timeout does not apply to
+     * that case, so a /sethome racing the replication flush would just fail.
+     * Taking the write lock up front turns that into an ordinary queued wait.
+     */
     public <T> T transaction(TxWork<T> work) throws SQLException {
         if (Boolean.TRUE.equals(inTransaction.get())) {
             throw new IllegalStateException(
@@ -317,29 +348,27 @@ public final class Database implements AutoCloseable {
         }
         inTransaction.set(Boolean.TRUE);
         try (Connection c = provider.acquire()) {
-            boolean autoCommit = c.getAutoCommit();
-            c.setAutoCommit(false);
+            executeOn(c, "BEGIN IMMEDIATE");
             try {
                 T result = work.run(new TxImpl(c));
-                c.commit();
+                executeOn(c, "COMMIT");
                 return result;
             } catch (SQLException | RuntimeException e) {
                 try {
-                    c.rollback();
+                    executeOn(c, "ROLLBACK");
                 } catch (SQLException rollbackFailure) {
                     e.addSuppressed(rollbackFailure);
                 }
                 throw e;
-            } finally {
-                try {
-                    c.setAutoCommit(autoCommit);
-                } catch (SQLException ignored) {
-                    // Hikari restores autoCommit when the connection returns to the
-                    // pool; a failure here is secondary and must not mask the real cause.
-                }
             }
         } finally {
             inTransaction.remove();
+        }
+    }
+
+    private static void executeOn(Connection connection, String sql) throws SQLException {
+        try (Statement statement = connection.createStatement()) {
+            statement.execute(sql);
         }
     }
 
@@ -428,7 +457,7 @@ public final class Database implements AutoCloseable {
         }
 
         @Override
-        public boolean deleteHomeAndTombstone(String ownerUuid, String name, long deletedAt) throws SQLException {
+        public long deleteHomeAndTombstone(String ownerUuid, String name, long deletedAt) throws SQLException {
             // Local /delhome: row delete and tombstone commit (or roll back) together,
             // so a crash between them can neither lose the delete nor the stamp.
             //
@@ -436,20 +465,28 @@ public final class Database implements AutoCloseable {
             // backend whose clock runs ahead carries a createdAt in the future, and
             // the plain "created_at < deletedAt" guard would then keep it alive while
             // the player is told the home does not exist. Raising the stamp stays
-            // monotonic, so peers still order the deletion correctly.
+            // monotonic, so peers still order the deletion correctly. Callers
+            // replicate the returned stamp: publishing the lower one they passed in
+            // would leave that future-dated row alive on every peer.
             long deletedStamp = Math.max(deletedAt, newestHomeCreatedAt(ownerUuid, name) + 1L);
             int removed = deleteHomeRows(ownerUuid, name, deletedStamp);
             if (removed == 0) {
-                return false; // no row here: a tombstone would block an older replication
+                return 0L; // no row here: a tombstone would block an older replication
             }
             recordDeletion("home", ownerUuid, name, deletedStamp);
-            return true;
+            return deletedStamp;
         }
 
-        /** Newest creation stamp of one stored home, 0 when there is no such row. */
+        /**
+         * Newest creation stamp of one stored home, 0 when there is no such row. The
+         * name match is case-insensitive: rows written by older versions can carry a
+         * different spelling of the same home, and the stamp has to outrank every one
+         * of them.
+         */
         private long newestHomeCreatedAt(String ownerUuid, String name) throws SQLException {
             try (PreparedStatement ps = connection.prepareStatement(
-                    "SELECT MAX(created_at) FROM %shomes WHERE owner_uuid = ? AND name = ?".formatted(prefix))) {
+                    "SELECT MAX(created_at) FROM %shomes WHERE owner_uuid = ? AND name = ? COLLATE NOCASE"
+                            .formatted(prefix))) {
                 ps.setString(1, ownerUuid);
                 ps.setString(2, name);
                 try (ResultSet rs = ps.executeQuery()) {
@@ -458,10 +495,16 @@ public final class Database implements AutoCloseable {
             }
         }
 
-        /** Deletes only rows older than {@code deletedAt}; a re-created home survives. */
+        /**
+         * Deletes only rows older than {@code deletedAt}; a re-created home survives.
+         * The name match ignores case, matching the identity rules: a home spelled
+         * "Base" on one backend and "base" on another is the same home, and a delete
+         * that only matched one spelling would leave the other one to resurrect it.
+         */
         private int deleteHomeRows(String ownerUuid, String name, long deletedAt) throws SQLException {
             try (PreparedStatement ps = connection.prepareStatement(
-                    "DELETE FROM %shomes WHERE owner_uuid = ? AND name = ? AND created_at < ?".formatted(prefix))) {
+                    "DELETE FROM %shomes WHERE owner_uuid = ? AND name = ? COLLATE NOCASE AND created_at < ?"
+                            .formatted(prefix))) {
                 ps.setString(1, ownerUuid);
                 ps.setString(2, name);
                 ps.setLong(3, deletedAt);
@@ -621,10 +664,16 @@ public final class Database implements AutoCloseable {
             return removed;
         }
 
-        /** True when a delete for this row is newer than the snapshot being written. */
+        /**
+         * True when a delete for this row is newer than the snapshot being written.
+         * Tombstone names are matched case-insensitively (and the newest stamp wins
+         * when several spellings left a row behind): the identity of a home ignores
+         * case, so its deletion has to as well.
+         */
         private boolean deletedAfter(String kind, String owner, String name, long snapshotAt) throws SQLException {
             try (PreparedStatement ps = connection.prepareStatement(
-                    "SELECT deleted_at FROM %stombstones WHERE kind = ? AND owner = ? AND name = ?".formatted(prefix))) {
+                    ("SELECT MAX(deleted_at) FROM %stombstones"
+                            + " WHERE kind = ? AND owner = ? AND name = ? COLLATE NOCASE").formatted(prefix))) {
                 ps.setString(1, kind);
                 ps.setString(2, owner);
                 ps.setString(3, name);
@@ -649,7 +698,9 @@ public final class Database implements AutoCloseable {
             }
             if (deletionsSincePrune.incrementAndGet() >= TOMBSTONE_PRUNE_EVERY) {
                 deletionsSincePrune.set(0);
-                pruneTombstones(connection, System.currentTimeMillis() - TOMBSTONE_TTL_MS);
+                long now = System.currentTimeMillis();
+                pruneTombstones(connection, now - TOMBSTONE_TTL_MS);
+                pruneExpiredIgnores(connection, now);
             }
         }
     }
@@ -786,9 +837,10 @@ public final class Database implements AutoCloseable {
      * only written when a row was actually removed, so deleting a home this backend
      * no longer has cannot block a slightly older replication of it.
      *
-     * @return true when a row was deleted (and the tombstone committed with it)
+     * @return the deletion stamp that was stored (raised above the removed row), or
+     *         0 when no row was deleted
      */
-    public boolean deleteHomeAndTombstone(String ownerUuid, String name, long deletedAt) throws SQLException {
+    public long deleteHomeAndTombstone(String ownerUuid, String name, long deletedAt) throws SQLException {
         return transaction(tx -> tx.deleteHomeAndTombstone(ownerUuid, name, deletedAt));
     }
 

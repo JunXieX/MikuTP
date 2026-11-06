@@ -47,11 +47,11 @@ public final class PlayerLifecycle implements Listener {
         UUID id = player.getUniqueId();
         // The join publishes the profile below, so only the local runtime state is
         // rebuilt here: a quiet refresh would read the same row a second time.
-        refreshLocal(player);
+        boolean firstPlayer = refreshLocal(player);
         // A real join announces the profile; refresh() deliberately does not, so
         // /mtp reload cannot turn every online player into PROFILE traffic (R2-03).
         profiles.onJoin(player);
-        coordinator.onPlayerJoin(onlinePlayers.size());
+        coordinator.onPlayerJoin(firstPlayer);
         // Answers that arrived while this backend still saw the player as absent
         // are replayed first: they may be the acceptance the player is waiting for.
         requestService.replayDeferred(player);
@@ -76,14 +76,15 @@ public final class PlayerLifecycle implements Listener {
         profiles.refresh(player);
     }
 
-    private void refreshLocal(Player player) {
+    private boolean refreshLocal(Player player) {
         UUID id = player.getUniqueId();
-        onlinePlayers.add(player);
+        boolean firstPlayer = onlinePlayers.add(player);
         cooldowns.setBypass(id, player.hasPermission("mikutp.bypass.cooldown"));
         homeService.onJoin(player);
         // Request dedupe state (answered/handled request ids) is intentionally not
         // reset here: the proxy re-delivers a pending TP_NEW after a server switch
         // and RequestService.onQuit() already dropped the session-local copy.
+        return firstPlayer;
     }
 
     @EventHandler(priority = EventPriority.MONITOR)

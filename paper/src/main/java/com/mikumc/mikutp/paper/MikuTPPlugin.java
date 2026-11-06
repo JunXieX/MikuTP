@@ -115,7 +115,7 @@ public final class MikuTPPlugin extends JavaPlugin {
         warpService = new WarpService(this, tasks, config, database, messages, cooldowns, teleports);
         requestService = new RequestService(this, tasks, config, database, messages, effects, cooldowns,
                 teleports, profiles, network, syncBus, onlinePlayers);
-        wildService = new WildService(tasks, config, messages, cooldowns, teleports, onlinePlayers);
+        wildService = new WildService(this, tasks, config, messages, cooldowns, teleports, onlinePlayers);
         coordinator = new SyncCoordinator(this, tasks, config, database, syncBus,
                 homeService, profiles, teleports, requestService);
 
@@ -311,11 +311,6 @@ public final class MikuTPPlugin extends JavaPlugin {
                 // stays authoritative and every offending value is named in the log.
                 logValidationProblems(parsed);
                 bundle = loadBundle(parsed.languageFile);
-                // Validate the bundle before anything live is swapped: constructing the
-                // service parses the MiniMessage prefix exactly like MessageService.reload
-                // does, so a malformed prefix rejects the reload instead of leaving the
-                // config applied while the message layer still holds the old prefix.
-                new MessageService(tasks, bundle, parsed.parsePlaceholderApi, papiAvailable);
             } catch (Exception e) {
                 // Keep the running configuration intact and report the failure.
                 getSLF4JLogger().error("Reload failed; the running configuration was kept: {}", e.toString());

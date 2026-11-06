@@ -12,46 +12,46 @@ public final class MikuTPConfig {
     /** Config structure version shipped with this build; older files are diagnosed on load. */
     public static final int CURRENT_VERSION = 2;
 
-    public int configVersion = CURRENT_VERSION;
+    public volatile int configVersion = CURRENT_VERSION;
 
     /** Local SQLite storage settings. */
-    public Storage storage = new Storage();
+    public volatile Storage storage = new Storage();
 
     /** Cross-server identity and request settings. */
-    public CrossServer crossServer = new CrossServer();
+    public volatile CrossServer crossServer = new CrossServer();
 
     /** Cross-server sync settings. */
-    public Sync sync = new Sync();
+    public volatile Sync sync = new Sync();
 
     /** Global teleport behaviour: warmup, cancel rules and cooldowns. */
-    public Teleport teleport = new Teleport();
+    public volatile Teleport teleport = new Teleport();
 
     /** Home feature settings. */
-    public Home home = new Home();
+    public volatile Home home = new Home();
 
     /** Warp feature settings (per-server scoped). */
-    public Warp warp = new Warp();
+    public volatile Warp warp = new Warp();
 
     /** Teleport request (tpa) settings. */
-    public Tpa tpa = new Tpa();
+    public volatile Tpa tpa = new Tpa();
 
     /** /back settings. */
-    public Back back = new Back();
+    public volatile Back back = new Back();
 
     /** Random teleport (wild) settings. */
-    public Wild wild = new Wild();
+    public volatile Wild wild = new Wild();
 
     /** Dialog menu settings. */
-    public Dialogs dialogs = new Dialogs();
+    public volatile Dialogs dialogs = new Dialogs();
 
     /** Per-command switches and aliases. */
-    public Commands commands = new Commands();
+    public volatile Commands commands = new Commands();
 
     /** Message file loaded from the plugin data folder. */
-    public String languageFile = "messages_zh_cn.json";
+    public volatile String languageFile = "messages_zh_cn.json";
 
     /** Parse PlaceholderAPI placeholders in player-visible messages. */
-    public boolean parsePlaceholderApi = true;
+    public volatile boolean parsePlaceholderApi = true;
 
     public static final class Commands {
         public CommandEntry home = new CommandEntry(List.of("homes"));
@@ -98,6 +98,13 @@ public final class MikuTPConfig {
      * initialised model would half-apply itself. Parsing and copying are two
      * separate steps on purpose — a failed parse must leave the running config
      * completely untouched.
+     *
+     * <p>Every field is volatile, so readers on other region threads are guaranteed
+     * to see a completely parsed section instead of a stale one forever. The copy is
+     * not one atomic snapshot: a reader touching two sections while this runs can
+     * observe the new value of one and the old value of the other. That is fine for
+     * independent settings; anything that must be read as a unit belongs in one
+     * section.
      */
     public void copyFrom(MikuTPConfig other) {
         this.configVersion = other.configVersion;

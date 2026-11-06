@@ -322,11 +322,16 @@ public final class HomeService {
                         messages.send(player, "home.not-found", "name", wanted);
                         return;
                     }
-                    long deletedAt = System.currentTimeMillis();
                     // One transaction for the row delete and its tombstone, so a crash
                     // can neither lose the delete nor the stamp; a row that is already
                     // gone writes no tombstone (it would block an older replication).
-                    if (!database.deleteHomeAndTombstone(id.toString(), match.name, deletedAt)) {
+                    // The stored stamp is the one raised above the removed row, and it
+                    // is what must be replicated: peers delete by that stamp, so
+                    // publishing the unraised time would leave a future-dated row alive
+                    // there while this backend has already forgotten it.
+                    long deletedAt = database.deleteHomeAndTombstone(id.toString(), match.name,
+                            System.currentTimeMillis());
+                    if (deletedAt == 0L) {
                         // The cache was ahead of the database (e.g. a remote delete was
                         // applied in between): drop the stale entry, but write no tombstone.
                         cache.put(id, sort(current.stream()
